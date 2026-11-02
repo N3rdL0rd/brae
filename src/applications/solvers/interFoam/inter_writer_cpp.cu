@@ -1599,22 +1599,8 @@ InterWriter::InterWriter(
     deltaTSave_ = startDeltaT(cd, startDir, cd.scalarOr("deltaT", scalar(0)));
     deltaT0_ = deltaTSave_;
 
-    if (const FoamDict* fns = cd.subDict("functions"))
-    {
-        if (!fns->subs.empty())
-        {
-            std::string names;
-            for (const auto& s : fns->subs)
-            {
-                names += (names.empty() ? "" : ", ") + s.first;
-            }
-            noticeIgnored(
-                "controlDict functions",
-                "brae runs no function objects (" + names + "): their postProcessing/ output and the fields "
-                "they write are not produced; the solution depends on them in the time step alone, where "
-                "an object's adjustableRunTime write times trim it, and that is kept");
-        }
-    }
+    // controlDict `functions`: the loops run the objects brae ports (inter_function_objects.cuh) and notice the
+    // ones it does not, by name, when they build the list; this writer says nothing about them.
 
     // A RESTART continues OpenFOAM's time index and cumulative continuity error from the start directory
     // (Time.C:304-307, initContinuityErrs.H:40-52) -- the index is the case's, InterFields::startTimeIndex,

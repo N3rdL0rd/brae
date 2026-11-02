@@ -10,6 +10,7 @@
 #include "inter_peqn_cpp.cuh"
 #include "interface_properties_cpp.cuh"
 #include "time_controls.cuh"
+#include "inter_function_objects.cuh"
 #include "foam_field_reader.cuh"
 #include <cmath>
 #include <cstdio>
@@ -833,6 +834,48 @@ RunReport runInterFoam(
     // alpha flux the step's LAST alpha solve leaves, kept only on a write step: OpenFOAM writes
     // alphaPhi0.<phase1> from alphaPhi10 (createAlphaFluxes.H), which that solve overwrites
     bool writeNow = false;
+    // The step's buffers above are kept on a write step -- and on EVERY step when a function object can end the
+    // run (runTimeControl satisfiedAction end): that step is written whether or not it is a write time, and the
+    // alpha flux and the old alpha it writes can only be taken while the step runs.
+    bool capture = false;
+    bool foStop = false;
+    // The function objects of the case's controlDict, run on the state each step leaves (see
+    // inter_function_objects.cuh). Fields are shown to them from the host copies this loop already has; U as
+    // three component arrays, rebuilt once per step and only when an object asks.
+    std::vector<scalar> foUx, foUy, foUz, foPatch;
+    bool foUValid = false;
+    std::shared_ptr<brae::fo::FunctionObjectList> fos;
+    {
+        brae::fo::Source src;
+        auto fillU = [&]()
+        {
+            if (foUValid) return;
+            const std::size_t n = f.U.internal.size();
+            foUx.resize(n);
+            foUy.resize(n);
+            foUz.resize(n);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                foUx[i] = f.U.internal[i].x;
+                foUy[i] = f.U.internal[i].y;
+                foUz[i] = f.U.internal[i].z;
+            }
+            foUValid = true;
+        };
+        src.newStep = [&]() { foUValid = false; };
+        src.alpha = [&]() -> const std::vector<scalar>& { return f.alpha1.internal; };
+        src.p_rgh = [&]() -> const std::vector<scalar>& { return f.p_rgh.internal; };
+        src.Ux = [&]() -> const std::vector<scalar>& { fillU(); return foUx; };
+        src.Uy = [&]() -> const std::vector<scalar>& { fillU(); return foUy; };
+        src.Uz = [&]() -> const std::vector<scalar>& { fillU(); return foUz; };
+        src.alphaPatch = [&](std::size_t pi) -> const std::vector<scalar>&
+        {
+            foPatch = f.alpha1.boundary[pi]->value();
+            return foPatch;
+        };
+        fos = brae::fo::createFunctionObjects(caseDir, startDir, m, g, patches, f.cellZones, f.alphaName,
+                                              f.meshIsDynamic, src);
+    }
     SurfaceScalarField alphaPhi10Write;
     // alpha.<phase1>_0 of a sub-cycled alpha: alpha as the step found it, taken only on a write step
     std::vector<scalar> alphaOldWrite;
@@ -981,7 +1024,8 @@ RunReport runInterFoam(
                             writer->stepTaken(rep.deltaT);
                             writeNow = writer->isWriteTime(f.startTimeIndex + rep.steps, indexMoved);
                         }
-                        if (writeNow && writer->writesAlphaOld())
+                        capture = writeNow || (fos && fos->canStop());
+                        if (capture && writer && writer->writesAlphaOld())
                         {
                             alphaOldWrite = f.alpha1.internal;
                             alphaOldBndWrite.assign(f.alpha1.boundary.size(), std::vector<scalar>());
@@ -1092,7 +1136,7 @@ RunReport runInterFoam(
                         // At the step's FIRST update only: a later corrector's alpha is already this step's
                         // solution, while OpenFOAM's level is the restored old one (subCycle.H:88-99) --
                         // which a later change would map again, and that form is refused at start-up.
-                        if (writeNow && writer->writesAlphaOld() && outerOfStep == 0
+                        if (capture && writer && writer->writesAlphaOld() && outerOfStep == 0
                             && std::getenv("BRAE_CONTROL_AMR_ALPHA0_START") == nullptr)
                         {
                             alphaOldWrite = f.alpha1.internal;
@@ -1253,7 +1297,7 @@ RunReport runInterFoam(
                         ++subCycle;
                         // the last sub-cycle's storeOldTime (GeometricField.C:932) copies alpha's patches
                         // into the old level as they stand now, before this sub-cycle updates any
-                        if (writeNow && writer && writer->writesAlphaOld()
+                        if (capture && writer && writer->writesAlphaOld()
                             && subCycle == f.alphaCtl.nAlphaSubCycles)
                         {
                             alphaSubBndWrite.assign(f.alpha1.boundary.size(), std::vector<scalar>());
@@ -1347,7 +1391,7 @@ RunReport runInterFoam(
                         }
                         // a copy, and only on a write step -- the last call of the step wins, as the last
                         // assignment to alphaPhi10 does in OpenFOAM
-                        if (writeNow)
+                        if (capture)
                         {
                             alphaPhi10Write = aPhi;
                         }
@@ -1922,8 +1966,25 @@ RunReport runInterFoam(
                     break;
                 }
                 case Stage::write:
+                    // function objects, on the state the step has just left (OpenFOAM runs them at the top of the
+                    // next Time::run(), on this same state); one of them may end the run at this step
+                    if (fos)
+                    {
+                        brae::fo::Step fs;
+                        fs.timeIndex = f.startTimeIndex + rep.steps;
+                        fs.time = rep.time;
+                        fs.deltaT = rep.deltaT;
+                        fs.sinceStart = rep.time - startTime;
+                        fs.runTimeWrite = writeNow;
+                        foStop = fos->execute(fs);
+                        if (foStop)
+                        {
+                            std::printf("  function objects: a runTimeControl ends the run at t = %.17g; this time is "
+                                        "written\n", (double)rep.time);
+                        }
+                    }
                     // runTime.write() (interFoam.C:175): the stored state, nothing re-evaluated
-                    if (writer && writeNow)
+                    if (writer && (writeNow || foStop))
                     {
                         const std::vector<std::vector<scalar>> pB =
                             pPatchesFrozen ? pBFrozen : staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
@@ -2033,6 +2094,10 @@ RunReport runInterFoam(
                         "alpha [%.3e, %.15g]  max|U| %.4f\n",
                         (double)rep.time, (double)rep.deltaT, (double)rep.CoNum,
                         (double)rep.alphaCoNum, (double)aMin, (double)aMax, (double)maxU);
+        }
+        if (foStop)
+        {
+            break;
         }
     }
 

@@ -1026,6 +1026,16 @@ target_include_directories(test_write_control_interval PRIVATE ${BRAE_HEADER_DIR
 target_link_libraries(test_write_control_interval PRIVATE brae_core)
 add_test(NAME write_control_interval COMMAND test_write_control_interval)
 
+# interFoam's runtime function objects (volFieldValue, surfaceFieldValue, probes, fieldMinMax, exprField,
+# runTimeControl): the files they write against sums formed in the test, the cadence, the stop, and what must
+# stop the run at start-up. Host only, on the 20-cell demo mesh.
+add_executable(test_inter_function_objects tests/test_inter_function_objects.cu)
+target_include_directories(test_inter_function_objects PRIVATE ${BRAE_HEADER_DIRS})
+target_compile_definitions(test_inter_function_objects PRIVATE
+    BRAE_TEST_MESH_DIR="${CMAKE_SOURCE_DIR}/demo/amgpcg/case20/constant/polyMesh")
+target_link_libraries(test_inter_function_objects PRIVATE brae_core)
+add_test(NAME inter_function_objects COMMAND test_inter_function_objects)
+
 add_executable(kepsilon_probe tests/kepsilon_probe.cu)
 target_include_directories(kepsilon_probe PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(kepsilon_probe PRIVATE brae_core)

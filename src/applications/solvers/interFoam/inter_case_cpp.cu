@@ -994,9 +994,10 @@ InterFields buildInterFields(const std::string&          caseDir,
     f.writeCadence = WriteCadence::read(controlDict);
     for (const FunctionObjectCadence& fo : f.writeCadence.functionObjects)
     {
-        // said per object: the step is the solution's, and this is the one thing of a function object brae keeps
+        // said per object: an object's adjustableRunTime write times trim the step in OpenFOAM, and here too,
+        // whether or not the object itself is one brae runs (inter_function_objects.cuh says which are)
         std::printf("  time step: the write times of function object `%s`, every %g, trim the step as "
-                    "OpenFOAM's Time::adjustDeltaT does; the object itself is not run\n",
+                    "OpenFOAM's Time::adjustDeltaT does\n",
                     fo.name.c_str(), (double)fo.writeInterval);
     }
     f.deltaT    = controlDict.scalarOr("deltaT", scalar(1e-3));

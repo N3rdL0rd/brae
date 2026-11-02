@@ -12,6 +12,7 @@
 #include "device_fv_geometry.cuh"
 #include "device_patch_wave.cuh"
 #include "device_swept_volumes.cuh"
+#include "inter_function_objects.cuh"
 #include <limits>
 #include <map>
 #include <cstring>
@@ -2803,6 +2804,38 @@ RunReport runInterFoamDevice(
         throw std::runtime_error(std::string("brae interFoam: U's boundary kept on the GPU is not the host's: ")
                                  + line);
     };
+    // U's patches are all noSlip or zeroGradient, with no MRF zone: the state the device boundary is refreshed from
+    // (refValue, valueFraction, refGrad ...) is the same at every call after the first full build, so the refresh
+    // and the key that decides whether to make it have nothing to find. MEASURED on the G4 tank (2.5M cells, 533,594
+    // boundary faces, four calls a step): 127 ms of an 860 ms step. Any other class of patch -- a flux, a time, a wave,
+    // an alpha-dependent value, a coupled or an empty patch -- keeps the refresh.
+    //   BRAE_CONTROL_U_BOUNDARY_FULL=1 (the existing control) turns this off with it.
+    const bool uAllStatic = [&]()
+    {
+        if (!f.mrfZones.empty())
+        {
+            return false;
+        }
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const auto* p = f.U.boundary[pi].get();
+            if (!p)
+            {
+                return false;
+            }
+            const std::type_info& t = typeid(*p);
+            if (t != typeid(NoSlipPatchField<vector>) && t != typeid(ZeroGradientPatchField<vector>))
+            {
+                return false;
+            }
+        }
+        return true;
+    }();
+    if (uAllStatic)
+    {
+        std::printf("  U boundary: every patch is noSlip or zeroGradient, so the device boundary's state is built once "
+                    "and not refreshed; BRAE_CONTROL_U_BOUNDARY_FULL=1 refreshes it at every call\n");
+    }
     H.updateUBoundary =
         [&](const DeviceBuffer<scalar>& ux, const DeviceBuffer<scalar>& uy,
             const DeviceBuffer<scalar>& uz, DeviceVectorBoundary& db, DeviceBuffer<scalar>* ubOut,
@@ -2979,6 +3012,10 @@ RunReport runInterFoamDevice(
                 oz.data());
             cudaCheck(cudaGetLastError(), "mirrorEmptyFacesKernel");
         };
+        // a static boundary that a full build has already put in this object: nothing to key and nothing to refresh
+        const bool staticFast = uAllStatic && !uBoundaryFull && uBoundaryBuiltIn == &db
+                             && uBoundaryBuiltEpoch == meshGeometryEpoch && uBoundaryBuiltAddressing == dm.addressingId;
+        if (!staticFast)
         {
             // the key first, which is cheap: equal keys give equal non-state arrays (deviceVectorBoundaryShape),
             // so only the state is built; otherwise everything is, and checked against the last full build
@@ -5149,6 +5186,54 @@ RunReport runInterFoamDevice(
     // Time::writeTime_ for the step being taken, decided at its start (as ++runTime is), and the alpha flux
     // its last alpha solve leaves, copied out on the device only on a write step
     bool writeNow = false;
+    // The step's buffers are kept on a write step -- and on EVERY step when a function object can end the run
+    // (runTimeControl satisfiedAction end): that step is written whether or not it is a write time, and the alpha
+    // flux and the old alpha it writes can only be taken while the step runs.
+    bool capture = false;
+    bool foStop = false;
+    // The function objects of the case's controlDict, run on the state each step leaves (see
+    // inter_function_objects.cuh). Host views of the device fields, downloaded when an object asks and once per
+    // step; a step in which nothing is due downloads nothing.
+    std::vector<scalar> foA, foP, foUx, foUy, foUz, foPatch;
+    bool foAValid = false, foPValid = false, foUxValid = false, foUyValid = false, foUzValid = false;
+    std::shared_ptr<brae::fo::FunctionObjectList> fos;
+    {
+        brae::fo::Source src;
+        src.newStep = [&]() { foAValid = foPValid = foUxValid = foUyValid = foUzValid = false; };
+        src.alpha = [&]() -> const std::vector<scalar>&
+        {
+            if (!foAValid) { dA.copyTo(foA); foAValid = true; }
+            return foA;
+        };
+        src.p_rgh = [&]() -> const std::vector<scalar>&
+        {
+            if (!foPValid) { dPrgh.copyTo(foP); foPValid = true; }
+            return foP;
+        };
+        src.Ux = [&]() -> const std::vector<scalar>&
+        {
+            if (!foUxValid) { dUx.copyTo(foUx); foUxValid = true; }
+            return foUx;
+        };
+        src.Uy = [&]() -> const std::vector<scalar>&
+        {
+            if (!foUyValid) { dUy.copyTo(foUy); foUyValid = true; }
+            return foUy;
+        };
+        src.Uz = [&]() -> const std::vector<scalar>&
+        {
+            if (!foUzValid) { dUz.copyTo(foUz); foUzValid = true; }
+            return foUz;
+        };
+        // the host's patch values, as the hooks left them -- what the writer writes
+        src.alphaPatch = [&](std::size_t pi) -> const std::vector<scalar>&
+        {
+            foPatch = f.alpha1.boundary[pi]->value();
+            return foPatch;
+        };
+        fos = brae::fo::createFunctionObjects(caseDir, startDir, m, g, fvp, f.cellZones, f.alphaName,
+                                              f.meshIsDynamic, src);
+    }
     DeviceBuffer<scalar> dAlphaPhiWriteI, dAlphaPhiWriteB, dAlphaPhiWriteIf;
     // alpha.<phase1>_0 of a sub-cycled alpha: alpha as the step found it, downloaded only on a write step
     std::vector<scalar> alphaOldWrite;
@@ -5927,7 +6012,8 @@ RunReport runInterFoamDevice(
                 writer->stepTaken(rep.deltaT);
                 writeNow = writer->isWriteTime(f.startTimeIndex + stepIndex, indexMoved);
             }
-            if (writeNow && writer->writesAlphaOld())
+            capture = writeNow || (fos && fos->canStop());
+            if (capture && writer && writer->writesAlphaOld())
             {
                 dA.copyTo(alphaOldWrite);
                 alphaOldBndWrite.assign(f.alpha1.boundary.size(), std::vector<scalar>());
@@ -5936,10 +6022,10 @@ RunReport runInterFoamDevice(
                     alphaOldBndWrite[pi] = f.alpha1.boundary[pi]->value();
                 }
             }
-            C.alphaPhiWriteInt = writeNow ? &dAlphaPhiWriteI : nullptr;
-            C.alphaPhiWriteBnd = writeNow ? &dAlphaPhiWriteB : nullptr;
-            C.alphaPhiWriteIf  = writeNow ? &dAlphaPhiWriteIf : nullptr;
-            C.alphaSubCycleBndWrite = (writeNow && writer->writesAlphaOld()) ? &dAlphaSubBndWrite : nullptr;
+            C.alphaPhiWriteInt = capture ? &dAlphaPhiWriteI : nullptr;
+            C.alphaPhiWriteBnd = capture ? &dAlphaPhiWriteB : nullptr;
+            C.alphaPhiWriteIf  = capture ? &dAlphaPhiWriteIf : nullptr;
+            C.alphaSubCycleBndWrite = (capture && writer && writer->writesAlphaOld()) ? &dAlphaSubBndWrite : nullptr;
         }
 
         // rho.oldTime() for the closure's ddt: f.rho still holds what the LAST step's hook left, and
@@ -6954,7 +7040,7 @@ RunReport runInterFoamDevice(
             // on a write step only. Without it the device wrote the start value (1 on a cold start).
             if (!f.meshIsDynamic)
             {
-                C.rAUOut = (writer && writeNow && writer->writesRAU()) ? &dRAU : nullptr;
+                C.rAUOut = (writer && capture && writer->writesRAU()) ? &dRAU : nullptr;
             }
             if (f.meshIsDynamic)
             {
@@ -7353,7 +7439,24 @@ RunReport runInterFoamDevice(
         // values as the hooks left them on the host. The closure is the exception: its download writes
         // f.turbulence, the host copy this loop never reads -- arm F of tests/interfoam_write_vs_openfoam.sh
         // holds the run byte-identical whether it writes every step or once.
-        if (writer && writeNow)
+        // function objects, on the state the step has just left (OpenFOAM runs them at the top of the next
+        // Time::run(), on this same state); one of them may end the run at this step
+        if (fos)
+        {
+            brae::fo::Step fs;
+            fs.timeIndex = f.startTimeIndex + rep.steps;
+            fs.time = rep.time;
+            fs.deltaT = rep.deltaT;
+            fs.sinceStart = rep.time - startTime;
+            fs.runTimeWrite = writeNow;
+            foStop = fos->execute(fs);
+            if (foStop)
+            {
+                std::printf("  function objects: a runTimeControl ends the run at t = %.17g; this time is "
+                            "written\n", (double)rep.time);
+            }
+        }
+        if (writer && (writeNow || foStop))
         {
             std::vector<scalar> aW, prghW, pW, ux, uy, uz;
             dA.copyTo(aW);
@@ -7558,6 +7661,10 @@ RunReport runInterFoamDevice(
                         "alpha [%.3e, %.15g]\n",
                         (double)rep.time, (double)rep.deltaT, (double)rep.CoNum,
                         (double)rep.alphaCoNum, (double)lo, (double)hi);
+        }
+        if (foStop)
+        {
+            break;
         }
     }
 
