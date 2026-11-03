@@ -1235,12 +1235,15 @@ public:
         if (op_ != "volIntegrate") { emit(s, rt); return; }
         deviceDue_ = true;
         deviceResults_.clear();
-        for (const std::string& f : fields_)
+        // one plan per field, made on the first write and kept: a plan holds the expression nodes and the
+        // region's cell list on the device, so a fresh one at every write is a leak of the cell list per step
+        devicePlans_.resize(fields_.size());
+        for (std::size_t i = 0; i < fields_.size(); ++i)
         {
-            deviceResults_.push_back(rt.queueDeviceIntegral(f, region_.all ? nullptr : region_.cells.data(),
+            deviceResults_.push_back(rt.queueDeviceIntegral(fields_[i], region_.all ? nullptr : region_.cells.data(),
                                                              region_.all ? static_cast<label>(rt.nCells())
                                                                          : static_cast<label>(region_.cells.size()),
-                                                             devicePlans_.emplace_back()));
+                                                             devicePlans_[i]));
         }
     }
 
