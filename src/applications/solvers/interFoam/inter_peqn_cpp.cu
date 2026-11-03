@@ -432,7 +432,8 @@ bool adjustPhi(
     SurfaceScalarField& phi,
     const GeometricField<vector>& U,
     bool needReference,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    scalar sumMagInternal)
 {
     if (!needReference) return false;
     scalar massIn = 0;
@@ -469,10 +470,14 @@ bool adjustPhi(
     // 1 + 2e-8, internal flux 1) OpenFOAM stops and the inflated normaliser (3) let the run continue.
     // The simpleFoam and rhoSimpleFoam twins were corrected for the same thing; this one is shared by
     // the pressure corrector and CorrectPhi, on both arms.
-    scalar sumMagPhi = 0;
-    for (const scalar v : phi.internal)
+    scalar sumMagPhi = sumMagInternal;
+    if (sumMagPhi < 0)
     {
-        sumMagPhi += std::fabs(v);
+        sumMagPhi = 0;
+        for (const scalar v : phi.internal)
+        {
+            sumMagPhi += std::fabs(v);
+        }
     }
     const scalar totalFlux = scalar(1e-300) + sumMagPhi;
     scalar massCorr = 1;

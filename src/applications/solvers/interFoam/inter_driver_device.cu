@@ -4666,12 +4666,28 @@ RunReport runInterFoamDevice(
     // step hands over: U's patch TYPES decide which faces are adjustable (adjustPhi reads no U values),
     // and those live on the host. Coupled patches are not in the device array and stay empty here, which
     // adjustPhi.C:57 skips anyway.
+    // THE INTERNAL FLUX STAYS ON THE DEVICE. adjustPhi reads the internal faces for one number, gSum(mag(phi)),
+    // the normaliser of its balance tests (adjustPhi.C:91); it scales boundary faces only. The hook used to bring
+    // the whole internal flux down every corrector (59 MB, three a step on the G4 tank, 13% of the step by nsys)
+    // to sum it on the host; the device reduces it and the host receives one scalar. The sum is in a different
+    // order from the host's sequential one, which moves totalFlux in its last bits: it feeds only the 1e-15 and
+    // 1e-8 relative thresholds and the error text, never massCorr. BRAE_CONTROL_ADJUSTPHI_HOST_SUM=1 sums on the
+    // host as before.
+    static const bool adjustPhiHostSum = std::getenv("BRAE_CONTROL_ADJUSTPHI_HOST_SUM") != nullptr;
     H.pressure.adjustPhi = [&](const DeviceBuffer<scalar>& phiHI, DeviceBuffer<scalar>& phiHB)
     {
         SurfaceScalarField ph;
-        phiHI.copyTo(ph.internal);
+        scalar sumMag = -1;
+        if (adjustPhiHostSum)
+        {
+            phiHI.copyTo(ph.internal);
+        }
+        else
+        {
+            sumMag = deviceSumMag(phiHI);
+        }
         unflatten(phiHB, ph.boundary);
-        cpu::interFoam::adjustPhi(ph, f.U, true, fvp);
+        cpu::interFoam::adjustPhi(ph, f.U, true, fvp, sumMag);
         phiHB.copyFrom(flattenPatches(ph.boundary, fvp));
     };
     H.pressure.updateBoundary = [&](const DeviceBuffer<scalar>& pr)
