@@ -183,6 +183,24 @@ void prghFluxCoeffsKernel(
     bC[b] = (-pGamma) * sn;          // ...and its gradientBoundaryCoeffs is the gradient
 }
 
+// snGrad(rho) on an uncoupled patch's faces, where rho's patch is a fixedValue of its own values: the gradient
+// coefficients' sum, (-deltaCoeffs)*rho_cell + rho_b*deltaCoeffs, with each operation rounded on its own as the
+// host's is (the explicit intrinsics are not contracted into an fma).
+__global__
+void snGradRhoBoundaryKernel(
+    int nB,
+    const label* __restrict__ cell,
+    const scalar* __restrict__ rho,
+    const scalar* __restrict__ rhoB,
+    const scalar* __restrict__ dc,
+    scalar* __restrict__ out)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nB) return;
+    const scalar d = dc[b];
+    out[b] = __dadd_rn(__dmul_rn(-d, rho[cell[b]]), __dmul_rn(rhoB[b], d));
+}
+
 // fixedGradientFvPatchField::evaluate: the cell's value plus gradient/deltaCoeffs
 __global__
 void prghEvaluateKernel(
@@ -3571,6 +3589,52 @@ RunReport runInterFoamDevice(
         ubOut[2].copyFrom(bz);
         part.reset();
     };
+    // THE INTERFACE FORCES WITHOUT THE HOST'S FIELDS. With the contact angle on the device the hook's inputs are
+    // already device buffers, and what it did with host copies of alpha, K and rho was: the mixture's nu on the host
+    // (alpha down, a loop, nu up), rho's patch lists and a whole host field around them for snGrad(rho)'s patch
+    // faces. The G4 tank: alpha, K and rho down 17 ms, mu and nu 19 ms, snGrad(rho) 21 ms of a 373 ms step. Here nu
+    // is the contact-angle mixture kernel's own formula on the cells (the caMixtureKernel arithmetic, the host's
+    // mixtureMu/mixtureNu term by term), and snGrad(rho)'s patch faces one kernel; rho's patch values are kept on
+    // the device and the host's list is made where the writer reads it (and at the end of the run, with the host
+    // copies of K, mu and nu a caller may read). Not on a coupled or empty patch, a closure, a momentum predictor,
+    // CrankNicolson, a moving mesh, with taps, or under the checks that compare the host's state.
+    //   BRAE_CONTROL_FORCES_FIELDS_HOST=1 brings alpha, K and rho down and does the host's work, as before
+    static const bool forcesFieldsHost = std::getenv("BRAE_CONTROL_FORCES_FIELDS_HOST") != nullptr;
+    const bool forcesFast = [&]()
+    {
+        if (forcesFieldsHost || !contactAngleDevice || !cyclics.empty() || hostClosure || f.turbulence.on
+            || f.momentumPredictorOn || f.meshIsDynamic || tapsOut != nullptr
+            || f.ddtU == DdtScheme::CrankNicolson || f.ddtAlpha == AlphaDdt::CrankNicolson
+            || std::getenv("BRAE_CONTROL_FORCES_HOST") || std::getenv("BRAE_CONTROL_FORCES_CHECK")
+            || std::getenv("BRAE_CONTROL_HOOKS_EMPTY_CHECK") || std::getenv("BRAE_CONTROL_HOOKS_EMPTY_POISON")
+            || fvp.empty())
+        {
+            return false;
+        }
+        std::size_t nFaces = 0;
+        for (const FvPatch& q : fvp)
+        {
+            if (q.type == "empty" || isCoupledInterfaceType(q.type)) return false;
+            nFaces += static_cast<std::size_t>(q.size);
+        }
+        return nFaces == static_cast<std::size_t>(dm.nBndFaces) && nFaces > 0;
+    }();
+    DeviceBuffer<scalar> dRhoBLast, dRhoDc, dTmpRho, dTmpMu;
+    DeviceBuffer<label> dRhoCell;
+    if (forcesFast)
+    {
+        std::vector<scalar> dc;
+        std::vector<label> cell;
+        for (const FvPatch& q : fvp)
+        {
+            dc.insert(dc.end(), q.deltaCoeffs.begin(), q.deltaCoeffs.end());
+            cell.insert(cell.end(), q.faceCells.begin(), q.faceCells.end());
+        }
+        dRhoDc.copyFrom(dc);
+        dRhoCell.copyFrom(cell);
+        std::printf("  interface forces: alpha, K and rho stay on the GPU, the mixture's nu and snGrad(rho)'s patch "
+                    "faces are made there; BRAE_CONTROL_FORCES_FIELDS_HOST=1 brings them down\n");
+    }
     H.interfaceForces =
         [&](const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& Kd,
             const DeviceBuffer<scalar>& rd, const DeviceBuffer<scalar>& rhoBd,
@@ -3586,9 +3650,12 @@ RunReport runInterFoamDevice(
         // value OpenFOAM wrote, exactly on its owner cell.
         std::optional<interPhase::Nested> forcesPart;
         forcesPart.emplace("forces hook: alpha, K and rho down");
-        a.copyTo(f.alpha1.internal);
-        Kd.copyTo(f.K);
-        rd.copyTo(f.rho);
+        if (!forcesFast)
+        {
+            a.copyTo(f.alpha1.internal);
+            Kd.copyTo(f.K);
+            rd.copyTo(f.rho);
+        }
         forcesPart.reset();
         // THE FACE LOOPS ON THE DEVICE where no pair is in them: the internal faces of the surface-tension
         // flux and of snGrad(rho) by the kernels above, the patch faces by the host's own branch. MEASURED on
@@ -3864,28 +3931,43 @@ RunReport runInterFoamDevice(
             // not empty run by run where an empty patch's entries stay on the GPU: its list keeps its size and
             // is read by nobody (the poison says so)
             const bool rhoByRuns = ep.kept && !hooksEmptyCheck;
-            unflatten(rhoBd, stepRhoBnd, !rhoByRuns, hooksEmptyPoison);
-            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            if (forcesFast)
             {
-                const FvPatch& q = fvp[pi];
-                if (!isCoupledInterfaceType(q.type)) continue;
-                stepRhoBnd[pi].resize(static_cast<std::size_t>(q.size));
-                for (label i = 0; i < q.size; ++i)
+                deviceCopy(dRhoBLast, rhoBd);
+            }
+            else
+            {
+                unflatten(rhoBd, stepRhoBnd, !rhoByRuns, hooksEmptyPoison);
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    stepRhoBnd[pi][static_cast<std::size_t>(i)] = coupledLinear(q, i, f.rho);
+                    const FvPatch& q = fvp[pi];
+                    if (!isCoupledInterfaceType(q.type)) continue;
+                    stepRhoBnd[pi].resize(static_cast<std::size_t>(q.size));
+                    for (label i = 0; i < q.size; ++i)
+                    {
+                        stepRhoBnd[pi][static_cast<std::size_t>(i)] = coupledLinear(q, i, f.rho);
+                    }
+                }
+                if (deviceClosure)
+                {
+                    deviceCopy(dStepRhoBnd, rhoBd);
                 }
             }
-            if (deviceClosure)
-            {
-                deviceCopy(dStepRhoBnd, rhoBd);
-            }
-            const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, stepRhoBnd, fvp, !rhoByRuns);
+            const GeometricField<scalar> rhoF = forcesFast ? GeometricField<scalar>()
+                                                           : rhoWithPatchValues(f.rho, stepRhoBnd, fvp, !rhoByRuns);
             snRho.resize(static_cast<std::size_t>(nIf) + ep.nBndAll);
             DeviceBuffer<scalar> gRx;
             DeviceBuffer<scalar> gRy;
             DeviceBuffer<scalar> gRz;
             deviceSnGradInternal(rd, rhoBd, f.gradRho, gRx, gRy, gRz, snRho);
-            if (ep.kept)
+            if (forcesFast)
+            {
+                const int nB = dm.nBndFaces;
+                snGradRhoBoundaryKernel<<<(nB + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                    nB, dRhoCell.data(), rd.data(), rhoBd.data(), dRhoDc.data(), snRho.data() + nIf);
+                cudaCheck(cudaGetLastError(), "snGradRhoBoundaryKernel");
+            }
+            else if (ep.kept)
             {
                 appendBoundaryRuns(snRho, snRho, snGradBoundary(rhoF, fvp, true, true), "snGrad(rho)");
                 emptySet(snRho.data() + nIf, scalar(0), "snGradRho");
@@ -4026,8 +4108,11 @@ RunReport runInterFoamDevice(
 
         // the mixture's own nu. NOTE mixtureNu's second argument is mu, not alpha2.
         forcesPart.emplace("forces hook: the mixture's mu and nu, the pair's share, nu up");
-        cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
-        cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
+        if (!forcesFast)
+        {
+            cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
+            cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
+        }
         // ...and the COUPLED patches' share of the mixture boundary, which is the two CELLS'
         // interpolated (updateMixtureBoundary's coupled branch, inter_case_cpp.cu:141-163) and so is
         // only as current as f.rho, f.mu and f.nu -- which this hook has just rebuilt. The alpha hook
@@ -4077,7 +4162,15 @@ RunReport runInterFoamDevice(
         {
             // laminar (the device path's condition): nuEff is the mixture's nu, the boundary the last hook's,
             // taken before its curvature pass
-            nuC.copyFrom(f.nu);
+            if (forcesFast)
+            {
+                deviceContactAngleMixture(a, f.mixture.phases.rho1, f.mixture.phases.nu1, f.mixture.phases.rho2,
+                                          f.mixture.phases.nu2, dTmpRho, dTmpMu, nuC);
+            }
+            else
+            {
+                nuC.copyFrom(f.nu);
+            }
             deviceCopy(nuB, dContactNuB);
             if (ep.kept) emptyMirror(nuB.data(), nuC, "nu");
         }
@@ -8240,6 +8333,7 @@ RunReport runInterFoamDevice(
                     deviceFluxConditional(dTurb.dbEps, dTurb.epsilon, second);
                 }
             }
+            if (forcesFast) unflatten(dRhoBLast, stepRhoBnd);
             const std::vector<std::vector<scalar>> pB =
                 pPatchesFrozen ? pBFrozen : staticPressureBoundary(f.p_rgh, stepRhoBnd, f.ghfBoundary);
             InterWriteState ws;
@@ -8435,6 +8529,13 @@ RunReport runInterFoamDevice(
     f.p_rgh.evaluateBoundary();
     dP.copyTo(f.p);
     dRho.copyTo(f.rho);
+    if (forcesFast)
+    {
+        dK.copyTo(f.K);
+        cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
+        cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
+        unflatten(dRhoBLast, stepRhoBnd);
+    }
     // ...and alpha's patches and the mixture's boundary as the last hook left them, for the caller
     if (contactAngleDevice)
     {
