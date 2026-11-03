@@ -30,6 +30,7 @@
 #include "fvc.cuh"
 #include "brae_notice.cuh"
 #include "device_inter_step.cuh"
+#include "device_interface_properties.cuh"
 #include "device_inter_turbulence.cuh"
 #include "device_blas.cuh"
 #include "device_alpha_courant.cuh"
@@ -1727,6 +1728,169 @@ RunReport runInterFoamDevice(
         dStStart.copyFrom(nHatStencil.start);
         dStFaces.copyFrom(nHatStencil.faces);
     };
+
+    // THE CONTACT-ANGLE BOUNDARY ON THE GPU (DeviceContactAngleState): the alpha hooks' evaluate, the boundary
+    // normal with the contact angle's rotation and wall-gradient write-back, the relaxed assignment, the
+    // pre-pass mixture boundary and the divergence coefficients, on the host field's own state carried on the
+    // device (`stored` values and the contact angle's `refGrad`) and in the host's arithmetic. MEASURED on G4
+    // (2.48M cells, 533,594 wall faces), the two hooks this replaces: 97.1 + 90.3 ms a step on the host.
+    // Taken only for constantAlphaContactAngle, zeroGradient and empty alpha patches under an unsmoothed Gauss
+    // nHat, with no host consumer of alpha's or the mixture's patch values between the hooks (the patch
+    // classes and controls tested below). Anything else keeps the host hooks, unchanged.
+    //   BRAE_CONTROL_HOST_CONTACT_ANGLE=1: the host hooks whatever the case -- the identity check's other arm
+    static const bool hostContactAngle = std::getenv("BRAE_CONTROL_HOST_CONTACT_ANGLE") != nullptr;
+    DeviceContactAngleState dContact;
+    DeviceBuffer<scalar> dContactRhoB, dContactMuB, dContactNuB;
+    std::vector<std::size_t> contactPatchStart(fvp.size(), 0);
+    std::string contactWhyHost;
+    {
+        std::vector<label> kind, lim, fc;
+        std::vector<scalar> th, dcv, nx, ny, nz, rg, st;
+        bool anyContact = false;
+        for (std::size_t pi = 0; pi < fvp.size() && contactWhyHost.empty(); ++pi)
+        {
+            const FvPatch& q = fvp[pi];
+            const fvPatchField<scalar>& ap = *f.alpha1.boundary[pi];
+            contactPatchStart[pi] = kind.size();
+            if (isCoupledInterfaceType(q.type) || q.coupled)
+            {
+                contactWhyHost = "alpha's patch `" + q.name + "` is coupled";
+                break;
+            }
+            label k = -1;
+            const FixedGradientPatchField<scalar>* fg = dynamic_cast<const FixedGradientPatchField<scalar>*>(&ap);
+            if (q.type == "empty" && dynamic_cast<const EmptyPatchField<scalar>*>(&ap)) k = 2;
+            else if (ap.contactAngleTheta0() >= scalar(0) && ap.contactAngleLimitMode() >= 0 && fg) k = 1;
+            else if (ap.contactAngleTheta0() < scalar(0) && dynamic_cast<const ZeroGradientPatchField<scalar>*>(&ap)) k = 0;
+            if (k < 0)
+            {
+                contactWhyHost = "alpha's patch `" + q.name + "` is of a class the device boundary does not carry";
+                break;
+            }
+            anyContact = anyContact || k == 1;
+            const scalar theta = k == 1 ? ap.contactAngleTheta0()*scalar(M_PI)/scalar(180) : scalar(0);
+            const std::vector<scalar>& v = ap.value();
+            for (label i = 0; i < q.size; ++i)
+            {
+                const std::size_t ii = static_cast<std::size_t>(i);
+                kind.push_back(k);
+                lim.push_back(k == 1 ? ap.contactAngleLimitMode() : 0);
+                fc.push_back(q.faceCells[ii]);
+                th.push_back(theta);
+                dcv.push_back(q.deltaCoeffs[ii]);
+                nx.push_back(q.nf[ii].x);
+                ny.push_back(q.nf[ii].y);
+                nz.push_back(q.nf[ii].z);
+                rg.push_back(k == 1 ? (*fg->refGradPtr())[ii] : scalar(0));
+                st.push_back(ii < v.size() ? v[ii] : scalar(0));
+            }
+        }
+        if (contactWhyHost.empty() && !anyContact) contactWhyHost = "no alpha patch is a contact angle";
+        if (contactWhyHost.empty())
+        {
+            dContact.n = static_cast<int>(kind.size());
+            dContact.kind.copyFrom(kind);
+            dContact.limit.copyFrom(lim);
+            dContact.faceCell.copyFrom(fc);
+            // b1 = cos(theta) by the host's libm, as interfaceProperties' correctContactAngle takes it
+            std::vector<scalar> ct(th.size());
+            for (std::size_t i = 0; i < th.size(); ++i) ct[i] = std::cos(th[i]);
+            dContact.cosTheta.copyFrom(ct);
+            dContact.hostKind = kind;
+            dContact.hostTheta = th;
+            dContact.deltaCoeffs.copyFrom(dcv);
+            dContact.nfx.copyFrom(nx);
+            dContact.nfy.copyFrom(ny);
+            dContact.nfz.copyFrom(nz);
+            dContact.refGrad.copyFrom(rg);
+            dContact.stored.copyFrom(st);
+        }
+    }
+    if (contactWhyHost.empty())
+    {
+        nHatStencilCurrent();
+        const auto uCarried = [&](std::size_t pi)
+        {
+            const fvPatchField<vector>* up = f.U.boundary[pi].get();
+            return dynamic_cast<const NoSlipPatchField<vector>*>(up) || dynamic_cast<const ZeroGradientPatchField<vector>*>(up)
+                || dynamic_cast<const EmptyPatchField<vector>*>(up);
+        };
+        for (std::size_t pi = 0; pi < fvp.size() && contactWhyHost.empty(); ++pi)
+        {
+            const fvPatchField<scalar>& pp = *f.p_rgh.boundary[pi];
+            const int pc = pp.bcCategory();
+            if (!uCarried(pi)) contactWhyHost = "U's patch `" + fvp[pi].name + "` is evaluated on the host between the alpha hooks";
+            else if (pc == 3 || pc == 4 || pc == 7 || pp.fluxName() == "rhoPhi" || pp.isPrghPermeableAlphaTotalPressure()
+                  || pp.isPorousBafflePressure())
+                contactWhyHost = "p_rgh's patch `" + fvp[pi].name + "` reads the flux or the mixture the alpha hooks tell it";
+        }
+        if (!contactWhyHost.empty()) {}
+        else if (hostContactAngle) contactWhyHost = "BRAE_CONTROL_HOST_CONTACT_ANGLE is set";
+        else if (std::getenv("BRAE_NO_CONTACT_ANGLE")) contactWhyHost = "BRAE_NO_CONTACT_ANGLE is set";
+        else if (nHatFull || nHatHostGradient || nHatEmptyCells || nHatOwnerOnly
+              || !interfaceProps::nHatBoundaryOnlyApplies(f.interface, false, nHatStencil) || !nHatStencil.skipEmpty)
+            contactWhyHost = "nHat is not the unsmoothed Gauss linear boundary-stencil form";
+        else if (!cyclics.empty() || f.waves.any || hasPerFaceAlphaFixes || hostClosure || f.turbulence.on
+              || f.meshIsDynamic || (f.amr && f.amr->active) || (writer && writer->writesAlphaOld()))
+            contactWhyHost = "the case has a feature whose host code reads alpha's patches";
+        else if (fluxEmptyFromHost || fluxDivFromHostCopy
+              || std::getenv("BRAE_CONTROL_NHAT_BOUNDARY_CHECK") || std::getenv("BRAE_CONTROL_HOOKS_EMPTY_CHECK")
+              || std::getenv("BRAE_CONTROL_HOOKS_EMPTY_POISON") || std::getenv("BRAE_CONTROL_MIXTURE_REPEAT_CHECK")
+              || std::getenv("BRAE_CONTROL_FORCES_HOST") || std::getenv("BRAE_CONTROL_FORCES_CHECK")
+              || std::getenv("BRAE_CONTROL_FLUX_DIVCOEFFS_CHECK"))
+            contactWhyHost = "a control that reads the host hooks' state is set";
+    }
+    const bool contactAngleDevice = contactWhyHost.empty();
+    if (contactAngleDevice)
+    {
+        std::printf("  contact angle: alpha's patches, the boundary normal, the wall gradient and the mixture's boundary "
+                    "on the GPU (%d faces); BRAE_CONTROL_HOST_CONTACT_ANGLE=1 takes the host hooks\n", dContact.n);
+    }
+    else if (contactWhyHost != "no alpha patch is a contact angle")
+    {
+        std::printf("  contact angle: the host hooks (%s)\n", contactWhyHost.c_str());
+    }
+    // the boundary normal of one curvature pass: the stencil cells' internal sums by the same kernel the host
+    // hooks' form uses, and the rest on the device
+    auto contactNHat = [&](const DeviceBuffer<scalar>& aDev, DeviceBuffer<scalar>& nBnd)
+    {
+        nHatStencilCurrent();
+        const int nSt = static_cast<int>(nHatStencil.cells.size());
+        dStAcc.resize(3*static_cast<std::size_t>(nSt));
+        if (nSt > 0)
+        {
+            nHatStencilInternalKernel<<<(nSt + 255)/256, 256>>>(
+                nSt, dStCells.data(), dStStart.data(), dStFaces.data(), dm.owner.data(), dm.nei.data(), dm.w.data(),
+                dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), aDev.data(), false,
+                dStAcc.data(), dStAcc.data() + nSt, dStAcc.data() + 2*static_cast<std::size_t>(nSt));
+            cudaCheck(cudaGetLastError(), "nHatStencilInternalKernel");
+        }
+        deviceContactAngleNHat(dm, dContact, aDev, dStCells, dStAcc, nSt, f.interface.deltaN, nBnd);
+    };
+    // the pre-pass mixture boundary, from the patch values the hook hands the step
+    auto contactMixture = [&](const DeviceBuffer<scalar>& aBnd)
+    {
+        deviceContactAngleMixture(aBnd, f.mixture.phases.rho1, f.mixture.phases.nu1, f.mixture.phases.rho2,
+                                  f.mixture.phases.nu2, dContactRhoB, dContactMuB, dContactNuB);
+    };
+    // alpha's patch values and the contact angles' gradients back into the host field, for a reader there (the
+    // writer, a function object, the caller after the run)
+    auto contactToHost = [&]()
+    {
+        const std::vector<scalar> v = dContact.stored.host();
+        const std::vector<scalar> gr = dContact.refGrad.host();
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const std::size_t at = contactPatchStart[pi];
+            const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+            f.alpha1.boundary[pi]->setValue(std::vector<scalar>(v.begin() + at, v.begin() + at + n));
+            if (f.alpha1.boundary[pi]->contactAngleTheta0() >= scalar(0))
+            {
+                dynamic_cast<FixedGradientPatchField<scalar>&>(*f.alpha1.boundary[pi])
+                    .setGradient(std::vector<scalar>(gr.begin() + at, gr.begin() + at + n));
+            }
+        }
+    };
     auto boundaryNHat = [&](SurfaceScalarField& nHb, const DeviceBuffer<scalar>& aDev)
     {
         nHatStencilCurrent();
@@ -2346,6 +2510,17 @@ RunReport runInterFoamDevice(
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd, DeviceBuffer<scalar>& nBnd)
     {
         interPhase::Nested timed("hook alpha.updateBoundary");
+        if (contactAngleDevice)
+        {
+            std::optional<interPhase::Nested> part;
+            part.emplace("alpha hook (device): the patches evaluated, the mixture's boundary");
+            deviceContactAngleEvaluate(dContact, a, true);
+            deviceCopy(aBnd, dContact.stored);
+            contactMixture(aBnd);
+            part.emplace("alpha hook (device): the boundary normal and the contact angle");
+            contactNHat(a, nBnd);
+            return;
+        }
         std::optional<interPhase::Nested> part;
         part.emplace("alpha hook: the flux to the patches");
         pushFlux();
@@ -2371,6 +2546,12 @@ RunReport runInterFoamDevice(
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd)
     {
         interPhase::Nested timed("hook alpha.refreshBoundary");
+        if (contactAngleDevice)
+        {
+            deviceContactAngleEvaluate(dContact, a, true);
+            deviceCopy(aBnd, dContact.stored);
+            return;
+        }
         pushFlux();
         a.copyTo(f.alpha1.internal);
         alphaBoundaryUp(hooksEmptyPlan(), AlphaUp::evaluated, &a, aBnd);
@@ -2382,6 +2563,11 @@ RunReport runInterFoamDevice(
         H.alpha.storedBoundary = [&](DeviceBuffer<scalar>& aBnd)
         {
             interPhase::Nested timed("hook alpha.storedBoundary");
+            if (contactAngleDevice)
+            {
+                deviceCopy(aBnd, dContact.stored);
+                return;
+            }
             alphaBoundaryUp(hooksEmptyPlan(), AlphaUp::stored, nullptr, aBnd);
         };
     }
@@ -2400,6 +2586,12 @@ RunReport runInterFoamDevice(
             DeviceBuffer<scalar>& aBnd)
     {
         interPhase::Nested timed("hook alpha.relaxBoundary");
+        if (contactAngleDevice)
+        {
+            deviceContactAngleRelax(dContact, postMules, relaxed, !hooksEmptyPlan().kept);
+            deviceCopy(aBnd, dContact.stored);
+            return;
+        }
         pushFlux();
         // (an empty patch kept on the GPU takes no part on the host: no alpha10 is copied for it, it is not
         // evaluated, relaxAlphaBoundary leaves it, and its entry is the relaxed cells' -- hooksEmptyPlan)
@@ -2430,6 +2622,16 @@ RunReport runInterFoamDevice(
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd, DeviceBuffer<scalar>& nBnd)
     {
         interPhase::Nested timed("hook alpha.mixtureCorrect");
+        if (contactAngleDevice)
+        {
+            std::optional<interPhase::Nested> part;
+            part.emplace("alpha hook (device): the mixture's boundary");
+            deviceCopy(aBnd, dContact.stored);
+            contactMixture(aBnd);
+            part.emplace("alpha hook (device): the boundary normal and the contact angle");
+            contactNHat(a, nBnd);
+            return;
+        }
         pushFlux();
         a.copyTo(f.alpha1.internal);
         const HooksEmptyPlan ep = hooksEmptyPlan();
@@ -2562,6 +2764,13 @@ RunReport runInterFoamDevice(
             const DeviceBuffer<scalar>* phiCNBnd)
     {
         interPhase::Nested timed("hook alpha.divCoeffs");
+        if (contactAngleDevice)
+        {
+            // the host's evaluate here leaves an empty patch alone where its entries are kept on the GPU
+            deviceContactAngleEvaluate(dContact, a, !hooksEmptyPlan().kept);
+            deviceContactAngleDivCoeffs(dContact, phiCNBnd ? *phiCNBnd : dPhiB, iC, bC);
+            return;
+        }
         a.copyTo(f.alpha1.internal);
         // (the coefficients below are the patches' own and read no patch value; the device's array is not this
         // hook's to write, so an empty patch kept on the GPU is not evaluated here either)
@@ -3506,7 +3715,19 @@ RunReport runInterFoamDevice(
             // surfaceTensionForce() = interpolate(sigma*K)*snGrad(alpha1)
             forcesPart.emplace("forces hook (device): the surface-tension flux");
             DeviceBuffer<scalar> alphaBval;
-            valuesForGradient(f.alpha1, a, "alpha", alphaBval);
+            if (contactAngleDevice)
+            {
+                // the host field's patch values (valuesForGradient), as the GPU holds them
+                if (!ep.kept || snCorrD)
+                {
+                    deviceCopy(alphaBval, dContact.stored);
+                    if (ep.kept) emptyMirror(alphaBval.data(), a, "alpha");
+                }
+            }
+            else
+            {
+                valuesForGradient(f.alpha1, a, "alpha", alphaBval);
+            }
             stf.resize(static_cast<std::size_t>(nIf) + ep.nBndAll);
             DeviceBuffer<scalar> gAx;
             DeviceBuffer<scalar> gAy;
@@ -3532,7 +3753,12 @@ RunReport runInterFoamDevice(
                 }
                 return stfB;
             };
-            if (ep.kept)
+            if (contactAngleDevice)
+            {
+                // fvc::snGrad's patch faces from the GPU's wall gradients, times sigma*K of the face cell
+                deviceContactAngleSurfaceTension(dContact, a, Kd, f.interface.sigma, stf.data() + nIf);
+            }
+            else if (ep.kept)
             {
                 appendBoundaryRuns(stf, stf, stfBoundary(true), "the surface-tension flux");
                 emptyCellTimesZero(stf.data() + nIf, Kd, f.interface.sigma, "flux");
@@ -3786,7 +4012,15 @@ RunReport runInterFoamDevice(
                 hooksHeld("nu's patch values", nuB, 0, flattenPatches(lists, fvp));
             }
         };
-        if (deviceClosure)
+        if (contactAngleDevice)
+        {
+            // laminar (the device path's condition): nuEff is the mixture's nu, the boundary the last hook's,
+            // taken before its curvature pass
+            nuC.copyFrom(f.nu);
+            deviceCopy(nuB, dContactNuB);
+            if (ep.kept) emptyMirror(nuB.data(), nuC, "nu");
+        }
+        else if (deviceClosure)
         {
             // the mixture's nu alone: the step adds the device's nut (DeviceInterStepControls::nutCell)
             nuC.copyFrom(f.nu);
@@ -5359,6 +5593,18 @@ RunReport runInterFoamDevice(
         // the host's patch values, as the hooks left them -- what the writer writes
         src.alphaPatch = [&](std::size_t pi) -> const std::vector<scalar>&
         {
+            if (contactAngleDevice)
+            {
+                // the patch's values as the GPU holds them (the host field's are not kept current)
+                foPatch.resize(static_cast<std::size_t>(fvp[pi].size));
+                if (!foPatch.empty())
+                {
+                    cudaCheck(cudaMemcpy(foPatch.data(), dContact.stored.data() + contactPatchStart[pi],
+                                         foPatch.size()*sizeof(scalar), cudaMemcpyDeviceToHost),
+                              "alpha's patch values for a function object");
+                }
+                return foPatch;
+            }
             foPatch = f.alpha1.boundary[pi]->value();
             return foPatch;
         };
@@ -7672,6 +7918,8 @@ RunReport runInterFoamDevice(
         }
         if (writer && (writeNow || foStop))
         {
+            // the writer writes alpha's patch values and a contact angle's gradient from the host field
+            if (contactAngleDevice) contactToHost();
             if (uStaticDevice && staticUBBuilt)
             {
                 uDown(dUx, dUy, dUz);
@@ -7962,6 +8210,25 @@ RunReport runInterFoamDevice(
     f.p_rgh.evaluateBoundary();
     dP.copyTo(f.p);
     dRho.copyTo(f.rho);
+    // ...and alpha's patches and the mixture's boundary as the last hook left them, for the caller
+    if (contactAngleDevice)
+    {
+        contactToHost();
+        const std::vector<scalar> rb = dContactRhoB.host();
+        const std::vector<scalar> mb = dContactMuB.host();
+        const std::vector<scalar> nb = dContactNuB.host();
+        f.rhoBnd.resize(fvp.size());
+        f.muBnd.resize(fvp.size());
+        f.nuBnd.resize(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size() && !rb.empty(); ++pi)
+        {
+            const std::size_t at = contactPatchStart[pi];
+            const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+            f.rhoBnd[pi].assign(rb.begin() + at, rb.begin() + at + n);
+            f.muBnd[pi].assign(mb.begin() + at, mb.begin() + at + n);
+            f.nuBnd[pi].assign(nb.begin() + at, nb.begin() + at + n);
+        }
+    }
     if (deviceClosure)
     {
         downloadDeviceInterTurbulence(dTurb, f.turbulence, fvp);

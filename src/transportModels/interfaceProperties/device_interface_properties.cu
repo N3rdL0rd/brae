@@ -110,6 +110,219 @@ __global__ void negateKernel(scalar* __restrict__ x, int n)
     x[i] = -x[i];
 }
 
+// ---- the contact-angle boundary (DeviceContactAngleState) ---------------------------------------------
+// Separately rounded operations throughout: the host forms these in plain doubles, with no contraction.
+__device__ __forceinline__ scalar mulR(scalar a, scalar b) { return __dmul_rn(a, b); }
+__device__ __forceinline__ scalar addR(scalar a, scalar b) { return __dadd_rn(a, b); }
+__device__ __forceinline__ scalar subR(scalar a, scalar b) { return __dsub_rn(a, b); }
+__device__ __forceinline__ scalar divR(scalar a, scalar b) { return __ddiv_rn(a, b); }
+// a.x*b.x + a.y*b.y + a.z*b.z, left to right
+__device__ __forceinline__ scalar dot3R(scalar ax, scalar ay, scalar az, scalar bx, scalar by, scalar bz)
+{
+    return addR(addR(mulR(ax, bx), mulR(ay, by)), mulR(az, bz));
+}
+
+// One face's evaluate (fv_patch_field.cuh: ZeroGradientPatchField, EmptyPatchField, and
+// ConstantAlphaContactAnglePatchField's limiting body over FixedGradientPatchField::evaluate). `g` is the
+// face's gradient in and out; `value` the value it held before (what `limit gradient` clamps against).
+__device__ __forceinline__ scalar caEvaluateFace(label kind, label lim, scalar cell, scalar& g, scalar value,
+                                                 scalar dc)
+{
+    if (kind != 1) return cell;
+    if (lim == 1)
+    {
+        const scalar implied = addR(value, divR(g, dc));
+        const scalar clamped = implied < scalar(0) ? scalar(0) : (implied > scalar(1) ? scalar(1) : implied);
+        g = mulR(dc, subR(clamped, value));
+    }
+    else if (lim == 2)
+    {
+        g = scalar(0);
+    }
+    const scalar v = addR(cell, divR(g, dc));
+    return lim == 3 ? (v < scalar(0) ? scalar(0) : (v > scalar(1) ? scalar(1) : v)) : v;
+}
+
+__global__ void caEvaluateKernel(
+    int n, const label* __restrict__ kind, const label* __restrict__ lim, const label* __restrict__ fc,
+    const scalar* __restrict__ dc, const scalar* __restrict__ cells, scalar* __restrict__ refGrad,
+    scalar* __restrict__ stored, int empties)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= n) return;
+    if (kind[b] == 2 && !empties) return;
+    scalar g = refGrad[b];
+    stored[b] = caEvaluateFace(kind[b], lim[b], cells[fc[b]], g, stored[b], dc[b]);
+    if (kind[b] == 1) refGrad[b] = g;
+}
+
+__global__ void caRelaxKernel(
+    int n, const label* __restrict__ kind, const label* __restrict__ lim, const label* __restrict__ fc,
+    const scalar* __restrict__ dc, const scalar* __restrict__ postMules, const scalar* __restrict__ relaxed,
+    scalar* __restrict__ refGrad, scalar* __restrict__ stored, int emptiesAverage)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= n) return;
+    if (kind[b] == 2 && !emptiesAverage)
+    {
+        stored[b] = relaxed[fc[b]];
+        return;
+    }
+    const scalar alpha10 = stored[b];
+    scalar g = refGrad[b];
+    const scalar post = caEvaluateFace(kind[b], lim[b], postMules[fc[b]], g, alpha10, dc[b]);
+    if (kind[b] == 1) refGrad[b] = g;
+    stored[b] = addR(mulR(scalar(0.5), post), mulR(scalar(0.5), alpha10));
+}
+
+// finishNHatBoundary's gradient: a stencil cell's internal sum plus its boundary faces (ascending boundary
+// index = patch order, then face order; empty faces left out), over V.
+__global__ void caCellGradientKernel(
+    int nSt, const label* __restrict__ stCells, const scalar* __restrict__ acc,
+    const label* __restrict__ bndCellStart, const label* __restrict__ bndPerm,
+    const label* __restrict__ bndGFace, const label* __restrict__ bndIsEmpty,
+    const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
+    const scalar* __restrict__ stored, const scalar* __restrict__ V,
+    scalar* __restrict__ gx, scalar* __restrict__ gy, scalar* __restrict__ gz)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nSt) return;
+    const label cell = stCells[k];
+    scalar ax = acc[k], ay = acc[k + nSt], az = acc[k + 2*nSt];
+    for (label j = bndCellStart[cell]; j < bndCellStart[cell + 1]; ++j)
+    {
+        const label b = bndPerm[j];
+        if (bndIsEmpty[b]) continue;
+        const label f = bndGFace[b];
+        const scalar pv = stored[b];
+        ax = addR(ax, mulR(Sfx[f], pv));
+        ay = addR(ay, mulR(Sfy[f], pv));
+        az = addR(az, mulR(Sfz[f], pv));
+    }
+    gx[cell] = divR(ax, V[cell]);
+    gy[cell] = divR(ay, V[cell]);
+    gz[cell] = divR(az, V[cell]);
+}
+
+// nHatBoundary (interface_properties_cpp.cu) per face, first half: the corrected face gradient, its
+// magnitude, the unit normal, and a contact face's a12 = nHat & nf.
+__global__ void caNormalKernel(
+    int n, const label* __restrict__ kind, const label* __restrict__ fc,
+    const scalar* __restrict__ nfx, const scalar* __restrict__ nfy, const scalar* __restrict__ nfz,
+    const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
+    const scalar* __restrict__ refGrad, scalar deltaN,
+    scalar* __restrict__ hxo, scalar* __restrict__ hyo, scalar* __restrict__ hzo, scalar* __restrict__ mo,
+    scalar* __restrict__ a12o)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= n) return;
+    if (kind[b] == 2) return;
+    const label c = fc[b];
+    const scalar nx = nfx[b], ny = nfy[b], nz = nfz[b];
+    const scalar gcx = gx[c], gcy = gy[c], gcz = gz[c];
+    const scalar snA = kind[b] == 1 ? refGrad[b] : scalar(0);
+    const scalar nn = dot3R(nx, ny, nz, gcx, gcy, gcz);
+    const scalar d = subR(snA, nn);
+    const scalar gbx = addR(gcx, mulR(nx, d));
+    const scalar gby = addR(gcy, mulR(ny, d));
+    const scalar gbz = addR(gcz, mulR(nz, d));
+    // faceUnitNormal
+    const scalar m = __dsqrt_rn(dot3R(gbx, gby, gbz, gbx, gby, gbz));
+    const scalar s = divR(scalar(1), addR(m, deltaN));
+    const scalar hx = mulR(gbx, s), hy = mulR(gby, s), hz = mulR(gbz, s);
+    hxo[b] = hx;
+    hyo[b] = hy;
+    hzo[b] = hz;
+    mo[b] = m;
+    a12o[b] = kind[b] == 1 ? dot3R(hx, hy, hz, nx, ny, nz) : scalar(0);
+}
+
+// ...second half: correctContactAngle with b1 = cos(theta) and b2 = cos(acos(a12) - theta) as the HOST's libm
+// gives them, contactAngleGradient, the patch's evaluate after setGradient, and nHatf = nHat & Sf.
+__global__ void caContactKernel(
+    int n, const label* __restrict__ kind, const label* __restrict__ lim, const label* __restrict__ fc,
+    const scalar* __restrict__ dc, const scalar* __restrict__ cosTheta, const scalar* __restrict__ b2s,
+    const scalar* __restrict__ nfx, const scalar* __restrict__ nfy, const scalar* __restrict__ nfz,
+    const label* __restrict__ bndGFace,
+    const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
+    const scalar* __restrict__ hxi, const scalar* __restrict__ hyi, const scalar* __restrict__ hzi,
+    const scalar* __restrict__ mi, const scalar* __restrict__ a12i,
+    const scalar* __restrict__ cells, scalar deltaN,
+    scalar* __restrict__ refGrad, scalar* __restrict__ stored, scalar* __restrict__ nHatf)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= n) return;
+    if (kind[b] == 2)
+    {
+        nHatf[b] = scalar(0);
+        return;
+    }
+    scalar hx = hxi[b], hy = hyi[b], hz = hzi[b];
+    if (kind[b] == 1)
+    {
+        const scalar nx = nfx[b], ny = nfy[b], nz = nfz[b];
+        const scalar a12 = a12i[b];
+        const scalar b1 = cosTheta[b];
+        const scalar b2 = b2s[b];
+        const scalar det = subR(scalar(1), mulR(a12, a12));
+        const scalar A = divR(subR(b1, mulR(a12, b2)), det);
+        const scalar B = divR(subR(b2, mulR(a12, b1)), det);
+        const scalar vx = addR(mulR(A, nx), mulR(B, hx));
+        const scalar vy = addR(mulR(A, ny), mulR(B, hy));
+        const scalar vz = addR(mulR(A, nz), mulR(B, hz));
+        const scalar mv = __dsqrt_rn(dot3R(vx, vy, vz, vx, vy, vz));
+        const scalar s2 = divR(scalar(1), addR(mv, deltaN));
+        hx = mulR(vx, s2); hy = mulR(vy, s2); hz = mulR(vz, s2);
+        scalar g = mulR(dot3R(nx, ny, nz, hx, hy, hz), mi[b]);
+        stored[b] = caEvaluateFace(1, lim[b], cells[fc[b]], g, stored[b], dc[b]);
+        refGrad[b] = g;
+    }
+    const label f = bndGFace[b];
+    nHatf[b] = dot3R(hx, hy, hz, Sfx[f], Sfy[f], Sfz[f]);
+}
+
+// updateMixtureBoundary (inter_case_cpp.cu), uncoupled branch, with alpha2 = 1 - alpha1
+__global__ void caMixtureKernel(
+    int n, const scalar* __restrict__ a, scalar rho1, scalar nu1, scalar rho2, scalar nu2,
+    scalar* __restrict__ rho, scalar* __restrict__ mu, scalar* __restrict__ nu)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= n) return;
+    const scalar ab = a[b];
+    const scalar lo = ab < scalar(0) ? scalar(0) : ab;
+    const scalar ac = scalar(1) < lo ? scalar(1) : lo;
+    const scalar a2 = subR(scalar(1), ab);
+    rho[b] = addR(mulR(ab, rho1), mulR(a2, rho2));
+    const scalar oneMinus = subR(scalar(1), ac);
+    const scalar m = addR(mulR(mulR(ac, rho1), nu1), mulR(mulR(oneMinus, rho2), nu2));
+    mu[b] = m;
+    nu[b] = divR(m, addR(mulR(ac, rho1), mulR(oneMinus, rho2)));
+}
+
+__global__ void caDivCoeffsKernel(
+    int n, const label* __restrict__ kind, const scalar* __restrict__ refGrad, const scalar* __restrict__ dc,
+    const scalar* __restrict__ flux, scalar* __restrict__ iC, scalar* __restrict__ bC)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= n) return;
+    const scalar pf = flux[b];
+    const scalar vBC = kind[b] == 1 ? divR(refGrad[b], dc[b]) : scalar(0);
+    iC[b] = mulR(pf, scalar(1));
+    bC[b] = mulR(-pf, vBC);
+}
+
+__global__ void caSurfaceTensionKernel(
+    int n, const label* __restrict__ kind, const label* __restrict__ fc, const scalar* __restrict__ refGrad,
+    const scalar* __restrict__ cells, const scalar* __restrict__ K, scalar sigma, scalar* __restrict__ stf)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= n) return;
+    const label c = fc[b];
+    const scalar g = kind[b] == 1 ? refGrad[b] : scalar(0);
+    const scalar snA = addR(mulR(scalar(0), cells[c]), g);
+    stf[b] = mulR(mulR(sigma, K[c]), snA);
+}
+
 }   // namespace
 
 
@@ -241,4 +454,112 @@ void deviceInterfaceCorrect(
     }
 }
 
+
+void deviceContactAngleEvaluate(DeviceContactAngleState& s, const DeviceBuffer<scalar>& cells, bool empties)
+{
+    if (s.n <= 0) return;
+    caEvaluateKernel<<<nBlocks(s.n), TPB>>>(s.n, s.kind.data(), s.limit.data(), s.faceCell.data(),
+                                           s.deltaCoeffs.data(), cells.data(), s.refGrad.data(), s.stored.data(),
+                                           empties ? 1 : 0);
+    ckIP(cudaGetLastError(), "contact angle: evaluate");
+}
+
+void deviceContactAngleRelax(DeviceContactAngleState& s, const DeviceBuffer<scalar>& postMules,
+                             const DeviceBuffer<scalar>& relaxed, bool emptiesAverage)
+{
+    if (s.n <= 0) return;
+    caRelaxKernel<<<nBlocks(s.n), TPB>>>(s.n, s.kind.data(), s.limit.data(), s.faceCell.data(),
+                                        s.deltaCoeffs.data(), postMules.data(), relaxed.data(),
+                                        s.refGrad.data(), s.stored.data(), emptiesAverage ? 1 : 0);
+    ckIP(cudaGetLastError(), "contact angle: relaxed assignment");
+}
+
+void deviceContactAngleNHat(const DeviceMesh& dm, DeviceContactAngleState& s,
+                            const DeviceBuffer<scalar>& cells, const DeviceBuffer<label>& stCells,
+                            const DeviceBuffer<scalar>& acc, int nSt, scalar deltaN,
+                            DeviceBuffer<scalar>& nHatfBnd)
+{
+    const std::size_t nC = static_cast<std::size_t>(dm.nCells);
+    s.gx.resize(nC);
+    s.gy.resize(nC);
+    s.gz.resize(nC);
+    if (nSt > 0)
+    {
+        caCellGradientKernel<<<nBlocks(nSt), TPB>>>(
+            nSt, stCells.data(), acc.data(), dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(),
+            dm.bndIsEmpty.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), s.stored.data(), dm.V.data(),
+            s.gx.data(), s.gy.data(), s.gz.data());
+        ckIP(cudaGetLastError(), "contact angle: the boundary cells' gradient");
+    }
+    nHatfBnd.resize(static_cast<std::size_t>(s.n));
+    if (s.n <= 0) return;
+    const std::size_t n = static_cast<std::size_t>(s.n);
+    s.hx.resize(n); s.hy.resize(n); s.hz.resize(n); s.mag.resize(n); s.a12.resize(n); s.b2.resize(n);
+    caNormalKernel<<<nBlocks(s.n), TPB>>>(
+        s.n, s.kind.data(), s.faceCell.data(), s.nfx.data(), s.nfy.data(), s.nfz.data(),
+        s.gx.data(), s.gy.data(), s.gz.data(), s.refGrad.data(), deltaN,
+        s.hx.data(), s.hy.data(), s.hz.data(), s.mag.data(), s.a12.data());
+    ckIP(cudaGetLastError(), "contact angle: the boundary normal");
+    // b2 = cos(acos(a12) - theta) by the host's libm, which is what the host hooks take. CUDA's acos and cos
+    // are not glibc's: MEASURED on 2e7 arguments, acos differs in its last bit on 19.6% and cos(acos(x)) on 13%,
+    // and on G4 that moved the wall gradient by an ulp on ~100 faces a pass, fed back by the next. The two
+    // arrays cross the bus (8 bytes a face each way); every other operation stays on the device.
+    if (!s.hostA12)
+    {
+        ckIP(cudaMallocHost(&s.hostA12, n*sizeof(scalar)), "pinned a12");
+        ckIP(cudaMallocHost(&s.hostB2, n*sizeof(scalar)), "pinned b2");
+    }
+    ckIP(cudaMemcpy(s.hostA12, s.a12.data(), n*sizeof(scalar), cudaMemcpyDeviceToHost), "a12 down");
+    const scalar* const a12h = s.hostA12;
+    scalar* const b2h = s.hostB2;
+    const label* const kindh = s.hostKind.data();
+    const scalar* const thetah = s.hostTheta.data();
+    const long nl = static_cast<long>(n);
+    #pragma omp parallel for schedule(static)
+    for (long i = 0; i < nl; ++i)
+    {
+        b2h[i] = kindh[i] == 1 ? std::cos(std::acos(a12h[i]) - thetah[i]) : scalar(0);
+    }
+    ckIP(cudaMemcpy(s.b2.data(), b2h, n*sizeof(scalar), cudaMemcpyHostToDevice), "b2 up");
+    caContactKernel<<<nBlocks(s.n), TPB>>>(
+        s.n, s.kind.data(), s.limit.data(), s.faceCell.data(), s.deltaCoeffs.data(), s.cosTheta.data(),
+        s.b2.data(), s.nfx.data(), s.nfy.data(), s.nfz.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(),
+        dm.Sfz.data(), s.hx.data(), s.hy.data(), s.hz.data(), s.mag.data(), s.a12.data(), cells.data(), deltaN,
+        s.refGrad.data(), s.stored.data(), nHatfBnd.data());
+    ckIP(cudaGetLastError(), "contact angle: the contact angle and nHatf");
+}
+
+void deviceContactAngleMixture(const DeviceBuffer<scalar>& aBnd, scalar rho1, scalar nu1, scalar rho2,
+                               scalar nu2, DeviceBuffer<scalar>& rhoBnd, DeviceBuffer<scalar>& muBnd,
+                               DeviceBuffer<scalar>& nuBnd)
+{
+    const int n = static_cast<int>(aBnd.size());
+    rhoBnd.resize(aBnd.size());
+    muBnd.resize(aBnd.size());
+    nuBnd.resize(aBnd.size());
+    if (n <= 0) return;
+    caMixtureKernel<<<nBlocks(n), TPB>>>(n, aBnd.data(), rho1, nu1, rho2, nu2, rhoBnd.data(), muBnd.data(),
+                                        nuBnd.data());
+    ckIP(cudaGetLastError(), "contact angle: the boundary mixture");
+}
+
+void deviceContactAngleDivCoeffs(const DeviceContactAngleState& s, const DeviceBuffer<scalar>& flux,
+                                 DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC)
+{
+    iC.resize(static_cast<std::size_t>(s.n));
+    bC.resize(static_cast<std::size_t>(s.n));
+    if (s.n <= 0) return;
+    caDivCoeffsKernel<<<nBlocks(s.n), TPB>>>(s.n, s.kind.data(), s.refGrad.data(), s.deltaCoeffs.data(),
+                                            flux.data(), iC.data(), bC.data());
+    ckIP(cudaGetLastError(), "contact angle: divergence coefficients");
+}
+
+void deviceContactAngleSurfaceTension(const DeviceContactAngleState& s, const DeviceBuffer<scalar>& cells,
+                                      const DeviceBuffer<scalar>& K, scalar sigma, scalar* stfBnd)
+{
+    if (s.n <= 0) return;
+    caSurfaceTensionKernel<<<nBlocks(s.n), TPB>>>(s.n, s.kind.data(), s.faceCell.data(), s.refGrad.data(),
+                                                 cells.data(), K.data(), sigma, stfBnd);
+    ckIP(cudaGetLastError(), "contact angle: the surface-tension flux on the boundary");
+}
 } // namespace brae

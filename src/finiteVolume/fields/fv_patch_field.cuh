@@ -114,6 +114,8 @@ public:
     // second contact-angle model (dynamic, temperature-dependent) is a new return value here and not
     // a new branch at every call site.
     virtual scalar contactAngleTheta0() const { return scalar(-1); }
+    // Contact-angle limit mode: 0 none, 1 gradient, 2 zeroGradient, 3 alpha; -1 if not one.
+    virtual int contactAngleLimitMode() const { return -1; }
     // DOES evaluate() REPEAT: called again on the same cells, with the same flux told and nothing else told in
     // between, does it leave the value and the state the first call left? True for a class whose evaluate is a
     // function of the cells and of what the patch was told. FALSE BY DEFAULT -- a class nobody has answered for
@@ -1338,6 +1340,11 @@ public:
     }
 
     scalar contactAngleTheta0() const override { return theta0_; }
+    int contactAngleLimitMode() const override
+    {
+        return limit_ == Limit::none ? 0 : limit_ == Limit::gradient ? 1
+             : limit_ == Limit::zeroGradient ? 2 : 3;
+    }
     // the gradient is rewritten by every curvature pass, and `limit gradient` reads the value back
     bool evaluateRepeats() const override { return false; }
 

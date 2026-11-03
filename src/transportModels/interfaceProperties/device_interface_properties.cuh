@@ -15,12 +15,10 @@
 //        four times a step (interfaceProperties' constructor, once per alpha corrector per sub-cycle,
 //        and again between the sub-cycle and UEqn).
 //
-//   OFF: correctContactAngle. It touches only the faces of alphaContactAngle patches, and of those
-//        only the ones the interface has actually reached -- TWO of eight hundred on capillaryRise.
-//        It is also branchy (four `limit` modes), stateful (it writes alpha's own wall gradient) and
-//        iterative (the curvature is a fixed point in it). Putting a rare, branchy, stateful thing on
-//        the device to save 2 faces of work would be the wrong trade; the corrected normals are
-//        handed in and the bulk is what runs here.
+//   OFF in general: correctContactAngle and the evaluation of alpha's patches stay with the host hooks.
+//   ON for one validated family (the DeviceContactAngleState below): constantAlphaContactAngle walls
+//   beside zeroGradient and empty patches, under an unsmoothed Gauss linear nHat. Every other patch
+//   type or scheme keeps the host path (the driver decides and refuses to the host, it never approximates).
 //
 // THE GRADIENT AND THE DIVERGENCE ARE NOT HERE EITHER: deviceGaussGrad and deviceDiv already exist and
 // are gated on their own. This file is the piece between them that is interfaceProperties' own.
@@ -109,5 +107,77 @@ void deviceInterfaceNormalFluxCyclic(
     const DeviceBuffer<scalar>& gz,
     scalar                      deltaN,
     DeviceBuffer<scalar>&       nHatfIf);
+
+// THE CONTACT-ANGLE BOUNDARY ON THE DEVICE, the host hooks' state and arithmetic transcribed:
+//   `stored`   alpha1's patch values as the host field holds them -- what every evaluate reads (the
+//              `limit gradient` clamp takes the PREVIOUS stored value, fv_patch_field.cuh) and writes;
+//   `refGrad`  a contact angle's wall gradient, rewritten by every curvature pass and read by the next.
+// Both persist across hooks and steps exactly as the host patch objects did. A hook hands the alpha step
+// a COPY of `stored` taken where the host uploaded its values (before the curvature pass moves them).
+// Every product, sum and quotient is a separately rounded operation (__dmul_rn and friends): the host
+// computes these lists in plain doubles with no contraction, and a fused multiply-add here would move
+// the wall gradient by an ulp that the next pass then feeds back. sqrt and division are correctly rounded
+// on both sides. cos/acos are NOT guaranteed to round as glibc does; see deviceContactAngleNHat.
+// kind: 0 zeroGradient, 1 constantAlphaContactAngle, 2 empty. limit: 0 none, 1 gradient, 2 zeroGradient,
+// 3 alpha (contact faces only). Arrays are in the device mesh's boundary order (no coupled patch).
+struct DeviceContactAngleState
+{
+    int n = 0;
+    DeviceBuffer<label> kind, limit, faceCell;
+    DeviceBuffer<scalar> cosTheta, deltaCoeffs, nfx, nfy, nfz;
+    DeviceBuffer<scalar> refGrad, stored;
+    // host copies the libm half of the rotation reads (see deviceContactAngleNHat)
+    std::vector<label> hostKind;
+    std::vector<scalar> hostTheta;
+    // work: the stencil cells' gradient (per cell); a face's unit normal, |gradAlphaf|, a12 and b2
+    DeviceBuffer<scalar> gx, gy, gz, hx, hy, hz, mag, a12, b2;
+    scalar* hostA12 = nullptr;   // pinned
+    scalar* hostB2 = nullptr;    // pinned
+    DeviceContactAngleState() = default;
+    DeviceContactAngleState(const DeviceContactAngleState&) = delete;
+    DeviceContactAngleState& operator=(const DeviceContactAngleState&) = delete;
+    ~DeviceContactAngleState()
+    {
+        if (hostA12) cudaFreeHost(hostA12);
+        if (hostB2) cudaFreeHost(hostB2);
+    }
+};
+
+// alpha1.evaluateBoundary(): zeroGradient and empty take their cell, a contact angle clamps its gradient
+// against the stored value (limit gradient) and evaluates cell + gradient/deltaCoeffs. `empties` false
+// leaves an empty face's entry as it stands (the host's evaluateBoundaryWhere(notEmptyPatch)).
+void deviceContactAngleEvaluate(DeviceContactAngleState& s, const DeviceBuffer<scalar>& cells, bool empties);
+
+// A relaxed corrector's boundary (relaxBoundary hook): the evaluate on the post-MULES cells, then
+// 0.5*that + 0.5*the value before it on every patch (all three kinds assign through operator=). An empty
+// face takes the relaxed cell, or with `emptiesAverage` the average as every other face does (the host's
+// whole evaluate and assignment, where an empty patch's entries are not kept on the GPU).
+void deviceContactAngleRelax(DeviceContactAngleState& s, const DeviceBuffer<scalar>& postMules,
+                             const DeviceBuffer<scalar>& relaxed, bool emptiesAverage);
+
+// calculateK's boundary half (interfaceProps::finishNHatBoundary + nHatBoundary): the stencil cells'
+// gradient from their internal-face sums `acc` (nHatStencilInternalKernel's, three blocks of nSt) plus
+// their boundary faces in patch order over `stored`, divided by V; then each boundary face's corrected
+// gradient, unit normal, the contact angle's rotation, the wall gradient written back and evaluated, and
+// nHatf = nHat & Sf. An empty face's normal is zero.
+void deviceContactAngleNHat(const DeviceMesh& dm, DeviceContactAngleState& s,
+                            const DeviceBuffer<scalar>& cells, const DeviceBuffer<label>& stCells,
+                            const DeviceBuffer<scalar>& acc, int nSt, scalar deltaN,
+                            DeviceBuffer<scalar>& nHatfBnd);
+
+// updateMixtureBoundary on the patch values `aBnd` (alpha2 = 1 - alpha1 there): rho from the raw value,
+// mu and nu from the clamped one.
+void deviceContactAngleMixture(const DeviceBuffer<scalar>& aBnd, scalar rho1, scalar nu1, scalar rho2,
+                               scalar nu2, DeviceBuffer<scalar>& rhoBnd, DeviceBuffer<scalar>& muBnd,
+                               DeviceBuffer<scalar>& nuBnd);
+
+// fvm::div's patch coefficients: flux*valueInternalCoeffs and (-flux)*valueBoundaryCoeffs.
+void deviceContactAngleDivCoeffs(const DeviceContactAngleState& s, const DeviceBuffer<scalar>& flux,
+                                 DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC);
+
+// The surface-tension flux on the boundary faces: (sigma*K_cell)*(gradientInternalCoeffs*alpha_cell +
+// gradientBoundaryCoeffs), written to `stfBnd[0..n)`.
+void deviceContactAngleSurfaceTension(const DeviceContactAngleState& s, const DeviceBuffer<scalar>& cells,
+                                      const DeviceBuffer<scalar>& K, scalar sigma, scalar* stfBnd);
 
 } // namespace brae
