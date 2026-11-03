@@ -23,7 +23,12 @@
 //
 // WHERE THE STATE COMES FROM. The driver hands over lazy host views (Source): a loop that keeps its fields on
 // the device downloads a field the first time an object asks for it in a step, and not at all in a step in
-// which nothing is due. Expression fields are evaluated on demand, from those views, once per step.
+// which nothing is due. Expression fields are evaluated on demand, from those views, once per step. A device
+// loop may instead answer all due volIntegrate requests in one batch from a compiled expression tree, with
+// deterministic GPU reductions. Products/sums/quotients, unary minus, the phase fraction, U components,
+// pos().x()/y()/z(), magSqr(U), constants and cellZone indices are supported there. The device tree's sum has a
+// different rounding order from the serial host loop; any other expression, a missing answer, or the CPU loop
+// uses this original host evaluator. runTimeControl reads the same result entry after the batch, as before.
 //
 // WHAT IS NOT HERE, said rather than guessed: an entry of a ported type that asks for something unported
 // (writeFields, weightField, a vector field in volFieldValue, interpolationScheme cellPoint, exprField
@@ -49,6 +54,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <deque>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -70,6 +76,50 @@ struct Step
     bool   runTimeWrite = false; // the run writes its fields at this step (writeControl writeTime)
 };
 
+
+// A device-resident field is named by a member offset in DeviceArrays. Keeping this vocabulary free of CUDA
+// types lets the host-only unit test exercise a device Source. `cells == nullptr` means regionType all;
+// otherwise the reduction visits exactly the cellZone's indices, in dictionary order.
+struct DeviceArrays
+{
+    const scalar* alpha = nullptr;
+    const scalar* ux = nullptr;
+    const scalar* uy = nullptr;
+    const scalar* uz = nullptr;
+    const scalar* V = nullptr;
+    const scalar* Cx = nullptr;
+    const scalar* Cy = nullptr;
+    const scalar* Cz = nullptr;
+    label         nCells = 0;
+};
+
+
+// The IR is also the Source-independent description of what the device reduction can evaluate.
+struct DeviceExpr
+{
+    enum Kind { Constant, Field, Unary, Binary, MagSqrU } kind = Constant;
+    enum Leaf { Alpha, Ux, Uy, Uz, PosX, PosY, PosZ } leaf = Alpha;
+    char        op = 0;
+    scalar      constant = 0;
+    int         left = -1, right = -1, third = -1;
+};
+
+struct DeviceIntegral
+{
+    std::string             phaseField;   // the case's phase name, so alpha.water is not hard-coded
+    std::string             expression;   // the original field name, for diagnostics
+    std::vector<DeviceExpr> nodes;        // used when no prepareDeviceIntegral callback is supplied
+    std::shared_ptr<void>   plan;         // opaque immutable state made once by prepareDeviceIntegral
+    DeviceArrays            fields;
+    const label*            cells = nullptr;
+    label                   n = 0;
+    std::vector<scalar>*    result = nullptr; // one entry per request, stable until the next step
+};
+
+using DeviceIntegrals = std::function<bool(std::vector<DeviceIntegral>&)>;
+using PrepareDeviceIntegral = std::function<std::shared_ptr<void>(
+    const std::string&, const std::vector<DeviceExpr>&, const label*, label)>;
+
 // Host views of the solution at the step just taken. Every getter may download on first use; `newStep` is
 // called once at the start of each execute() so the driver can drop what it cached.
 struct Source
@@ -81,7 +131,47 @@ struct Source
     std::function<const std::vector<scalar>&()>                 Uy;
     std::function<const std::vector<scalar>&()>                 Uz;
     std::function<const std::vector<scalar>&(std::size_t)>      alphaPatch;   // the phase fraction's patch values
+    // Optional. All due requests are submitted together; false, or an empty result entry, selects the host
+    // path for every request left unanswered. A Source must not answer a request it cannot evaluate exactly.
+    DeviceIntegrals                                             deviceIntegrals;
+    std::function<DeviceArrays()>                               deviceFields;
+    PrepareDeviceIntegral                                       prepareDeviceIntegral;
 };
+struct DeviceValue { bool vec = false; int s = -1, x = -1, y = -1, z = -1; };
+
+struct DeviceScope
+{
+    std::string                                       phaseField;
+    std::vector<DeviceExpr>*                          nodes = nullptr;
+    std::function<bool(const std::string&, int&)>      scalarField;
+};
+
+inline int deviceConstant(DeviceScope& sc, scalar v)
+{
+    sc.nodes->push_back(DeviceExpr{});
+    sc.nodes->back().constant = v;
+    return static_cast<int>(sc.nodes->size() - 1);
+}
+
+inline int deviceLeaf(DeviceScope& sc, DeviceExpr::Leaf leaf)
+{
+    DeviceExpr e;
+    e.kind = DeviceExpr::Field;
+    e.leaf = leaf;
+    sc.nodes->push_back(e);
+    return static_cast<int>(sc.nodes->size() - 1);
+}
+
+inline int deviceNode(DeviceScope& sc, DeviceExpr::Kind kind, char op, int a, int b = -1)
+{
+    DeviceExpr e;
+    e.kind = kind;
+    e.op = op;
+    e.left = a;
+    e.right = b;
+    sc.nodes->push_back(e);
+    return static_cast<int>(sc.nodes->size() - 1);
+}
 
 struct Services
 {
@@ -245,6 +335,149 @@ inline std::vector<Tok> tokenizeExpression(const std::string& s)
     out.push_back(Tok());   // End
     return out;
 }
+
+// Compile the device-safe subset with the same tokenisation, precedence and dot/component rules as ExprParser.
+// Every unsupported construct throws before a request reaches the Source; this is an optimisation gate, not a
+// replacement for ExprParser's full validation and host evaluation.
+class DeviceExprParser
+{
+public:
+    DeviceExprParser(const std::string& text, DeviceScope& sc) : text_(text), t_(tokenizeExpression(text)), sc_(sc) {}
+
+    int parse()
+    {
+        const DeviceValue v = expr();
+        if (peek().k != Tok::End || v.vec) fail("not a supported scalar expression");
+        return v.s;
+    }
+
+private:
+    std::string        text_;
+    std::vector<Tok>   t_;
+    std::size_t        p_ = 0;
+    DeviceScope&       sc_;
+
+    [[noreturn]] void fail(const std::string& why) const
+    {
+        throw std::runtime_error("brae function objects: device expression `" + text_ + "`: " + why);
+    }
+    const Tok& peek(std::size_t o = 0) const { return t_[std::min(p_ + o, t_.size() - 1)]; }
+    bool isOp(const char* s, std::size_t o = 0) const { return peek(o).k == Tok::Op && peek(o).t == s; }
+    void expectOp(const char* s) { if (!isOp(s)) fail(std::string("expected `") + s + "`"); ++p_; }
+    int scalar(const DeviceValue& v) const { if (v.vec) fail("vector arithmetic"); return v.s; }
+    static int componentIndex(const std::string& s) { return s == "x" ? 0 : s == "y" ? 1 : s == "z" ? 2 : -1; }
+
+    DeviceValue expr()
+    {
+        DeviceValue l = term();
+        while (isOp("+") || isOp("-"))
+        {
+            const char op = t_[p_++].t[0];
+            const DeviceValue r = term();
+            l.s = deviceNode(sc_, DeviceExpr::Binary, op, scalar(l), scalar(r));
+            l.vec = false;
+        }
+        return l;
+    }
+    DeviceValue term()
+    {
+        DeviceValue l = unary();
+        while (isOp("*") || isOp("/"))
+        {
+            const char op = t_[p_++].t[0];
+            const DeviceValue r = unary();
+            l.s = deviceNode(sc_, DeviceExpr::Binary, op, scalar(l), scalar(r));
+            l.vec = false;
+        }
+        return l;
+    }
+    DeviceValue unary()
+    {
+        if (isOp("-"))
+        {
+            ++p_;
+            DeviceValue v;
+            v.s = deviceNode(sc_, DeviceExpr::Unary, '-', scalar(unary()));
+            return v;
+        }
+        if (isOp("+")) { ++p_; return unary(); }
+        return primary();
+    }
+    DeviceValue postfix(DeviceValue v)
+    {
+        while (isOp(".") && peek(1).k == Tok::Id && componentIndex(peek(1).t) >= 0
+            && isOp("(", 2) && isOp(")", 3))
+        {
+            if (!v.vec) fail("component of a scalar");
+            const int c = componentIndex(peek(1).t);
+            p_ += 4;
+            DeviceValue s;
+            s.s = c == 0 ? v.x : c == 1 ? v.y : v.z;
+            v = s;
+        }
+        return v;
+    }
+    DeviceValue call(const std::string& name, const std::vector<DeviceValue>& args)
+    {
+        if (name == "pos" && args.empty())
+        {
+            DeviceValue v;
+            v.vec = true;
+            v.x = deviceLeaf(sc_, DeviceExpr::PosX);
+            v.y = deviceLeaf(sc_, DeviceExpr::PosY);
+            v.z = deviceLeaf(sc_, DeviceExpr::PosZ);
+            return v;
+        }
+        if (name == "magSqr" && args.size() == 1 && args[0].vec)
+        {
+            DeviceValue v;
+            v.s = deviceNode(sc_, DeviceExpr::MagSqrU, 0, args[0].x, args[0].y);
+            sc_.nodes->back().third = args[0].z;
+            return v;
+        }
+        fail("only pos(), U components and magSqr(U) are supported on the device");
+    }
+    DeviceValue primary()
+    {
+        const Tok tk = peek();
+        if (tk.k == Tok::Num) { ++p_; DeviceValue v; v.s = deviceConstant(sc_, tk.num); return v; }
+        if (isOp("(")) { ++p_; DeviceValue v = expr(); expectOp(")"); return postfix(v); }
+        if (tk.k != Tok::Id) fail(tk.k == Tok::End ? "ends early" : "unexpected `" + tk.t + "`");
+        std::vector<std::string> parts{tk.t};
+        ++p_;
+        while (isOp(".") && peek(1).k == Tok::Id && !(componentIndex(peek(1).t) >= 0 && isOp("(", 2)))
+        {
+            parts.push_back(peek(1).t);
+            p_ += 2;
+        }
+        if (parts.size() == 1 && isOp("("))
+        {
+            ++p_;
+            std::vector<DeviceValue> args;
+            if (!isOp(")"))
+            {
+                args.push_back(expr());
+                while (isOp(",")) { ++p_; args.push_back(expr()); }
+            }
+            expectOp(")");
+            return postfix(call(parts[0], args));
+        }
+        std::string name = parts[0];
+        for (std::size_t i = 1; i < parts.size(); ++i) name += "." + parts[i];
+        int node = -1;
+        if (sc_.scalarField(name, node)) { DeviceValue v; v.s = node; return v; }
+        if (name == "U")
+        {
+            DeviceValue v;
+            v.vec = true;
+            v.x = deviceLeaf(sc_, DeviceExpr::Ux);
+            v.y = deviceLeaf(sc_, DeviceExpr::Uy);
+            v.z = deviceLeaf(sc_, DeviceExpr::Uz);
+            return postfix(v);
+        }
+        fail("unknown field `" + name + "`");
+    }
+};
 
 class ExprParser
 {
@@ -650,6 +883,89 @@ public:
         return o->second.at(key);
     }
 
+    // Compile an expression once, after all exprFields have been read. An empty cached tree means the host
+    // evaluator owns this field; no unsupported construct is silently approximated.
+    const std::vector<DeviceExpr>* deviceExpression(const std::string& field)
+    {
+        const auto made = deviceIr_.find(field);
+        if (made != deviceIr_.end()) return made->second.empty() ? nullptr : &made->second;
+        std::vector<DeviceExpr> out;
+        DeviceScope sc;
+        sc.phaseField = svc.phaseField;
+        sc.nodes = &out;
+        std::vector<std::string> active;
+        std::function<bool(const std::string&, int&)> lookup;
+        lookup = [&](const std::string& name, int& node)
+        {
+            if (name == svc.phaseField) { node = deviceLeaf(sc, DeviceExpr::Alpha); return true; }
+            const auto e = exprs.find(name);
+            if (e == exprs.end()) return false;
+            if (std::find(active.begin(), active.end(), name) != active.end()) return false;
+            active.push_back(name);
+            try { node = DeviceExprParser(e->second, sc).parse(); }
+            catch (...) { active.pop_back(); throw; }
+            active.pop_back();
+            return true;
+        };
+        sc.scalarField = lookup;
+        try
+        {
+            int root = -1;
+            if (field == svc.phaseField) deviceLeaf(sc, DeviceExpr::Alpha);
+            else if (!lookup(field, root)) return nullptr;
+        }
+        catch (const std::exception&)
+        {
+            deviceIr_[field] = {};
+            return nullptr;
+        }
+        deviceIr_[field] = std::move(out);
+        return &deviceIr_[field];
+    }
+
+    const std::vector<scalar>* queueDeviceIntegral(const std::string& field, const label* cells, label n,
+                                                    std::shared_ptr<void>& plan)
+    {
+        const std::vector<DeviceExpr>* nodes = deviceExpression(field);
+        if (!svc.src.deviceIntegrals || !svc.src.deviceFields || !nodes) return nullptr;
+        if (!plan && svc.src.prepareDeviceIntegral)
+        {
+            plan = svc.src.prepareDeviceIntegral(field, *nodes, cells, n);
+            if (!plan) return nullptr;
+        }
+        DeviceIntegral q;
+        q.phaseField = svc.phaseField;
+        q.expression = field;
+        if (!svc.src.prepareDeviceIntegral) q.nodes = *nodes;
+        q.plan = plan;
+        q.fields = svc.src.deviceFields();
+        q.cells = cells;
+        q.n = n;
+        q.result = &deviceValues_.emplace_back();
+        deviceIntegrals_.push_back(std::move(q));
+        return q.result;
+    }
+
+    void beginDeviceStep()
+    {
+        deviceIntegrals_.clear();
+        deviceValues_.clear();
+    }
+
+    void flushDeviceIntegrals()
+    {
+        if (deviceIntegrals_.empty()) return;
+        if (!svc.src.deviceIntegrals(deviceIntegrals_))
+        {
+            for (DeviceIntegral& q : deviceIntegrals_) q.result->clear();
+        }
+        deviceIntegrals_.clear();
+    }
+
+    std::map<std::string, std::vector<DeviceExpr>>       deviceIr_;
+    std::vector<DeviceIntegral>                          deviceIntegrals_;
+    std::deque<std::vector<scalar>>                      deviceValues_;
+
 private:
     std::map<std::string, std::pair<label, SF>> cache_;
     std::vector<std::string>                    active_;
@@ -732,6 +1048,8 @@ public:
     // every step, after the writes; true asks the run to end (and write) at this step
     virtual bool evaluatesEveryStep() const { return false; }
     virtual bool evaluate(const Step&, Runtime&) { return false; }
+    // Integrals that were queued during write() are emitted after the Source's one batched device call.
+    virtual void afterDeviceBatch(const Step&, Runtime&) {}
 };
 
 inline void refuseKey(const FoamDict& d, const std::string& object, const char* key, const char* why)
@@ -914,19 +1232,22 @@ public:
 
     void write(const Step& s, Runtime& rt) override
     {
-        const std::vector<scalar>& V = rt.svc.geom->V();
-        std::string line = fmtNum(s.time, rt.svc.precision);
+        if (op_ != "volIntegrate") { emit(s, rt); return; }
+        deviceDue_ = true;
+        deviceResults_.clear();
         for (const std::string& f : fields_)
         {
-            const SF sf = rt.scalarField(f);
-            const scalar value = reduce(sf, V);
-            rt.results[name][op_ + "(" + f + ")"] = value;
-            line += "\t" + fmtNum(value, rt.svc.precision);
+            deviceResults_.push_back(rt.queueDeviceIntegral(f, region_.all ? nullptr : region_.cells.data(),
+                                                             region_.all ? static_cast<label>(rt.nCells())
+                                                                         : static_cast<label>(region_.cells.size()),
+                                                             devicePlans_.emplace_back()));
         }
-        if (writeToFile_)
-        {
-            dat_.row(line);
-        }
+    }
+
+
+    void afterDeviceBatch(const Step& s, Runtime& rt) override
+    {
+        if (deviceDue_) emit(s, rt);
     }
 
 private:
@@ -935,6 +1256,27 @@ private:
     CellRegion                region_;
     bool                      writeToFile_ = true;
     DatFile                   dat_;
+    std::vector<const std::vector<scalar>*> deviceResults_;
+    std::vector<std::shared_ptr<void>>    devicePlans_;
+    bool                      deviceDue_ = false;
+    void emit(const Step& s, Runtime& rt)
+    {
+        const std::vector<scalar>& V = rt.svc.geom->V();
+        std::string line = fmtNum(s.time, rt.svc.precision);
+        for (std::size_t i = 0; i < fields_.size(); ++i)
+        {
+            const std::string& f = fields_[i];
+            scalar value = 0;
+            const bool device = i < deviceResults_.size() && deviceResults_[i] && deviceResults_[i]->size() == 1;
+            if (device) value = (*deviceResults_[i])[0];
+            else value = reduce(rt.scalarField(f), V);
+            rt.results[name][op_ + "(" + f + ")"] = value;
+            line += "\t" + fmtNum(value, rt.svc.precision);
+        }
+        if (writeToFile_) dat_.row(line);
+        deviceResults_.clear();
+        deviceDue_ = false;
+    }
 
     scalar reduce(const SF& f, const std::vector<scalar>& V) const
     {
@@ -1688,6 +2030,7 @@ public:
         {
             rt_.svc.src.newStep();
         }
+        rt_.beginDeviceStep();
         for (auto& o : objects_)
         {
             if (!o->evaluatesEveryStep() && o->ctl.due(s))
@@ -1695,6 +2038,8 @@ public:
                 o->write(s, rt_);
             }
         }
+        rt_.flushDeviceIntegrals();
+        for (auto& o : objects_) o->afterDeviceBatch(s, rt_);
         bool stop = false;
         for (auto& o : objects_)
         {

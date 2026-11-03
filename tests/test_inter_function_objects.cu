@@ -115,6 +115,84 @@ struct Fixture
     }
 };
 
+// A host implementation of the Source's device contract: it receives compiled expression trees and raw field
+// pointers, never a named host vector. This checks batching, recursive expression expansion, cellZone indexing,
+// all supported leaves and the untouched host fallback without needing a GPU.
+struct FakeDevice
+{
+    Fixture* fx;
+    int batches = 0, requests = 0;
+    bool answer = true;
+    std::vector<std::string> expressions;
+    std::vector<scalar> cx, cy, cz;
+
+    explicit FakeDevice(Fixture& f) : fx(&f)
+    {
+        for (const vector& c : f.g.C()) { cx.push_back(c.x); cy.push_back(c.y); cz.push_back(c.z); }
+    }
+
+    DeviceArrays fields() const
+    {
+        DeviceArrays a;
+        a.alpha = fx->alpha.data(); a.ux = fx->ux.data(); a.uy = fx->uy.data(); a.uz = fx->uz.data();
+        a.V = fx->g.V().data(); a.Cx = cx.data(); a.Cy = cy.data(); a.Cz = cz.data();
+        a.nCells = static_cast<label>(fx->g.V().size());
+        return a;
+    }
+
+    scalar eval(const std::vector<DeviceExpr>& ns, int i, const DeviceArrays& f, label c) const
+    {
+        const DeviceExpr& e = ns[static_cast<std::size_t>(i)];
+        if (e.kind == DeviceExpr::Constant) return e.constant;
+        if (e.kind == DeviceExpr::Field)
+        {
+            switch (e.leaf)
+            {
+                case DeviceExpr::Alpha: return f.alpha[c];
+                case DeviceExpr::Ux: return f.ux[c];
+                case DeviceExpr::Uy: return f.uy[c];
+                case DeviceExpr::Uz: return f.uz[c];
+                case DeviceExpr::PosX: return f.Cx[c];
+                case DeviceExpr::PosY: return f.Cy[c];
+                default: return f.Cz[c];
+            }
+        }
+        if (e.kind == DeviceExpr::Unary) return -eval(ns, e.left, f, c);
+        if (e.kind == DeviceExpr::MagSqrU)
+        {
+            const scalar x = eval(ns, e.left, f, c), y = eval(ns, e.right, f, c), z = eval(ns, e.third, f, c);
+            return x*x + y*y + z*z;
+        }
+        const scalar a = eval(ns, e.left, f, c), b = eval(ns, e.right, f, c);
+        return e.op == '+' ? a + b : e.op == '-' ? a - b : e.op == '*' ? a*b : a/b;
+    }
+
+    bool reduce(std::vector<DeviceIntegral>& qs)
+    {
+        ++batches;
+        requests += static_cast<int>(qs.size());
+        for (DeviceIntegral& q : qs)
+        {
+            expressions.push_back(q.expression);
+            if (!answer) { q.result->clear(); continue; }
+            scalar sum = 0;
+            for (label i = 0; i < q.n; ++i)
+            {
+                const label c = q.cells ? q.cells[i] : i;
+                sum += q.fields.V[c]*eval(q.nodes, static_cast<int>(q.nodes.size() - 1), q.fields, c);
+            }
+            q.result->assign(1, sum);
+        }
+        return answer;
+    }
+
+    void attach(Services& s)
+    {
+        s.src.deviceFields = [this]() { return fields(); };
+        s.src.deviceIntegrals = [this](std::vector<DeviceIntegral>& qs) { return reduce(qs); };
+    }
+};
+
 std::string tmpDir(const char* tag)
 {
     const std::string d = (std::filesystem::temp_directory_path() / (std::string("brae_fo_") + tag)).string();
@@ -582,6 +660,92 @@ int main()
         auto r = rows(dirE + "/postProcessing/tot/0/volFieldValue.dat");
         check("-(a+2)*3/4 - sqr(1.5) + mag(U) - magSqr(U) + pos().x() integrates to the hand sum",
               r.size() == 1 && near(r[0][1], want, 1e-10));
+    }
+
+    std::printf("-- device Source: batched integrals, cellZones and fallback --\n");
+    {
+        Fixture f;
+        f.setStep(2);
+        FakeDevice dev(f);
+        const std::string dd = tmpDir("device");
+        Services svc = f.services(dd);
+        dev.attach(svc);
+        const std::string body = R"FO(functions {
+            az { type exprField; field az; expression "alpha.water*pos().z()"; autowrite false; }
+            nested { type exprField; field nested; expression "2*az + 0.25*pos().y()"; autowrite false; }
+            au { type exprField; field au; expression "-(alpha.water*U.z() + 0.5)"; autowrite false; }
+            ke { type exprField; field ke; expression "505.05*alpha.water*magSqr(U)"; autowrite false; }
+            root { type exprField; field root; expression "sqrt(alpha.water)"; autowrite false; }
+            all { type volFieldValue; regionType all; operation volIntegrate; fields (nested au ke root);
+                  writeControl timeStep; writeInterval 1; }
+            zone { type volFieldValue; regionType cellZone; name zoneA; operation volIntegrate;
+                   fields (alpha.water nested); writeControl timeStep; writeInterval 1; }
+            avg { type volFieldValue; regionType all; operation volAverage; fields (nested);
+                  writeControl timeStep; writeInterval 1; }
+            other { type probes; fields (alpha.water); fixedLocations true; probeLocations ((0.5 0.5 0.5));
+                    writeControl timeStep; writeInterval 1; }
+        })FO";
+        FoamDict d = dictOf(dd, body);
+        auto l = FunctionObjectList::read(d, svc);
+        Step s; s.timeIndex = 1; s.time = 1; s.deltaT = 1; s.sinceStart = 1;
+        l->execute(s);
+        check("all supported due fields arrive in one device batch", dev.batches == 1 && dev.requests == 5);
+        auto a = rows(dd + "/postProcessing/all/0/volFieldValue.dat");
+        auto z = rows(dd + "/postProcessing/zone/0/volFieldValue.dat");
+        const std::vector<scalar>& fV = f.g.V();
+        scalar nested = 0, au = 0, ke = 0, root = 0;
+        for (std::size_t c = 0; c < fV.size(); ++c)
+        {
+            const scalar nz = 2*f.alpha[c]*f.g.C()[c].z + 0.25*f.g.C()[c].y;
+            const scalar u2 = f.ux[c]*f.ux[c] + f.uy[c]*f.uy[c] + f.uz[c]*f.uz[c];
+            nested += fV[c]*nz;
+            au += fV[c]*(-(f.alpha[c]*f.uz[c] + 0.5));
+            ke += fV[c]*505.05*f.alpha[c]*u2;
+            root += fV[c]*std::sqrt(f.alpha[c]);
+        }
+        check("nested pos, unary minus, constants, U and magSqr(U) match",
+              a.size() == 1 && a[0].size() == 5 && near(a[0][1], nested, 1e-9) && near(a[0][2], au, 1e-9)
+              && near(a[0][3], ke, 1e-9) && near(a[0][4], root, 1e-9));
+        scalar za = 0, zn = 0;
+        for (label cc : f.zones["zoneA"])
+        {
+            const std::size_t c = static_cast<std::size_t>(cc);
+            za += fV[c]*f.alpha[c];
+            zn += fV[c]*(2*f.alpha[c]*f.g.C()[c].z + 0.25*f.g.C()[c].y);
+        }
+        check("cellZone uses exactly its indexed cells", z.size() == 1 && z[0].size() == 3
+              && near(z[0][1], za) && near(z[0][2], zn));
+        check("unsupported sqrt remains a correct host result", a.size() == 1 && near(a[0][4], root, 1e-9));
+        auto av = rows(dd + "/postProcessing/avg/0/volFieldValue.dat");
+        scalar volume = 0; for (scalar v : fV) volume += v;
+        check("volAverage stays on its host operation path", av.size() == 1 && near(av[0][1], nested/volume, 1e-9)
+              && dev.requests == 5);
+
+        Fixture g;
+        g.setStep(2);
+        FakeDevice no(g); no.answer = false;
+        const std::string dh = tmpDir("deviceFallback");
+        Services sh = g.services(dh); no.attach(sh);
+        FoamDict hd = dictOf(dh, body);
+        auto hl = FunctionObjectList::read(hd, sh);
+        hl->execute(s);
+        auto ha = rows(dh + "/postProcessing/all/0/volFieldValue.dat");
+        check("declined device batch falls back to every host integral", ha.size() == 1 && ha[0].size() == 5
+              && near(ha[0][1], nested, 1e-9) && near(ha[0][2], au, 1e-9)
+              && near(ha[0][3], ke, 1e-9) && near(ha[0][4], root, 1e-9));
+
+        Fixture q;
+        FakeDevice qd(q); const std::string dq = tmpDir("deviceStop");
+        Services sq = q.services(dq); qd.attach(sq);
+        FoamDict qdict = dictOf(dq, withThreshold(2.5*speed1));
+        auto ql = FunctionObjectList::read(qdict, sq);
+        label stopAt = 0;
+        for (label i = 1; i <= 3; ++i)
+        {
+            q.setStep(i); Step qs; qs.timeIndex = i; qs.time = i*dt; qs.deltaT = dt; qs.sinceStart = qs.time;
+            if (ql->execute(qs) && stopAt == 0) stopAt = i;
+        }
+        check("runTimeControl consumes the device value and still stops at step 3", stopAt == 3);
     }
 
     std::printf(failures ? "FAILED: %d\n" : "all passed\n", failures);

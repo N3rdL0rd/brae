@@ -184,6 +184,83 @@ void emptyPressureCoeffsKernel(
     bC[b] = (wrong != scalar(0)) ? wrong : -scalar(0);
 }
 
+// Runtime volIntegrate: the expression tree is uploaded once per batch, but the cell values are never formed.
+// Two fixed-order reduction stages make the result reproducible from run to run; their summation order differs
+// from the host's serial loop, which is the only intended numerical difference in function-object output.
+__device__ scalar foDeviceLeaf(const fo::DeviceExpr& e, const fo::DeviceArrays& f, label c)
+{
+    switch (e.leaf)
+    {
+        case fo::DeviceExpr::Alpha: return f.alpha[c];
+        case fo::DeviceExpr::Ux:    return f.ux[c];
+        case fo::DeviceExpr::Uy:    return f.uy[c];
+        case fo::DeviceExpr::Uz:    return f.uz[c];
+        case fo::DeviceExpr::PosX:  return f.Cx[c];
+        case fo::DeviceExpr::PosY:  return f.Cy[c];
+        default:                    return f.Cz[c];
+    }
+}
+
+__device__ scalar foDeviceEval(const fo::DeviceExpr* nodes, int root, const fo::DeviceArrays& f, label c)
+{
+    const fo::DeviceExpr& e = nodes[root];
+    if (e.kind == fo::DeviceExpr::Constant) return e.constant;
+    if (e.kind == fo::DeviceExpr::Field) return foDeviceLeaf(e, f, c);
+    if (e.kind == fo::DeviceExpr::Unary) return -foDeviceEval(nodes, e.left, f, c);
+    if (e.kind == fo::DeviceExpr::MagSqrU)
+    {
+        const scalar x = foDeviceEval(nodes, e.left, f, c);
+        const scalar y = foDeviceEval(nodes, e.right, f, c);
+        const scalar z = foDeviceEval(nodes, e.third, f, c);
+        return x*x + y*y + z*z;
+    }
+    const scalar a = foDeviceEval(nodes, e.left, f, c);
+    const scalar b = foDeviceEval(nodes, e.right, f, c);
+    if (e.op == '+') return a + b;
+    if (e.op == '-') return a - b;
+    if (e.op == '*') return a*b;
+    return a/b;
+}
+
+__global__ void foIntegralPartialsKernel(
+    int n, const label* cells, const fo::DeviceExpr* nodes, int root,
+    fo::DeviceArrays f, scalar* partials)
+{
+    __shared__ scalar sum[256];
+    const int tid = threadIdx.x;
+    const int i = blockIdx.x*blockDim.x + tid;
+    scalar v = 0;
+    if (i < n)
+    {
+        const label c = cells ? cells[i] : i;
+        v = f.V[c]*foDeviceEval(nodes, root, f, c);
+    }
+    sum[tid] = v;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1)
+    {
+        if (tid < s) sum[tid] += sum[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) partials[blockIdx.x] = sum[0];
+}
+
+__global__ void foIntegralFinalKernel(const scalar* partials, int n, scalar* out)
+{
+    __shared__ scalar sum[256];
+    const int tid = threadIdx.x;
+    scalar v = 0;
+    for (int i = tid; i < n; i += 256) v += partials[i];
+    sum[tid] = v;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1)
+    {
+        if (tid < s) sum[tid] += sum[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) *out = sum[0];
+}
+
 // AN `empty` PATCH'S ENTRIES OF A BOUNDARY ARRAY THE ALPHA AND FORCES HOOKS HAND THE DEVICE, written here in place
 // of a host loop and an upload: one constant a face -- the zero the host's own arithmetic gives there (the snGrad
 // of zero gradient coefficients; the boundary normal of a patch the stencil leaves out). A gate's CONTROL hands 1.
@@ -5201,6 +5278,16 @@ RunReport runInterFoamDevice(
         if (!foAValid) { dA.copyTo(foA); foAValid = true; }
         return foA;
     };
+    // Function objects run on static meshes only (createFunctionObjects refuses a changing one), so centres
+    // and cellZone indices are one-time uploads. BRAE_CONTROL_FUNCTION_OBJECTS_HOST=1 restores host evaluation.
+    std::vector<scalar> foCx, foCy, foCz;
+    DeviceBuffer<scalar> dFoCx, dFoCy, dFoCz;
+    struct FoDevicePlan
+    {
+        DeviceBuffer<fo::DeviceExpr> nodes;
+        DeviceBuffer<label>          cells;
+    };
+    DeviceBuffer<scalar> dFoPartials, dFoResult;
     std::shared_ptr<brae::fo::FunctionObjectList> fos;
     {
         brae::fo::Source src;
@@ -5232,6 +5319,58 @@ RunReport runInterFoamDevice(
             foPatch = f.alpha1.boundary[pi]->value();
             return foPatch;
         };
+
+        if (std::getenv("BRAE_CONTROL_FUNCTION_OBJECTS_HOST") == nullptr)
+        {
+            src.deviceFields = [&]() {
+                if (dFoCx.size() == 0)
+                {
+                    foCx.resize(static_cast<std::size_t>(nC));
+                    foCy.resize(static_cast<std::size_t>(nC));
+                    foCz.resize(static_cast<std::size_t>(nC));
+                    for (label c = 0; c < nC; ++c)
+                    {
+                        foCx[static_cast<std::size_t>(c)] = g.C()[c].x;
+                        foCy[static_cast<std::size_t>(c)] = g.C()[c].y;
+                        foCz[static_cast<std::size_t>(c)] = g.C()[c].z;
+                    }
+                    dFoCx.copyFrom(foCx); dFoCy.copyFrom(foCy); dFoCz.copyFrom(foCz);
+                }
+                fo::DeviceArrays a;
+                a.alpha = dA.data(); a.ux = dUx.data(); a.uy = dUy.data(); a.uz = dUz.data();
+                a.V = dm.V.data(); a.Cx = dFoCx.data(); a.Cy = dFoCy.data(); a.Cz = dFoCz.data();
+                a.nCells = nC;
+                return a;
+            };
+            src.prepareDeviceIntegral = [&](const std::string&, const std::vector<fo::DeviceExpr>& nodes,
+                                            const label* cells, label n) -> std::shared_ptr<void>
+            {
+                auto p = std::make_shared<FoDevicePlan>();
+                p->nodes.copyFrom(nodes);
+                if (cells) p->cells.copyFrom(std::vector<label>(cells, cells + n));
+                return p;
+            };
+            src.deviceIntegrals = [&](std::vector<fo::DeviceIntegral>& requests)
+            {
+                for (fo::DeviceIntegral& q : requests)
+                {
+                    q.result->assign(1, scalar(0));
+                    if (q.n == 0) continue;
+                    const FoDevicePlan& p = *static_cast<const FoDevicePlan*>(q.plan.get());
+                    const int nb = (q.n + 255)/256;
+                    dFoPartials.resize(static_cast<std::size_t>(nb));
+                    dFoResult.resize(1);
+                    foIntegralPartialsKernel<<<nb, 256>>>(q.n, p.cells.data(), p.nodes.data(),
+                                                          static_cast<int>(p.nodes.size() - 1), q.fields,
+                                                          dFoPartials.data());
+                    foIntegralFinalKernel<<<1, 256>>>(dFoPartials.data(), nb, dFoResult.data());
+                    cudaCheck(cudaGetLastError(), "function-object volIntegrate");
+                    cudaCheck(cudaMemcpy(q.result->data(), dFoResult.data(), sizeof(scalar), cudaMemcpyDeviceToHost),
+                              "function-object volIntegrate result");
+                }
+                return true;
+            };
+        }
         fos = brae::fo::createFunctionObjects(caseDir, startDir, m, g, fvp, f.cellZones, f.alphaName,
                                               f.meshIsDynamic, src);
     }
