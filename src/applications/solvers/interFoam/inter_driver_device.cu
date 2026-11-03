@@ -4933,8 +4933,73 @@ RunReport runInterFoamDevice(
     // 1e-8 relative thresholds and the error text, never massCorr. BRAE_CONTROL_ADJUSTPHI_HOST_SUM=1 sums on the
     // host as before.
     static const bool adjustPhiHostSum = std::getenv("BRAE_CONTROL_ADJUSTPHI_HOST_SUM") != nullptr;
+    // WHERE NO U PATCH IS ADJUSTABLE adjustPhi scales nothing: every outflow is fixed, so phiHbyA's boundary goes
+    // through unchanged and the whole call is the balance test, adjustPhi.C:108 -- |sum(phi_b)| against
+    // 1e-8*(sum|phi_internal|). The hook sent the boundary flux down and back (4 MB each way, three a step on the
+    // G4 tank) and read the internal sum, a sync each corrector behind the step's queued kernels: 134 calls and 1.5 s
+    // of an `nsys` window. Here the three sums are queued on the device -- sum|phi_internal|, sum|phi_b| and
+    // sum(phi_b) -- and read together once the step's pressure correctors are done, where the test runs on the
+    // same numbers: a run that OpenFOAM would stop at the corrector stops at the step's end, with its message.
+    // The sums are on the device's reduction order, as the internal sum already was. A case with an adjustable
+    // patch (inletOutlet, an open outflow) or an empty or coupled one keeps the host's call.
+    //   BRAE_CONTROL_ADJUSTPHI_SYNC=1 keeps the host's call at every corrector, as before
+    static const bool adjustPhiSync = std::getenv("BRAE_CONTROL_ADJUSTPHI_SYNC") != nullptr;
+    const bool adjustPhiDeferred = [&]()
+    {
+        if (adjustPhiSync || adjustPhiHostSum || fvp.empty()) return false;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (fvp[pi].type == "empty" || isCoupledInterfaceType(fvp[pi].type)) return false;
+            const fvPatchField<vector>* up = f.U.boundary[pi].get();
+            if (!up || !up->fixesValue() || dynamic_cast<const InletOutletPatchField<vector>*>(up)) return false;
+        }
+        return true;
+    }();
+    constexpr int adjustPhiMaxQueued = 64;
+    DeviceBuffer<scalar> dAdjustRecord(3*static_cast<std::size_t>(adjustPhiMaxQueued));
+    int adjustPhiQueued = 0;
+    const auto adjustPhiFlush = [&]()
+    {
+        if (adjustPhiQueued == 0) return;
+        std::vector<scalar> r(3*static_cast<std::size_t>(adjustPhiQueued));
+        cudaCheck(cudaMemcpy(r.data(), dAdjustRecord.data(), r.size()*sizeof(scalar), cudaMemcpyDeviceToHost),
+                  "adjustPhi's queued sums");
+        const int n = adjustPhiQueued;
+        adjustPhiQueued = 0;
+        for (int k = 0; k < n; ++k)
+        {
+            const scalar totalFlux = scalar(1e-300) + r[3*static_cast<std::size_t>(k)];
+            const scalar sumAbs = r[3*static_cast<std::size_t>(k) + 1];
+            const scalar sum = r[3*static_cast<std::size_t>(k) + 2];
+            if (std::fabs(sum)/totalFlux > scalar(1e-8))
+            {
+                const scalar massIn = (sumAbs - sum)/scalar(2);
+                const scalar fixedMassOut = (sumAbs + sum)/scalar(2);
+                char nums[256];
+                std::snprintf(nums, sizeof(nums),
+                              "Total flux              : %.6e\n"
+                              "Specified mass inflow   : %.6e\n"
+                              "Specified mass outflow  : %.6e\n"
+                              "Adjustable mass outflow : %.6e",
+                              (double)totalFlux, (double)massIn, (double)fixedMassOut, 0.0);
+                throw std::runtime_error(
+                    std::string("brae interFoam adjustPhi: Continuity error cannot be removed by adjusting the "
+                                "outflow.\nPlease check the velocity boundary conditions and/or run potentialFoam "
+                                "to initialise the outflow.\n") + nums);
+            }
+        }
+    };
     H.pressure.adjustPhi = [&](const DeviceBuffer<scalar>& phiHI, DeviceBuffer<scalar>& phiHB)
     {
+        if (adjustPhiDeferred)
+        {
+            if (adjustPhiQueued == adjustPhiMaxQueued) adjustPhiFlush();
+            scalar* rec = dAdjustRecord.data() + 3*static_cast<std::size_t>(adjustPhiQueued++);
+            deviceSumMagInto(phiHI, rec);
+            deviceSumMagInto(phiHB, rec + 1);
+            deviceDotInto(phiHB, deviceOnes(static_cast<int>(phiHB.size())), rec + 2);
+            return;
+        }
         SurfaceScalarField ph;
         scalar sumMag = -1;
         if (adjustPhiHostSum)
@@ -7946,6 +8011,7 @@ RunReport runInterFoamDevice(
                             dNH, dNHB, dABnd, dK, dAFixes, dAFlag, dbU,
                             dRho, dMu, dNu, dRpI, dRpB, tapsOut);
             interPhase::mark("5 pressure correctors");
+            adjustPhiFlush();
             if (cnDdt && dCn.ocAlpha > scalar(0))
             {
                 // the flux this pass ended on is alphaPhi10 as it stands: the next step's oldTime()
