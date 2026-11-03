@@ -133,6 +133,11 @@ struct DeviceContactAngleState
     DeviceBuffer<scalar> gx, gy, gz, hx, hy, hz, mag, a12, b2;
     scalar* hostA12 = nullptr;   // pinned
     scalar* hostB2 = nullptr;    // pinned
+    int*    hostIdx = nullptr;   // pinned
+    // the faces whose a12 moved since the last call, and a12 as that call left it (see deviceContactAngleNHat)
+    DeviceBuffer<scalar> prevA12, changedVal;
+    DeviceBuffer<int>    changedIdx, changedCount;
+    bool a12Valid = false;
     DeviceContactAngleState() = default;
     DeviceContactAngleState(const DeviceContactAngleState&) = delete;
     DeviceContactAngleState& operator=(const DeviceContactAngleState&) = delete;
@@ -140,6 +145,7 @@ struct DeviceContactAngleState
     {
         if (hostA12) cudaFreeHost(hostA12);
         if (hostB2) cudaFreeHost(hostB2);
+        if (hostIdx) cudaFreeHost(hostIdx);
     }
 };
 

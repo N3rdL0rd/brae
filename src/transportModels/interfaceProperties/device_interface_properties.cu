@@ -281,6 +281,33 @@ __global__ void caContactKernel(
     nHatf[b] = dot3R(hx, hy, hz, Sfx[f], Sfy[f], Sfz[f]);
 }
 
+// The faces whose a12 differs, bit for bit, from the last call's: their index and new value are listed and the
+// last call's array brought up to date. b2 is a function of a12 and the face's own constants and nothing else, so
+// a face whose a12 has not moved keeps its b2 exactly.
+__global__ void caChangedKernel(
+    int n, const scalar* __restrict__ a12, scalar* __restrict__ prev, int force,
+    int* __restrict__ count, int* __restrict__ idx, scalar* __restrict__ val)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const scalar a = a12[i];
+    if (force || __double_as_longlong(a) != __double_as_longlong(prev[i]))
+    {
+        const int k = atomicAdd(count, 1);
+        idx[k] = i;
+        val[k] = a;
+        prev[i] = a;
+    }
+}
+
+__global__ void caScatterKernel(
+    int m, const int* __restrict__ idx, const scalar* __restrict__ val, scalar* __restrict__ out)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= m) return;
+    out[idx[k]] = val[k];
+}
+
 // updateMixtureBoundary (inter_case_cpp.cu), uncoupled branch, with alpha2 = 1 - alpha1
 __global__ void caMixtureKernel(
     int n, const scalar* __restrict__ a, scalar rho1, scalar nu1, scalar rho2, scalar nu2,
@@ -502,25 +529,73 @@ void deviceContactAngleNHat(const DeviceMesh& dm, DeviceContactAngleState& s,
     ckIP(cudaGetLastError(), "contact angle: the boundary normal");
     // b2 = cos(acos(a12) - theta) by the host's libm, which is what the host hooks take. CUDA's acos and cos
     // are not glibc's: MEASURED on 2e7 arguments, acos differs in its last bit on 19.6% and cos(acos(x)) on 13%,
-    // and on G4 that moved the wall gradient by an ulp on ~100 faces a pass, fed back by the next. The two
-    // arrays cross the bus (8 bytes a face each way); every other operation stays on the device.
+    // and on G4 that moved the wall gradient by an ulp on ~100 faces a pass, fed back by the next. So the libm
+    // half stays on the host -- but only for the faces whose a12 moved since the last call. b2 depends on a12 and
+    // the face's own constants alone, so an unmoved face keeps its b2 bit for bit; on G4 the interface touches a
+    // few thousand of 533,594 wall faces. MEASURED with `nsys`: 75% of the host time in the GPU's idle gaps (27%
+    // of the step) was this loop and the two whole-array copies around it.
+    //   BRAE_CONTROL_CA_B2_FULL=1 takes the whole array through the host's libm at every call, as before
+    static const bool b2Full = std::getenv("BRAE_CONTROL_CA_B2_FULL") != nullptr;
     if (!s.hostA12)
     {
         ckIP(cudaMallocHost(&s.hostA12, n*sizeof(scalar)), "pinned a12");
         ckIP(cudaMallocHost(&s.hostB2, n*sizeof(scalar)), "pinned b2");
+        ckIP(cudaMallocHost(&s.hostIdx, n*sizeof(int)), "pinned changed indices");
     }
-    ckIP(cudaMemcpy(s.hostA12, s.a12.data(), n*sizeof(scalar), cudaMemcpyDeviceToHost), "a12 down");
-    const scalar* const a12h = s.hostA12;
-    scalar* const b2h = s.hostB2;
     const label* const kindh = s.hostKind.data();
     const scalar* const thetah = s.hostTheta.data();
-    const long nl = static_cast<long>(n);
-    #pragma omp parallel for schedule(static)
-    for (long i = 0; i < nl; ++i)
+    if (b2Full)
     {
-        b2h[i] = kindh[i] == 1 ? std::cos(std::acos(a12h[i]) - thetah[i]) : scalar(0);
+        ckIP(cudaMemcpy(s.hostA12, s.a12.data(), n*sizeof(scalar), cudaMemcpyDeviceToHost), "a12 down");
+        const scalar* const a12h = s.hostA12;
+        scalar* const b2h = s.hostB2;
+        const long nl = static_cast<long>(n);
+        #pragma omp parallel for schedule(static)
+        for (long i = 0; i < nl; ++i)
+        {
+            b2h[i] = kindh[i] == 1 ? std::cos(std::acos(a12h[i]) - thetah[i]) : scalar(0);
+        }
+        ckIP(cudaMemcpy(s.b2.data(), b2h, n*sizeof(scalar), cudaMemcpyHostToDevice), "b2 up");
     }
-    ckIP(cudaMemcpy(s.b2.data(), b2h, n*sizeof(scalar), cudaMemcpyHostToDevice), "b2 up");
+    else
+    {
+        if (s.prevA12.size() != n)
+        {
+            s.prevA12.resize(n);
+            s.changedVal.resize(n);
+            s.changedIdx.resize(n);
+            s.changedCount.resize(1);
+            s.a12Valid = false;
+        }
+        ckIP(cudaMemsetAsync(s.changedCount.data(), 0, sizeof(int), cudaStreamPerThread), "changed count zero");
+        caChangedKernel<<<nBlocks(s.n), TPB>>>(
+            s.n, s.a12.data(), s.prevA12.data(), s.a12Valid ? 0 : 1, s.changedCount.data(), s.changedIdx.data(),
+            s.changedVal.data());
+        ckIP(cudaGetLastError(), "contact angle: the faces whose a12 moved");
+        int m = 0;
+        ckIP(cudaMemcpy(&m, s.changedCount.data(), sizeof(int), cudaMemcpyDeviceToHost), "changed count down");
+        s.a12Valid = true;
+        if (m > 0)
+        {
+            ckIP(cudaMemcpy(s.hostIdx, s.changedIdx.data(), static_cast<std::size_t>(m)*sizeof(int),
+                            cudaMemcpyDeviceToHost), "changed indices down");
+            ckIP(cudaMemcpy(s.hostA12, s.changedVal.data(), static_cast<std::size_t>(m)*sizeof(scalar),
+                            cudaMemcpyDeviceToHost), "changed a12 down");
+            const scalar* const a12h = s.hostA12;
+            scalar* const b2h = s.hostB2;
+            const int* const idxh = s.hostIdx;
+            #pragma omp parallel for schedule(static)
+            for (int j = 0; j < m; ++j)
+            {
+                const int i = idxh[j];
+                b2h[j] = kindh[i] == 1 ? std::cos(std::acos(a12h[j]) - thetah[i]) : scalar(0);
+            }
+            ckIP(cudaMemcpy(s.changedVal.data(), b2h, static_cast<std::size_t>(m)*sizeof(scalar),
+                            cudaMemcpyHostToDevice), "changed b2 up");
+            caScatterKernel<<<(m + TPB - 1)/TPB, TPB>>>(m, s.changedIdx.data(), s.changedVal.data(), s.b2.data());
+            ckIP(cudaGetLastError(), "contact angle: the changed b2");
+        }
+    }
     caContactKernel<<<nBlocks(s.n), TPB>>>(
         s.n, s.kind.data(), s.limit.data(), s.faceCell.data(), s.deltaCoeffs.data(), s.cosTheta.data(),
         s.b2.data(), s.nfx.data(), s.nfy.data(), s.nfz.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(),
