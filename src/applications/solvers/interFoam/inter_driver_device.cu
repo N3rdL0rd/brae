@@ -2913,12 +2913,46 @@ RunReport runInterFoamDevice(
         std::printf("  U boundary: every patch is noSlip or zeroGradient, so the device boundary's state is built once "
                     "and not refreshed; BRAE_CONTROL_U_BOUNDARY_FULL=1 refreshes it at every call\n");
     }
+
+    // A fixed mesh whose U patches are only noSlip/zeroGradient needs no host state at the four calls: the
+    // stored boundary values ARE deviceBCValue's result, at the assembly as after an evaluate. No flux-dependent
+    // or time-dependent patch exists on this arm, so the three-component download, host evaluation and packing
+    // all dead work. A changing mesh, a host closure, or either U identity gate keeps the old whole-hook path;
+    // writers and the final hand-off explicitly bring the host field current below.
+    // BRAE_CONTROL_U_STATIC_HOST=1 restores the previous host evaluation and packing at every call.
+    static const bool uStaticHost = std::getenv("BRAE_CONTROL_U_STATIC_HOST") != nullptr;
+    const bool uStaticDevice = uAllStatic && !f.meshIsDynamic && !hostClosure && !uStaticHost
+                            && !uEmptyFromHost && !uEmptyCheck;
+    DeviceBuffer<scalar> dStaticUB[3];
+    bool staticUBBuilt = false;
+    if (uStaticDevice)
+    {
+        std::printf("  U boundary: static noSlip/zeroGradient values stay on the GPU; "
+                    "BRAE_CONTROL_U_STATIC_HOST=1 evaluates and packs them on the host\n");
+    }
     H.updateUBoundary =
         [&](const DeviceBuffer<scalar>& ux, const DeviceBuffer<scalar>& uy,
             const DeviceBuffer<scalar>& uz, DeviceVectorBoundary& db, DeviceBuffer<scalar>* ubOut,
             DeviceUBoundaryCall call)
     {
         interPhase::Nested timed("hook updateUBoundary");
+        const bool staticDeviceCall = uStaticDevice && uBoundaryBuiltIn == &db
+                                   && uBoundaryBuiltEpoch == meshGeometryEpoch
+                                   && uBoundaryBuiltAddressing == dm.addressingId;
+        if (staticDeviceCall && ubOut)
+        {
+            // U needs no host round trip, but p_rgh and alpha still take the new flux at these calls.
+            // Keep that notification: skipping it changes their stored coefficients and the written phi.
+            pushFlux(call == DeviceUBoundaryCall::evaluateStillUpdated);
+            interPhase::Nested staticPart("U hook: static patch values on the GPU");
+            for (int k = 0; k < 3; ++k)
+            {
+                deviceBCValue(db.comp[k], k == 0 ? ux : (k == 1 ? uy : uz), dStaticUB[k]);
+                deviceCopy(ubOut[k], dStaticUB[k]);
+            }
+            staticUBBuilt = true;
+            return;
+        }
         std::optional<interPhase::Nested> part;
         part.emplace("U hook: the flux to the patches");
         // p_rgh's and alpha's patches take the new flux at every call; U's do not at the one call
@@ -3321,7 +3355,7 @@ RunReport runInterFoamDevice(
             DeviceBuffer<scalar>& gz,
             DeviceBuffer<scalar>& out)
         {
-            out.resize(static_cast<std::size_t>(nIf));
+            if (out.size() < static_cast<std::size_t>(nIf)) out.resize(static_cast<std::size_t>(nIf));
             if (snCorrD)
             {
                 deviceGradOf(dm, v, bval, gradChoice.leastSquares, gradChoice.cellLimitK, gx, gy, gz,
@@ -3341,12 +3375,17 @@ RunReport runInterFoamDevice(
                 (snCorrD && !forcesNoCorrection) ? 1 : 0, snLimD, out.data());
             cudaCheck(cudaGetLastError(), "snGradInternal");
         };
+        // The internal kernels write the full-face output's head directly; only its boundary tail is appended.
+        static const bool appendCopy = std::getenv("BRAE_CONTROL_FORCES_APPEND_COPY") != nullptr;
         auto appendBoundary = [&](DeviceBuffer<scalar>& full, const DeviceBuffer<scalar>& internal,
                                   const std::vector<scalar>& bnd)
         {
-            full.resize(static_cast<std::size_t>(nIf) + bnd.size());
-            cudaCheck(cudaMemcpyAsync(full.data(), internal.data(), static_cast<std::size_t>(nIf)*sizeof(scalar),
-                                      cudaMemcpyDeviceToDevice, cudaStreamPerThread), "forces internal copy");
+            if (appendCopy)
+            {
+                DeviceBuffer<scalar> prefix(static_cast<std::size_t>(nIf));
+                cudaCheck(cudaMemcpyAsync(prefix.data(), internal.data(), static_cast<std::size_t>(nIf)*sizeof(scalar),
+                                          cudaMemcpyDeviceToDevice, cudaStreamPerThread), "forces internal copy");
+            }
             if (!bnd.empty())
             {
                 cudaCheck(cudaMemcpyAsync(full.data() + nIf, bnd.data(), bnd.size()*sizeof(scalar),
@@ -3363,9 +3402,12 @@ RunReport runInterFoamDevice(
             const std::vector<scalar>& packed,
             const char* what)
         {
-            full.resize(static_cast<std::size_t>(nIf) + ep.nBndAll);
-            cudaCheck(cudaMemcpyAsync(full.data(), internal.data(), static_cast<std::size_t>(nIf)*sizeof(scalar),
-                                      cudaMemcpyDeviceToDevice, cudaStreamPerThread), "forces internal copy");
+            if (appendCopy)
+            {
+                DeviceBuffer<scalar> prefix(static_cast<std::size_t>(nIf));
+                cudaCheck(cudaMemcpyAsync(prefix.data(), internal.data(), static_cast<std::size_t>(nIf)*sizeof(scalar),
+                                          cudaMemcpyDeviceToDevice, cudaStreamPerThread), "forces internal copy");
+            }
             runsUp(full.data() + nIf, packed, ep, what);
         };
         // a scalar's patch values for a corrected snGrad's gradient, the one reader (deviceSnGradInternal)
@@ -3465,13 +3507,13 @@ RunReport runInterFoamDevice(
             forcesPart.emplace("forces hook (device): the surface-tension flux");
             DeviceBuffer<scalar> alphaBval;
             valuesForGradient(f.alpha1, a, "alpha", alphaBval);
-            DeviceBuffer<scalar> stfInternal;
+            stf.resize(static_cast<std::size_t>(nIf) + ep.nBndAll);
             DeviceBuffer<scalar> gAx;
             DeviceBuffer<scalar> gAy;
             DeviceBuffer<scalar> gAz;
-            deviceSnGradInternal(a, alphaBval, f.gradAlpha1, gAx, gAy, gAz, stfInternal);
+            deviceSnGradInternal(a, alphaBval, f.gradAlpha1, gAx, gAy, gAz, stf);
             surfaceTensionInternalKernel<<<blocksIf, 256>>>(
-                nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), Kd.data(), f.interface.sigma, stfInternal.data());
+                nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), Kd.data(), f.interface.sigma, stf.data());
             cudaCheck(cudaGetLastError(), "surfaceTensionInternal");
             const auto stfBoundary = [&](bool skipEmpty)
             {
@@ -3492,7 +3534,7 @@ RunReport runInterFoamDevice(
             };
             if (ep.kept)
             {
-                appendBoundaryRuns(stf, stfInternal, stfBoundary(true), "the surface-tension flux");
+                appendBoundaryRuns(stf, stf, stfBoundary(true), "the surface-tension flux");
                 emptyCellTimesZero(stf.data() + nIf, Kd, f.interface.sigma, "flux");
                 if (hooksEmptyCheck)
                 {
@@ -3502,7 +3544,7 @@ RunReport runInterFoamDevice(
             }
             else
             {
-                appendBoundary(stf, stfInternal, stfBoundary(false));
+                appendBoundary(stf, stf, stfBoundary(false));
             }
             if (pairOnDevice)
             {
@@ -3551,14 +3593,14 @@ RunReport runInterFoamDevice(
                 deviceCopy(dStepRhoBnd, rhoBd);
             }
             const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, stepRhoBnd, fvp, !rhoByRuns);
-            DeviceBuffer<scalar> snRhoInternal;
+            snRho.resize(static_cast<std::size_t>(nIf) + ep.nBndAll);
             DeviceBuffer<scalar> gRx;
             DeviceBuffer<scalar> gRy;
             DeviceBuffer<scalar> gRz;
-            deviceSnGradInternal(rd, rhoBd, f.gradRho, gRx, gRy, gRz, snRhoInternal);
+            deviceSnGradInternal(rd, rhoBd, f.gradRho, gRx, gRy, gRz, snRho);
             if (ep.kept)
             {
-                appendBoundaryRuns(snRho, snRhoInternal, snGradBoundary(rhoF, fvp, true, true), "snGrad(rho)");
+                appendBoundaryRuns(snRho, snRho, snGradBoundary(rhoF, fvp, true, true), "snGrad(rho)");
                 emptySet(snRho.data() + nIf, scalar(0), "snGradRho");
                 if (hooksEmptyCheck)
                 {
@@ -3568,7 +3610,7 @@ RunReport runInterFoamDevice(
             }
             else
             {
-                appendBoundary(snRho, snRhoInternal, snGradBoundary(rhoF, fvp, true));
+                appendBoundary(snRho, snRho, snGradBoundary(rhoF, fvp, true));
             }
             if (pairOnDevice)
             {
@@ -3803,14 +3845,14 @@ RunReport runInterFoamDevice(
             {
                 DeviceBuffer<scalar> pBval;
                 valuesForGradient(f.p_rgh, *prghForHooks, "prgh", pBval);
-                DeviceBuffer<scalar> snPInternal;
+                snP.resize(static_cast<std::size_t>(nIf) + ep.nBndAll);
                 DeviceBuffer<scalar> gPx;
                 DeviceBuffer<scalar> gPy;
                 DeviceBuffer<scalar> gPz;
-                deviceSnGradInternal(*prghForHooks, pBval, f.gradPrgh, gPx, gPy, gPz, snPInternal);
+                deviceSnGradInternal(*prghForHooks, pBval, f.gradPrgh, gPx, gPy, gPz, snP);
                 if (ep.kept)
                 {
-                    appendBoundaryRuns(snP, snPInternal, snGradBoundary(f.p_rgh, fvp, true, true), "snGrad(p_rgh)");
+                    appendBoundaryRuns(snP, snP, snGradBoundary(f.p_rgh, fvp, true, true), "snGrad(p_rgh)");
                     emptySet(snP.data() + nIf, scalar(0), "snGradPrgh");
                     if (hooksEmptyCheck)
                     {
@@ -3820,7 +3862,7 @@ RunReport runInterFoamDevice(
                 }
                 else
                 {
-                    appendBoundary(snP, snPInternal, snGradBoundary(f.p_rgh, fvp, true));
+                    appendBoundary(snP, snP, snGradBoundary(f.p_rgh, fvp, true));
                 }
                 if (pairOnDevice)
                 {
@@ -3916,6 +3958,7 @@ RunReport runInterFoamDevice(
         }
         return runs;
     };
+
     H.pressure.pressureCoeffs =
         [&](const DeviceBuffer<scalar>&, const DeviceBuffer<scalar>& phiHB,
             const DeviceBuffer<scalar>& rAUfAll, const DeviceBuffer<scalar>& rAUCell,
@@ -5853,6 +5896,21 @@ RunReport runInterFoamDevice(
         deviceCopyNotViaHost(dUox, dUx, "Ux's old-time level");
         deviceCopyNotViaHost(dUoy, dUy, "Uy's old-time level");
         deviceCopyNotViaHost(dUoz, dUz, "Uz's old-time level");
+        if (uStaticDevice && staticUBBuilt)
+        {
+            // The old level's patch values are the last evaluated level's, exactly what the previous step's
+            // static deviceBCValue left. This also covers the first step's fixed-value oldTime creation.
+            deviceCopyNotViaHost(dUobx, dStaticUB[0], "U old-time static patch x");
+            deviceCopyNotViaHost(dUoby, dStaticUB[1], "U old-time static patch y");
+            deviceCopyNotViaHost(dUobz, dStaticUB[2], "U old-time static patch z");
+            if (cnDdt && dUoobx.size() == 0)
+            {
+                deviceCopy(dUoobx, dUobx);
+                deviceCopy(dUooby, dUoby);
+                deviceCopy(dUoobz, dUobz);
+            }
+        }
+        else
         {
             interPhase::Nested timed("step: U's old-time patch values up");
             // AN `empty` PATCH'S OLD-TIME VALUES ARE ITS CELLS' (EmptyPatchField::evaluate, and nothing moves U
@@ -7614,6 +7672,24 @@ RunReport runInterFoamDevice(
         }
         if (writer && (writeNow || foStop))
         {
+            if (uStaticDevice && staticUBBuilt)
+            {
+                uDown(dUx, dUy, dUz);
+                std::vector<scalar> vb[3];
+                for (int k = 0; k < 3; ++k) dStaticUB[k].copyTo(vb[k]);
+                std::size_t off = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    std::vector<vector> v(static_cast<std::size_t>(fvp[pi].size));
+                    for (label i = 0; i < fvp[pi].size; ++i, ++off)
+                    {
+                        v[static_cast<std::size_t>(i)] = vector{vb[0][off], vb[1][off], vb[2][off]};
+                    }
+                    f.U.boundary[pi]->setValue(v);
+                }
+                uEmptyStale = false;
+            }
             std::vector<scalar> prghW, pW, ux, uy, uz;
             // A function object may already have downloaded this step's final alpha; the writer shares it.
             const std::vector<scalar>& aW = srcAlpha();
