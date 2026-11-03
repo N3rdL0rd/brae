@@ -150,6 +150,54 @@ void mirrorEmptyFacesKernel(
     oz[b] = uz[c];
 }
 
+// p_rgh's fixedFluxPressure walls over a noSlip U, on the device: constrainPressure's gradient
+// (phiHbyA_b - Sf_b.U_b)/(magSf_b*rAUf_b) with U_b = 0, and the laplacian's patch coefficients from it -- the host's
+// own arithmetic, face by face: no product feeds a sum here, so nothing for the compiler to contract.
+__global__
+void prghFluxCoeffsKernel(
+    int nB,
+    int nIf,
+    const scalar* __restrict__ phiHB,
+    const scalar* __restrict__ rAUfAll,
+    const scalar* __restrict__ magSfAll,
+    const scalar* __restrict__ SfxAll,
+    const scalar* __restrict__ SfyAll,
+    const scalar* __restrict__ SfzAll,
+    scalar Ub,
+    scalar* __restrict__ grad,
+    scalar* __restrict__ iC,
+    scalar* __restrict__ bC)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nB) return;
+    const scalar rA = rAUfAll[nIf + b];
+    const scalar ms = magSfAll[nIf + b];
+    // dot(Sf, U_b) as the host forms it, U_b = (Ub, Ub, Ub) = zero: the SIGN of that zero reaches a face whose
+    // phiHbyA is zero, where hB - (-0) and hB - (+0) differ in the sign of their zero. Ub is a launch argument so
+    // the products are made at run time, as the host makes them.
+    const scalar SfU = SfxAll[nIf + b]*Ub + SfyAll[nIf + b]*Ub + SfzAll[nIf + b]*Ub;
+    const scalar sn = (phiHB[b] - SfU) / (ms * rA);
+    const scalar pGamma = rA * ms;
+    grad[b] = sn;
+    iC[b] = pGamma * scalar(0);      // fixedGradient's gradientInternalCoeffs is zero
+    bC[b] = (-pGamma) * sn;          // ...and its gradientBoundaryCoeffs is the gradient
+}
+
+// fixedGradientFvPatchField::evaluate: the cell's value plus gradient/deltaCoeffs
+__global__
+void prghEvaluateKernel(
+    int nB,
+    const label* __restrict__ cell,
+    const scalar* __restrict__ pr,
+    const scalar* __restrict__ grad,
+    const scalar* __restrict__ dc,
+    scalar* __restrict__ val)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nB) return;
+    val[b] = pr[cell[b]] + grad[b] / dc[b];
+}
+
 // A scalar's value in each of `n` listed cells, in the list's order: the cells under a set of patch faces.
 __global__
 void gatherCellsKernel(
@@ -4206,12 +4254,77 @@ RunReport runInterFoamDevice(
         return runs;
     };
 
+    // p_rgh's PATCHES ON THE DEVICE, where every patch is a fixedFluxPressure wall over a noSlip U and nothing on
+    // the host reads them between two writes. constrainPressure's gradient, the laplacian's patch coefficients and
+    // the patches' evaluate are one face-wise formula each, and the host did them on every wall face (533,594 on
+    // the G4 tank) three times a step: pressureCoeffs 55 ms and updateBoundary 54 ms of a 497 ms step. The gradient
+    // and the patch values live in two device arrays; the host's patch fields are brought current where something
+    // reads them -- a write and the end of the run (syncPrghPatches, below) -- by the same updateSnGrad and
+    // evaluate the hooks made. U_b is zero on a noSlip wall that nothing assigns (no MRF zone). Any other patch
+    // class, an empty or coupled patch, a moving mesh or a momentum predictor keeps the host's hooks.
+    //   BRAE_CONTROL_PRESSURE_PATCHES_HOST=1 runs the host's hooks as before
+    static const bool pPatchesHost = std::getenv("BRAE_CONTROL_PRESSURE_PATCHES_HOST") != nullptr;
+    const bool pDevicePatches = [&]()
+    {
+        if (pPatchesHost || pEmptyFromHost || pEmptyCheck || pPatchCopies || f.meshIsDynamic || hostClosure
+            || f.momentumPredictorOn || !cyclics.empty() || !f.mrfZones.empty()
+            || std::getenv("BRAE_CONTROL_FORCES_CHECK") != nullptr || fvp.empty())
+        {
+            return false;
+        }
+        std::size_t nFaces = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (fvp[pi].type == "empty" || isCoupledInterfaceType(fvp[pi].type)) return false;
+            const auto* pp = f.p_rgh.boundary[pi].get();
+            const auto* up = f.U.boundary[pi].get();
+            if (!pp || !up) return false;
+            if (typeid(*pp) != typeid(FixedFluxPressurePatchField)) return false;
+            if (typeid(*up) != typeid(NoSlipPatchField<vector>)) return false;
+            nFaces += static_cast<std::size_t>(fvp[pi].size);
+        }
+        return nFaces == static_cast<std::size_t>(dm.nBndFaces) && nFaces > 0;
+    }();
+    DeviceBuffer<scalar> dPGrad, dPVal, dPDc;
+    DeviceBuffer<label> dPCell;
+    if (pDevicePatches)
+    {
+        std::vector<scalar> dc, grad;
+        std::vector<label> cell;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            dc.insert(dc.end(), fvp[pi].deltaCoeffs.begin(), fvp[pi].deltaCoeffs.end());
+            cell.insert(cell.end(), fvp[pi].faceCells.begin(), fvp[pi].faceCells.end());
+            const std::vector<scalar> g0 = f.p_rgh.boundary[pi]->snGrad(std::vector<scalar>());
+            grad.insert(grad.end(), g0.begin(), g0.end());
+        }
+        dPDc.copyFrom(dc);
+        dPCell.copyFrom(cell);
+        dPGrad.copyFrom(grad);
+        dPVal.copyFrom(patchValues(f.p_rgh, fvp));
+        std::printf("  p_rgh boundary: every patch is a fixedFluxPressure wall over noSlip U, so the gradient, the "
+                    "laplacian's patch coefficients and the patch values are made on the GPU (%zu faces); "
+                    "BRAE_CONTROL_PRESSURE_PATCHES_HOST=1 makes them on the host\n", cell.size());
+    }
+
     H.pressure.pressureCoeffs =
         [&](const DeviceBuffer<scalar>&, const DeviceBuffer<scalar>& phiHB,
             const DeviceBuffer<scalar>& rAUfAll, const DeviceBuffer<scalar>& rAUCell,
             DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC, DeviceBuffer<scalar>& cycJump)
     {
         interPhase::Nested timed("hook pressure.pressureCoeffs");
+        if (pDevicePatches)
+        {
+            const int nB = dm.nBndFaces;
+            iC.resize(static_cast<std::size_t>(nB));
+            bC.resize(static_cast<std::size_t>(nB));
+            prghFluxCoeffsKernel<<<(nB + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                nB, nIf, phiHB.data(), rAUfAll.data(), dm.magSf.data(), dm.Sfx.data(), dm.Sfy.data(),
+                dm.Sfz.data(), scalar(0), dPGrad.data(), iC.data(), bC.data());
+            cudaCheck(cudaGetLastError(), "prghFluxCoeffsKernel");
+            cycJump.resize(0);
+            return;
+        }
         std::optional<interPhase::Nested> hookPart;
         hookPart.emplace("p hook: the pair's flux, phiHbyA and rAUf of the boundary down");
         // THE PAIR'S FLUX, as it stands at THIS assembly. porousBafflePressure's jump is built from it
@@ -4576,6 +4689,12 @@ RunReport runInterFoamDevice(
     H.pressure.boundaryValues = [&](const DeviceBuffer<scalar>& pr, DeviceBuffer<scalar>& bval)
     {
         interPhase::Nested timed("hook pressure.boundaryValues");
+        if (pDevicePatches)
+        {
+            bval.resize(dPVal.size());
+            deviceCopy(bval, dPVal);
+            return;
+        }
         if (pEmptyFromHost)
         {
             std::vector<scalar> flat;
@@ -4736,6 +4855,14 @@ RunReport runInterFoamDevice(
     {
         interPhase::Nested timed("hook pressure.updateBoundary");
         std::optional<interPhase::Nested> hookPart;
+        if (pDevicePatches)
+        {
+            const int nB = dm.nBndFaces;
+            prghEvaluateKernel<<<(nB + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                nB, dPCell.data(), pr.data(), dPGrad.data(), dPDc.data(), dPVal.data());
+            cudaCheck(cudaGetLastError(), "prghEvaluateKernel");
+            return;
+        }
         hookPart.emplace("p hook: p_rgh down to the host field");
         if (pDownFaceCells)
         {
@@ -5477,6 +5604,23 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dPhiI(f.phi.internal);
     DeviceBuffer<scalar> dPrgh(f.p_rgh.internal), dP;
     prghForHooks = &dPrgh;
+    // The host's p_rgh patches made current from the device's gradient and cells: the same updateSnGrad and
+    // evaluate the host hooks made, now where a writer or the end of the run reads them.
+    auto syncPrghPatches = [&]()
+    {
+        if (!pDevicePatches) return;
+        dPrgh.copyTo(f.p_rgh.internal);
+        std::vector<scalar> grad;
+        dPGrad.copyTo(grad);
+        std::size_t at = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+            f.p_rgh.boundary[pi]->updateSnGrad(std::vector<scalar>(grad.begin() + at, grad.begin() + at + n));
+            at += n;
+        }
+        f.p_rgh.evaluateBoundary();
+    };
     DeviceBuffer<scalar> dNH(f.nHatf.internal), dNHB(flattenPatches(f.nHatf.boundary, fvp));
     // ...and ON THE PAIR, seeded from the same field buildInterFields built: at the first step of a
     // run that normal is calculateK's own.
@@ -8020,6 +8164,7 @@ RunReport runInterFoamDevice(
             std::vector<scalar> prghW, pW, ux, uy, uz;
             // A function object may already have downloaded this step's final alpha; the writer shares it.
             const std::vector<scalar>& aW = srcAlpha();
+            syncPrghPatches();
             dPrgh.copyTo(prghW);
             dP.copyTo(pW);
             // ...and under frozenFlow no pressure corrector ever filled the device's p: OpenFOAM writes the
@@ -8285,6 +8430,7 @@ RunReport runInterFoamDevice(
       for (label c = 0; c < nC; ++c) f.U.internal[c] = vector{x[c], y[c], z[c]};
       f.U.evaluateBoundary();
       uEmptyStale = false; }
+    syncPrghPatches();
     dPrgh.copyTo(f.p_rgh.internal);
     f.p_rgh.evaluateBoundary();
     dP.copyTo(f.p);
