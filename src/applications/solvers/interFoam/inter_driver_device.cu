@@ -150,6 +150,19 @@ void mirrorEmptyFacesKernel(
     oz[b] = uz[c];
 }
 
+// A scalar's value in each of `n` listed cells, in the list's order: the cells under a set of patch faces.
+__global__
+void gatherCellsKernel(
+    int n,
+    const label* __restrict__ cell,
+    const scalar* __restrict__ v,
+    scalar* __restrict__ o)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    o[k] = v[cell[k]];
+}
+
 // ...and a SCALAR's (p_rgh's stored patch values, for the corrected laplacian's gradient)
 __global__
 void mirrorEmptyScalarKernel(
@@ -4690,12 +4703,62 @@ RunReport runInterFoamDevice(
         cpu::interFoam::adjustPhi(ph, f.U, true, fvp, sumMag);
         phiHB.copyFrom(flattenPatches(ph.boundary, fvp));
     };
+    // p_rgh's PATCHES, EVALUATED FROM THEIR OWN CELLS ONLY. The hook brought the whole field down (20 MB a call,
+    // three calls a step on the G4 tank) for patch fields that read one cell a face; nothing on the host reads
+    // the field's other cells between two writes -- the writer, the function objects, the hand-off after a
+    // change of mesh and the end of the run each take p_rgh off the device themselves. So the cells under the
+    // evaluated patches' faces come down (one value a face, 4 MB on the tank) and the evaluate reads exactly
+    // the values it read before: the patch values are byte for byte the same. Kept whole where the host does
+    // read the field: a momentum predictor (snGrad(p_rgh) on the host), a coupled patch (reads its neighbour's
+    // cells too), a mesh that changes, a host closure, and the forces gate.
+    //   BRAE_CONTROL_PRESSURE_DOWN_WHOLE=1 brings the whole field down at every call, as before
+    static const bool pDownWhole = std::getenv("BRAE_CONTROL_PRESSURE_DOWN_WHOLE") != nullptr;
+    static const bool pForcesGate = std::getenv("BRAE_CONTROL_FORCES_CHECK") != nullptr;
+    const bool pDownFaceCells = !pDownWhole && !pEmptyFromHost && !pForcesGate && !f.momentumPredictorOn
+                             && !f.meshIsDynamic && !hostClosure && cyclics.empty() && !pEmptyCheck;
+    DeviceBuffer<label> dPFaceCells;
+    std::vector<label> hPFaceCells;
+    std::vector<scalar> hPFaceVals;
+    if (pDownFaceCells)
+    {
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (fvp[pi].type == "empty" || isCoupledInterfaceType(fvp[pi].type)) continue;
+            hPFaceCells.insert(hPFaceCells.end(), fvp[pi].faceCells.begin(), fvp[pi].faceCells.end());
+        }
+        hPFaceVals.resize(hPFaceCells.size());
+        dPFaceCells.copyFrom(hPFaceCells);
+        std::printf("  p_rgh boundary: the host's patches are evaluated from the %zu cells under their faces, "
+                    "not the whole field; BRAE_CONTROL_PRESSURE_DOWN_WHOLE=1 brings the field down\n",
+                    hPFaceCells.size());
+    }
     H.pressure.updateBoundary = [&](const DeviceBuffer<scalar>& pr)
     {
         interPhase::Nested timed("hook pressure.updateBoundary");
         std::optional<interPhase::Nested> hookPart;
         hookPart.emplace("p hook: p_rgh down to the host field");
-        pr.copyTo(f.p_rgh.internal);
+        if (pDownFaceCells)
+        {
+            const int nF = static_cast<int>(hPFaceCells.size());
+            if (nF > 0)
+            {
+                DeviceBuffer<scalar> stage(static_cast<std::size_t>(nF));
+                gatherCellsKernel<<<(nF + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                    nF, dPFaceCells.data(), pr.data(), stage.data());
+                cudaCheck(cudaGetLastError(), "gatherCellsKernel");
+                cudaCheck(cudaMemcpy(hPFaceVals.data(), stage.data(), static_cast<std::size_t>(nF)*sizeof(scalar),
+                                     cudaMemcpyDeviceToHost), "p_rgh's face cells down");
+                for (int k = 0; k < nF; ++k)
+                {
+                    f.p_rgh.internal[static_cast<std::size_t>(hPFaceCells[static_cast<std::size_t>(k)])]
+                        = hPFaceVals[static_cast<std::size_t>(k)];
+                }
+            }
+        }
+        else
+        {
+            pr.copyTo(f.p_rgh.internal);
+        }
         hookPart.emplace("p hook: p_rgh's patches evaluated (host)");
         if (pEmptyFromHost)
         {
