@@ -6092,6 +6092,28 @@ RunReport runInterFoamDevice(
     static const bool hostContErr = std::getenv("BRAE_CONTROL_HOST_CONTERR") != nullptr;
     scalar continuitySumV = 0;
     unsigned long long continuitySumVEpoch = 0;
+    // continuityErrs.H's SUM, QUEUED. Only a writer reads what the corrector's hook accumulates, and the hook read
+    // sum(V*divPhi) back at every corrector -- a blocking copy behind the step's queued kernels (128 calls, 0.63 s
+    // of an `nsys` window on the G4 tank). The dot product is queued into a device record and the accumulation
+    // replayed, in the same order with the same numbers, once the step's correctors are done (contErrFlush); the
+    // cumulative error is read at a write, which comes after.
+    //   BRAE_CONTROL_CONTERR_SYNC=1 reads it at every corrector, as before
+    static const bool contErrSync = std::getenv("BRAE_CONTROL_CONTERR_SYNC") != nullptr;
+    constexpr int contErrMaxQueued = 64;
+    DeviceBuffer<scalar> dContErrRecord(static_cast<std::size_t>(contErrMaxQueued));
+    std::vector<std::pair<scalar, scalar>> contErrQueued;   // deltaT and sum(V) of each queued dot product
+    const auto contErrFlush = [&]()
+    {
+        if (contErrQueued.empty()) return;
+        std::vector<scalar> r(contErrQueued.size());
+        cudaCheck(cudaMemcpy(r.data(), dContErrRecord.data(), r.size()*sizeof(scalar), cudaMemcpyDeviceToHost),
+                  "the queued continuity sums");
+        for (std::size_t k = 0; k < r.size(); ++k)
+        {
+            writer->addContinuityError(contErrQueued[k].first, r[k], contErrQueued[k].second);
+        }
+        contErrQueued.clear();
+    };
     if (writer)
     {
         H.correctorDone = [&](
@@ -6133,7 +6155,14 @@ RunReport runInterFoamDevice(
                 for (const scalar v : g.V()) continuitySumV += v;
                 continuitySumVEpoch = meshGeometryEpoch;
             }
-            writer->addContinuityError(rep.deltaT, deviceDot(divPhi, dm.V), continuitySumV);
+            if (contErrSync)
+            {
+                writer->addContinuityError(rep.deltaT, deviceDot(divPhi, dm.V), continuitySumV);
+                return;
+            }
+            if (static_cast<int>(contErrQueued.size()) == contErrMaxQueued) contErrFlush();
+            deviceDotInto(divPhi, dm.V, dContErrRecord.data() + contErrQueued.size());
+            contErrQueued.emplace_back(rep.deltaT, continuitySumV);
         };
     }
 
@@ -8012,6 +8041,7 @@ RunReport runInterFoamDevice(
                             dRho, dMu, dNu, dRpI, dRpB, tapsOut);
             interPhase::mark("5 pressure correctors");
             adjustPhiFlush();
+            contErrFlush();
             if (cnDdt && dCn.ocAlpha > scalar(0))
             {
                 // the flux this pass ended on is alphaPhi10 as it stands: the next step's oldTime()
