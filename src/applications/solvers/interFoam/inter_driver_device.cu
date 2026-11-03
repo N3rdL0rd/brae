@@ -1657,11 +1657,45 @@ RunReport runInterFoamDevice(
             off += n;
         }
     };
+    // THE FLUX PUSH TELLS PATCHES THE FLUX, and where no patch of U, p_rgh or alpha reads it there is nobody to tell.
+    // pushFlux brought phi's boundary down (4 MB on the G4 tank, 533,594 faces) four times a step, each a blocking
+    // copy behind the step's queued kernels -- 171 copies and 1.1 s of an `nsys` window -- to hand it to noSlip,
+    // fixedFluxPressure and contact-angle walls that ignore it. Skipped where every patch is one of those (or a
+    // zeroGradient), nothing is coupled or empty, and nothing reads the host's copy between two writes; the writer
+    // and the end of the run bring phi's patches down themselves (below).
+    //   BRAE_CONTROL_FLUX_PUSH_ALWAYS=1 pushes at every call, as before
+    static const bool fluxPushAlways = std::getenv("BRAE_CONTROL_FLUX_PUSH_ALWAYS") != nullptr;
+    const bool fluxPushSkipped = [&]()
+    {
+        if (fluxPushAlways || namesRhoPhi || fluxEmptyFromHost || !cyclics.empty() || f.meshIsDynamic
+            || tapsOut != nullptr || fvp.empty()
+            || std::getenv("BRAE_CONTROL_FLUX_DIVCOEFFS_CHECK") || std::getenv("BRAE_CONTROL_MIXTURE_REPEAT_CHECK")
+            || std::getenv("BRAE_CONTROL_HOOKS_EMPTY_CHECK"))
+        {
+            return false;
+        }
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (fvp[pi].type == "empty" || isCoupledInterfaceType(fvp[pi].type)) return false;
+            const auto* u = f.U.boundary[pi].get();
+            const auto* p = f.p_rgh.boundary[pi].get();
+            const auto* a = f.alpha1.boundary[pi].get();
+            if (!u || !p || !a) return false;
+            if (typeid(*u) != typeid(NoSlipPatchField<vector>) && typeid(*u) != typeid(ZeroGradientPatchField<vector>))
+                return false;
+            if (typeid(*p) != typeid(FixedFluxPressurePatchField) && typeid(*p) != typeid(ZeroGradientPatchField<scalar>))
+                return false;
+            if (typeid(*a) != typeid(ConstantAlphaContactAnglePatchField) && typeid(*a) != typeid(ZeroGradientPatchField<scalar>))
+                return false;
+        }
+        return true;
+    }();
     auto pushFlux = [&](
         bool uCoefficientsKept = false,
         bool whole = false)
     {
         const bool everyFace = whole || fluxEmptyFromHost;
+        if (fluxPushSkipped && !whole) return;
         static bool saidRuns = false;
         if (!saidRuns)
         {
@@ -8277,6 +8311,7 @@ RunReport runInterFoamDevice(
             }
             SurfaceScalarField phiW;
             dPhiI.copyTo(phiW.internal);
+            if (fluxPushSkipped) unflatten(dPhiB, f.phi.boundary);
             phiW.boundary = f.phi.boundary;
             SurfaceScalarField aPhiW;
             dAlphaPhiWriteI.copyTo(aPhiW.internal);
@@ -8560,6 +8595,7 @@ RunReport runInterFoamDevice(
         downloadDeviceInterTurbulence(dTurb, f.turbulence, fvp);
     }
     dPhiI.copyTo(f.phi.internal);
+    if (fluxPushSkipped) unflatten(dPhiB, f.phi.boundary);
 
     // ...and the REPORT's own numbers. Leaving maxU and worstDivPhi at their defaults printed
     // "max|U| 0 m/s, worst |div(phi)| 0.000e+00" on a run whose U reaches 0.27 -- a false statement in
