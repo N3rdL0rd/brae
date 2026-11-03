@@ -5196,15 +5196,16 @@ RunReport runInterFoamDevice(
     // step; a step in which nothing is due downloads nothing.
     std::vector<scalar> foA, foP, foUx, foUy, foUz, foPatch;
     bool foAValid = false, foPValid = false, foUxValid = false, foUyValid = false, foUzValid = false;
+    auto srcAlpha = [&]() -> const std::vector<scalar>&
+    {
+        if (!foAValid) { dA.copyTo(foA); foAValid = true; }
+        return foA;
+    };
     std::shared_ptr<brae::fo::FunctionObjectList> fos;
     {
         brae::fo::Source src;
         src.newStep = [&]() { foAValid = foPValid = foUxValid = foUyValid = foUzValid = false; };
-        src.alpha = [&]() -> const std::vector<scalar>&
-        {
-            if (!foAValid) { dA.copyTo(foA); foAValid = true; }
-            return foA;
-        };
+        src.alpha = srcAlpha;
         src.p_rgh = [&]() -> const std::vector<scalar>&
         {
             if (!foPValid) { dPrgh.copyTo(foP); foPValid = true; }
@@ -5242,8 +5243,12 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dAlphaSubBndWrite;
     std::vector<std::vector<scalar>> alphaSubBndWrite;
     // continuityErrs.H after every corrector, for uniform/cumulativeContErr -- one divergence and one
-    // read-back per corrector, and none at all without a writer. A periodic pair's faces are not in
+    // scalar read-back per corrector, and none at all without a writer. A periodic pair's faces are not in
     // deviceDiv's sum; they cancel in the volume-weighted total up to rounding.
+    // BRAE_CONTROL_HOST_CONTERR=1 restores the full-field download and the host's sequential sum.
+    static const bool hostContErr = std::getenv("BRAE_CONTROL_HOST_CONTERR") != nullptr;
+    scalar continuitySumV = 0;
+    unsigned long long continuitySumVEpoch = 0;
     if (writer)
     {
         H.correctorDone = [&](
@@ -5271,9 +5276,21 @@ RunReport runInterFoamDevice(
                                 && C.phiAbsIfOut->size() == static_cast<std::size_t>(dCyc.n);
                 deviceCyclicAddDivFlux(dCyc, absIf ? *C.phiAbsIfOut : dCyc.phi, dm.V, divPhi);
             }
-            std::vector<scalar> dv;
-            divPhi.copyTo(dv);
-            writer->addContinuityError(rep.deltaT, dv, g.V());
+            if (hostContErr)
+            {
+                std::vector<scalar> dv;
+                divPhi.copyTo(dv);
+                writer->addContinuityError(rep.deltaT, dv, g.V());
+                return;
+            }
+            // Keep sum(V) in the host's original cell order; only the numerator changes summation order.
+            if (continuitySumVEpoch != meshGeometryEpoch)
+            {
+                continuitySumV = 0;
+                for (const scalar v : g.V()) continuitySumV += v;
+                continuitySumVEpoch = meshGeometryEpoch;
+            }
+            writer->addContinuityError(rep.deltaT, deviceDot(divPhi, dm.V), continuitySumV);
         };
     }
 
@@ -7458,8 +7475,9 @@ RunReport runInterFoamDevice(
         }
         if (writer && (writeNow || foStop))
         {
-            std::vector<scalar> aW, prghW, pW, ux, uy, uz;
-            dA.copyTo(aW);
+            std::vector<scalar> prghW, pW, ux, uy, uz;
+            // A function object may already have downloaded this step's final alpha; the writer shares it.
+            const std::vector<scalar>& aW = srcAlpha();
             dPrgh.copyTo(prghW);
             dP.copyTo(pW);
             // ...and under frozenFlow no pressure corrector ever filled the device's p: OpenFOAM writes the
@@ -7653,10 +7671,25 @@ RunReport runInterFoamDevice(
         interPhase::mark("9 write");
         if (verbose)
         {
-            std::vector<scalar> av;
-            dA.copyTo(av);
-            scalar lo = av.empty() ? 0 : av[0], hi = lo;
-            for (scalar v : av) { lo = std::fmin(lo, v); hi = std::fmax(hi, v); }
+            scalar lo = 0, hi = 0;
+            // BRAE_CONTROL_HOST_ALPHA_RANGE=1 restores the full download and sequential host scan.
+            static const bool hostAlphaRange = std::getenv("BRAE_CONTROL_HOST_ALPHA_RANGE") != nullptr;
+            if (hostAlphaRange)
+            {
+                const std::vector<scalar>& av = srcAlpha();
+                lo = av.empty() ? 0 : av[0];
+                hi = lo;
+                for (const scalar v : av) { lo = std::fmin(lo, v); hi = std::fmax(hi, v); }
+            }
+            else
+            {
+                DeviceBuffer<scalar> range(3);
+                deviceMinMaxMeanInto(dA, range.data());
+                DeviceReadValue read[2];
+                read[0].dSrc = range.data();     read[0].hDst = &lo;
+                read[1].dSrc = range.data() + 1; read[1].hDst = &hi;
+                deviceReadValues(read, 2);
+            }
             std::printf("   t = %.17g  dt = %.17g  Co %.3f  alphaCo %.3f  [device]  "
                         "alpha [%.3e, %.15g]\n",
                         (double)rep.time, (double)rep.deltaT, (double)rep.CoNum,

@@ -161,6 +161,9 @@ public:
         scalar deltaT,
         const std::vector<scalar>& divPhi,
         const std::vector<scalar>& V);
+    // The same update when the caller formed sum(V*divPhi) on the device. sumV is supplied separately so
+    // the device path can retain the host's sequential denominator and refresh it only when geometry moves.
+    void addContinuityError(scalar deltaT, scalar sumVf, scalar sumV);
 
     // alpha.<phase1>_0 is written (a sub-cycled alpha): the loops capture it at the start of a write step
     void writeAlphaOld() { alphaOld_ = true; }

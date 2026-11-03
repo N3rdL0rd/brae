@@ -1696,13 +1696,21 @@ void InterWriter::stepTaken(scalar deltaT)
     deltaTSave_ = deltaT;
 }
 
+void InterWriter::addContinuityError(scalar deltaT, scalar sumVf, scalar sumV)
+{
+    // continuityErrs.H: globalContErr = deltaT*contErr.weightedAverage(V) (DimensionedField.C
+    // weightedAverage: gSum(V*f)/gSum(V) where gSum(V) > SMALL)
+    if (sumV > kSmall)
+    {
+        cumulativeContErr_ += deltaT*(sumVf/sumV);
+    }
+}
+
 void InterWriter::addContinuityError(
     scalar deltaT,
     const std::vector<scalar>& divPhi,
     const std::vector<scalar>& V)
 {
-    // continuityErrs.H: globalContErr = deltaT*contErr.weightedAverage(V) (DimensionedField.C
-    // weightedAverage: gSum(V*f)/gSum(V) where gSum(V) > SMALL)
     scalar sumV = 0;
     scalar sumVf = 0;
     for (std::size_t c = 0; c < divPhi.size() && c < V.size(); ++c)
@@ -1710,10 +1718,7 @@ void InterWriter::addContinuityError(
         sumV += V[c];
         sumVf += V[c]*divPhi[c];
     }
-    if (sumV > kSmall)
-    {
-        cumulativeContErr_ += deltaT*(sumVf/sumV);
-    }
+    addContinuityError(deltaT, sumVf, sumV);
 }
 
 std::string InterWriter::timeName(
