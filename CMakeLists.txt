@@ -3405,6 +3405,13 @@ add_test(NAME mgpu_proc_geometry
                  $<TARGET_FILE:test_proc_geometry_loopback>)
 set_tests_properties(mgpu_proc_geometry PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+# Multi-GPU interFoam, I/O half: the frozen-state harness (hidden globals, function objects, per-rank writer
+# on N virtual ranks of the ProcComm loopback backend; tools/mgpu_oracle/FROZEN.md). The driver and the
+# states and references are made by tools/mgpu_oracle/frozen_state.sh (OpenFOAM v2606); no ctest wrapper yet.
+add_executable(mgpu_frozen tests/mgpu_frozen.cu)
+target_include_directories(mgpu_frozen PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(mgpu_frozen PRIVATE brae_core)
+
 # ...and MULES. Two kinds of arm: the PROPERTY (alpha stays in [0,1]) asserted exactly, because that is
 # what MULES is for and needs no host to compare against; and lambda itself within a measured
 # tolerance, because each cell's five gathers run in a different ORDER from the host's face loop and
