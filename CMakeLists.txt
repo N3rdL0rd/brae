@@ -5311,3 +5311,10 @@ set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_PRESSURE_C
 # (BRAE_TURBULENCE_CASE_SOLVER=1) and keeps its bound; the rule is held to OpenFOAM at its measured bounds by
 # tests/interfoam_write/turb_colour/, which unset this. The user's decision, 2026-10-06.
 set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_TURBULENCE_CASE_SOLVER=1")
+
+# First multi-GPU gate: np = 1 through `-parallel` (processor0 of decomposePar, one domain) is byte-identical to
+# the serial run; np = 2/4 decompositions print the per-rank patch table and are refused. Needs a GPU and OpenFOAM v2606
+# (skips, exit 77, without it).
+add_test(NAME mgpu_np1_byte_identical
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_np1_byte_identical.sh $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(mgpu_np1_byte_identical PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
