@@ -52,6 +52,7 @@ Description
 #include "fvOptions.H"
 #include "CorrectPhi.H"
 #include "fvcSmooth.H"
+#include "processorFvPatch.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -71,6 +72,14 @@ int main(int argc, char *argv[])
     #include "setRootCaseLists.H"
     #include "createTime.H"
     #include "createDynamicFvMesh.H"
+
+    // BRAE_PROC_GEOMETRY=1: write the processor patches' geometry (procGeometryDump.H) and stop, before any field
+    // is read -- tools/mgpu_oracle/proc_geometry_gate.sh
+    if (getenv("BRAE_PROC_GEOMETRY"))
+    {
+        #include "procGeometryDump.H"
+        return 0;
+    }
     #include "initContinuityErrs.H"
     #include "createDyMControls.H"
     #include "createFields.H"
