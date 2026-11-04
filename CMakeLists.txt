@@ -406,6 +406,29 @@ foreach(_np 1 2 4 8)
     set_tests_properties(dist_solvers_np${_np} PROPERTIES TIMEOUT 900)
 endforeach()
 
+# np = 1 byte identity of the single-GPU entry points through the distributed hooks: the solver paths a case can select
+# (default graph PCG, BRAE_PCG_DEVICE=0 plain loop, host / device GS smoother) each print bit hashes; tests/np1_identity.sh
+# compares them with the same source built in the tree before the hooks
+add_executable(test_np1_identity tests/test_np1_identity.cu)
+target_include_directories(test_np1_identity PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_np1_identity PRIVATE brae_core)
+target_compile_definitions(test_np1_identity PRIVATE BRAE_DIST_HOOKS)
+
+# The same solvers on the p_rgh matrices OpenFOAM v2606 -parallel dumped (tools/mgpu_oracle: run_oracle.sh with TIGHT=1,
+# export_prgh_matrix.py <run>/par_d1 <root>/exp_open_np<N>_c<k> <k> 1, the serial run as exp_open_np1_c<k>); SKIPs without the dumps
+set(BRAE_MGPU_ORACLE_DUMPS "/tmp/mgpu_oracle_dumps" CACHE PATH "Exported OpenFOAM p_rgh matrices (export_prgh_matrix.py)")
+add_executable(test_dist_solvers_oracle tests/test_dist_solvers_oracle.cu)
+target_include_directories(test_dist_solvers_oracle PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_dist_solvers_oracle PRIVATE brae_core)
+foreach(_np 2 4 8)
+    foreach(_c 1 2)
+        add_test(NAME dist_solvers_oracle_np${_np}_c${_c}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_dist_solvers_oracle>
+                         ${BRAE_MGPU_ORACLE_DUMPS}/exp_open_np${_np}_c${_c} ${BRAE_MGPU_ORACLE_DUMPS}/exp_open_np1_c${_c})
+        set_tests_properties(dist_solvers_oracle_np${_np}_c${_c} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+    endforeach()
+endforeach()
+
 # loopback ops captured as one joint CUDA graph and replayed 1000 times; the MPI-host backend must refuse capture
 add_executable(test_proc_comm_graph tests/test_proc_comm_graph.cu)
 target_include_directories(test_proc_comm_graph PRIVATE ${BRAE_HEADER_DIRS})
