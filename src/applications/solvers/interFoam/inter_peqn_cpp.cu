@@ -447,7 +447,9 @@ bool adjustPhi(
     scalar adjustableMassOut = 0;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        if (patches[pi].type == "empty" || isCyclicFamilyType(patches[pi].type)) continue;
+        // adjustPhi.C:87-95 sums the PHYSICAL boundary only: phip.coupled() patches are skipped, and a processor
+        // patch is coupled too (its flux belongs to the neighbour's interior, not to this run's inflow/outflow).
+        if (patches[pi].type == "empty" || isCoupledType(patches[pi].type)) continue;
         const fvPatchField<vector>& Up = *U.boundary[pi];
         const std::vector<scalar>& phip = phi.boundary[pi];
         // `Up.fixesValue() && !isA<inletOutletFvPatchVectorField>(Up)`: a fixed outflow is not
@@ -485,6 +487,19 @@ bool adjustPhi(
             sumMagPhi += std::fabs(v);
         }
     }
+    // OpenFOAM reduces all four quantities (adjustPhi.C:87-95: reduce(massIn, sumOp), fixedMassOut,
+    // adjustableMassOut, and sum(mag(phi)) is gSum of the internal faces). One collective for the four sums keeps
+    // totalFlux, massCorr, the balance test, the return value and the error text IDENTICAL on every rank; with
+    // rank-local sums each rank would scale its outflow differently and break global conservation. np == 1 (no
+    // ProcComm) returns the arguments untouched, so the single-GPU arithmetic is bit-identical.
+    {
+        scalar sums[4] = {massIn, fixedMassOut, adjustableMassOut, sumMagPhi};
+        pg::sum(sums, 4);
+        massIn = sums[0];
+        fixedMassOut = sums[1];
+        adjustableMassOut = sums[2];
+        sumMagPhi = sums[3];
+    }
     const scalar totalFlux = scalar(1e-300) + sumMagPhi;
     scalar massCorr = 1;
     const scalar magAdjustableMassOut = std::fabs(adjustableMassOut);
@@ -511,7 +526,7 @@ bool adjustPhi(
     }
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        if (patches[pi].type == "empty" || isCyclicFamilyType(patches[pi].type)) continue;
+        if (patches[pi].type == "empty" || isCoupledType(patches[pi].type)) continue;
         const fvPatchField<vector>& Up = *U.boundary[pi];
         if (Up.fixesValue() && !dynamic_cast<const InletOutletPatchField<vector>*>(&Up)) continue;
         for (scalar& v : phi.boundary[pi])

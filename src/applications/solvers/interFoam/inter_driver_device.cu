@@ -5081,7 +5081,9 @@ RunReport runInterFoamDevice(
         if (adjustPhiSync || adjustPhiHostSum || fvp.empty()) return false;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (fvp[pi].type == "empty" || isCyclicFamilyType(fvp[pi].type)) return false;
+            // adjustPhi's deferred sums cover the PHYSICAL boundary only: a coupled patch (processor included)
+            // takes the host route, whose global reductions keep every rank's decision identical.
+            if (fvp[pi].type == "empty" || isCoupledType(fvp[pi].type)) return false;
             const fvPatchField<vector>* up = f.U.boundary[pi].get();
             if (!up || !up->fixesValue() || dynamic_cast<const InletOutletPatchField<vector>*>(up)) return false;
         }

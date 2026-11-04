@@ -328,6 +328,13 @@ scalar deviceMaxRatio(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>&
 scalar deviceSumMag(const DeviceBuffer<scalar>& x)
 {
     const int n = static_cast<int>(x.size());
+    // n == 0 (an empty rank): no launch and no device read, but the global reduction below is still joined with
+    // the additive identity 0. Never guard a collective on a local element count.
+    if (n == 0)
+    {
+        if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; return pc->allReduce(scalar(0), ReduceOp::Sum); }
+        return 0;
+    }
     ensureRedScratch();
     if (deviceOfOrderReductions())
         seqSumMagKernel<<<1, 1>>>(x.data(), g_redDev, n);

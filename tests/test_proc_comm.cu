@@ -573,7 +573,15 @@ int mpiSuite(int argc, char** argv, const std::string& backendArg)
             if (!only.empty() && std::string(name).find(only) == std::string::npos) return;
             Watchdog wd(name, 180);
             int bad = 0;
+            // An abort test RAISES a ProcCommAbort on purpose: it is not a failure, but it MUST still be agreed
+            // on collectively. Treating it as a rank-local failure made one rank call MPI_Abort while its peers
+            // went on to the next test's allgather and hung there (a harness bug, not a backend one).
+            const bool expectAbort = std::string(name).find("collectiveAbort") != std::string::npos;
             try { c->guarded(f); }
+            catch (const ProcCommAbort& e)
+            {
+                if (!expectAbort) { bad = 1; std::printf("FAIL %s rank %d: %s\n", name, c->rank(), e.what()); }
+            }
             catch (const std::exception& e) { bad = 1; std::printf("FAIL %s rank %d: %s\n", name, c->rank(), e.what()); }
             // collective verdict (an exception leaves a rank out of step: abort the whole run on a failure)
             int total = Pstream::allReduce(static_cast<label>(bad), ReduceOp::Sum);

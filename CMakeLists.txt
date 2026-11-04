@@ -395,6 +395,43 @@ foreach(_np 1 2 3 4 8)
     set_tests_properties(proc_comm_mpi_np${_np} PROPERTIES TIMEOUT 300)
 endforeach()
 
+# Global Courant numbers / time steps and zero-cell-rank collective participation (findings 4 and 6).
+add_executable(test_courant_global tests/test_courant_global.cu)
+target_include_directories(test_courant_global PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_courant_global PRIVATE brae_core)
+foreach(_np 1 2 4 8)
+    add_test(NAME courant_global_np${_np}
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_courant_global>)
+    set_tests_properties(courant_global_np${_np} PROPERTIES TIMEOUT 240)
+endforeach()
+
+# Negative controls of the deadlock windows (post-status rank failure, capacity abort, NCCL queued-work failure,
+# forced revoke/quiesce failure, one-sided processor patch). Each mode has its own watchdog and asserts that every
+# rank returns the same ProcCommAbort; the test FAILS (watchdog exit 3) on the un-fixed backends.
+add_executable(test_proc_comm_failure tests/test_proc_comm_failure.cu)
+target_include_directories(test_proc_comm_failure PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_comm_failure PRIVATE brae_core)
+foreach(_np 2 4 8)
+    foreach(_mode post-status capacity asym)
+        add_test(NAME proc_comm_failure_${_mode}_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_proc_comm_failure> mpi ${_mode})
+        set_tests_properties(proc_comm_failure_${_mode}_np${_np} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
+endforeach()
+if(BRAE_WITH_NCCL)
+    foreach(_np 2 4)
+        foreach(_mode post-status capacity nccl-queued revoke asym)
+            add_test(NAME proc_comm_failure_nccl_${_mode}_np${_np}
+                     COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                             $<TARGET_FILE:test_proc_comm_failure> nccl ${_mode})
+            set_tests_properties(proc_comm_failure_nccl_${_mode}_np${_np} PROPERTIES
+                                 TIMEOUT 300 SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_nccl
+                                 ENVIRONMENT "BRAE_NCCL_ALLOW_SHARED_GPU=1")
+        endforeach()
+    endforeach()
+endif()
+
 # Multi-GPU step E-I: distributed linear solvers (processor-interface hook, global reductions, AMG-PCG, symGaussSeidel)
 # against the monolithic solve; one process per rank (MPI-host backend), several ranks on one GPU is fine
 add_executable(test_dist_solvers tests/test_dist_solvers.cu)

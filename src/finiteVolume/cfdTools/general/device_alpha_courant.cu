@@ -80,7 +80,6 @@ void sumPhiKernel(
 
 }   // namespace
 
-
 DeviceCourantNumbers deviceAlphaCourantNo(
     const DeviceMesh& dm,
     const DeviceBuffer<scalar>& phiInt,
@@ -92,7 +91,9 @@ DeviceCourantNumbers deviceAlphaCourantNo(
 {
     DeviceCourantNumbers c;
     const int nC = dm.nCells;
-    if (nC == 0) return c;
+    // A rank with NO cells still runs the three global reductions below (zero contributions, combined result):
+    // returning early would desynchronise the collective sequence of the whole job (review finding 6). The
+    // zero-sized launches are skipped inside the helpers, never the collectives.
     static const char* const leftOutEnv = std::getenv("BRAE_CONTROL_COURANT_PAIR_LEFT_OUT");
     static const bool leftOutBandOnly = leftOutEnv && std::string(leftOutEnv) == "interface";
     const bool pairLeftOut = leftOutEnv && (!leftOutBandOnly || alpha1);
@@ -127,6 +128,7 @@ DeviceCourantNumbers deviceAlphaCourantNo(
     }
 
     DeviceBuffer<scalar> sumPhi(static_cast<std::size_t>(nC));
+    if (nC > 0)
     sumPhiKernel<<<nBlocks(nC), TPB>>>(
         nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(),

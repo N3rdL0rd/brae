@@ -132,7 +132,13 @@ void Pstream::init(int& argc, char**& argv)
     int already = 0;
     MPI_Initialized(&already);
     if (!already)
-        MPI_Init(&argc, &argv);
+    {
+        // MULTIPLE: the ProcComm abort side channel is a background thread that runs a nonblocking allgather on
+        // its own duplicated communicator while the main thread is blocked in a device synchronisation. OpenMPI
+        // provides it; with a lesser level ProcComm falls back to driving the channel from the main thread.
+        int provided = MPI_THREAD_SINGLE;
+        MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
+    }
     MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &g_nprocs);
 
