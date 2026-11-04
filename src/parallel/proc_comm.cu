@@ -1121,7 +1121,13 @@ public:
         // bring-up hook for a node with fewer GPUs than ranks: NCCL >= 2.3x runs several ranks on one GPU when
         // NCCL_MULTI_RANK_GPU_ENABLE=1 (slow, only for testing the data path; never for measurements)
         const char* share = std::getenv("BRAE_NCCL_ALLOW_SHARED_GPU");
-        if (share && share[0] == '1') setenv("NCCL_MULTI_RANK_GPU_ENABLE", "1", 0);
+        if (share && share[0] == '1')
+        {
+            setenv("NCCL_MULTI_RANK_GPU_ENABLE", "1", 0);
+            // all ranks' communicator buffers live on the one GPU: a few channels keep 8 ranks inside its memory
+            setenv("NCCL_MAX_NCHANNELS", "4", 0);
+            setenv("NCCL_MAX_P2P_NCHANNELS", "2", 0);
+        }
         for (int a = 0; a < size_ && !(share && share[0] == '1'); ++a)
             for (int b = a + 1; b < size_; ++b)
                 if (all[a].host == all[b].host && all[a].dev == all[b].dev)
