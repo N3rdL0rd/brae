@@ -15,6 +15,24 @@
 #include <cstring>
 #include <string>
 #include <vector>
+// Kept out of device_amg_detail.cuh: that header also defines nBlocks/TPB in brae's namespace.
+// This is the same driver/toolkit gate the other solver dispatchers use.
+inline bool pressureCondGraphsAvailable()
+{
+    static const bool ok = []()
+    {
+#if CUDART_VERSION >= 12040
+        if (const char* e = std::getenv("BRAE_COND_GRAPH")) return e[0] != '0';
+        int drv = 0;
+        if (cudaDriverGetVersion(&drv) != cudaSuccess || drv < 12040) return false;
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return ok;
+}
+
 
 namespace brae {
 namespace {
@@ -63,7 +81,7 @@ constexpr label GAMG_HOST_MAX_CELLS = 2000000;
 bool gamgSolveOnHost(const DeviceLduView& A)
 {
     static const char* const forced = std::getenv("BRAE_DEVICE_GAMG");
-    const bool pair = A.nCyc > 0 || A.nAmi > 0;
+    const bool pair = A.nCyc > 0 || A.nAmi > 0 || A.proc.active();
     bool host = !pair && A.nCells < GAMG_HOST_MAX_CELLS;
     if (forced && std::string(forced) == "device")
     {
@@ -596,9 +614,8 @@ scalar deviceInterPressureStep(
                                 "BRAE_PRESSURE_DIC_INNER_RELTOL=case keeps the entry's own\n",
                                 static_cast<double>(relTol), static_cast<double>(knobs.dicInnerRelTol));
                 }
-                relTol = knobs.dicInnerRelTol;
             }
-            const bool graph = knobs.graph && !(in.cyc && in.cyc->n > 0);
+            const bool graph = knobs.graph && !(in.cyc && in.cyc->n > 0) && !A.proc.active() && pressureCondGraphsAvailable();
             // EXPERIMENT (AmgPcgKnobs::finalTolFactor): the Final solve's tolerance scaled
             scalar tolUsed = tol;
             if (finalPass && knobs.finalTolFactor != scalar(1))
