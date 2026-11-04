@@ -6,6 +6,37 @@
 
 namespace brae {
 
+// GLOBAL REDUCTIONS OF A DECOMPOSED MESH. With a ProcComm of more than one rank installed (ProcComm::current(), the
+// multi-GPU run), every reduction below -- deviceDot, deviceSumMag, deviceMaxRatio, the *Into variants, minmax --
+// returns the GLOBAL result: the rank-local value combined over all ranks in rank order (ProcComm::allReduce, the same
+// bits on every rank); the device-resident variants stay device-resident (an in-place device allReduce enqueued on
+// the stream). With no communicator, or a single rank, none of that code runs: no extra launch, no allocation, the
+// same numbers as ever.
+//
+// A LocalReductions scope turns that off for the work that must stay rank-local: the multigrid V-cycle's internal dots
+// (the scaled-correction line search, the Chebyshev spectrum estimate), a norm of a rank's own data. Nest freely;
+// per thread.
+inline int& localReductionDepth()
+{
+    thread_local int depth = 0;
+    return depth;
+}
+class LocalReductions
+{
+public:
+    LocalReductions() { ++localReductionDepth(); }
+    ~LocalReductions() { --localReductionDepth(); }
+    LocalReductions(const LocalReductions&) = delete;
+    LocalReductions& operator=(const LocalReductions&) = delete;
+};
+// Counters of the decomposed hooks (np > 1 only; a single-GPU run never touches them): collectives the reduction
+// hook enqueued and halo exchanges the matrix product issued. For the tests that state "N collectives per PCG iteration".
+struct ProcHookCounts { long long reductions = 0, exchanges = 0; };
+ProcHookCounts& procHookCountsRef();
+inline ProcHookCounts procHookCounts() { return procHookCountsRef(); }
+// True when the reductions are global right now (a communicator of >1 rank and no LocalReductions scope).
+bool deviceReductionsGlobal();
+
 void   deviceAxpy(scalar a, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y);  // y += a*x
 void   deviceScale(DeviceBuffer<scalar>& x, scalar a);                                // x *= a
 // BRAE_DEVICE_OF_REDUCE=1: every dot and sum(|x|) below in OpenFOAM's sequential cell order (reductions.cu)

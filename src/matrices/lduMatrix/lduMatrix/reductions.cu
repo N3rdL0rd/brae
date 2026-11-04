@@ -21,6 +21,7 @@
 // What this fixes is the reduction that the convergence test reads.
 #include <map>
 #include "device_blas.cuh"
+#include "proc_hooks.cuh"    // ProcComm::current(): the global-reduction hook
 #include <cuda_runtime.h>
 #include <atomic>
 #include <chrono>
@@ -81,6 +82,14 @@ void seqSumMagKernel(const scalar* __restrict__ x, scalar* out, int n)
     *out = s;
 }
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
+
+// The communicator the reductions are global over, or null (no communicator, one rank, or a LocalReductions scope).
+inline ProcComm* globalComm()
+{
+    if (localReductionDepth() != 0) return nullptr;
+    ProcComm* pc = ProcComm::current();
+    return (pc && pc->size() > 1) ? pc : nullptr;
+}
 
 // Persistent reduction scratch (one-time alloc, process-lifetime): a device accumulator + a PINNED host mirror.
 // Removes the per-reduction cudaMalloc/cudaFree + H2D-zero-init that dominated the device SIMPLE-loop wall; the
@@ -181,9 +190,9 @@ void minMaxSumKernel(const scalar* __restrict__ x, scalar* result, int n, int nb
 
 // ...and the sum becomes the mean, on the device, so the host reads three finished numbers.
 __global__
-void scaleMeanKernel(scalar* out, int n)
+void scaleMeanKernel(scalar* out, scalar n)
 {
-    if (threadIdx.x == 0 && blockIdx.x == 0) out[2] /= static_cast<scalar>(n);
+    if (threadIdx.x == 0 && blockIdx.x == 0) out[2] /= n;
 }
 
 
@@ -250,6 +259,18 @@ inline void reduceInto(K launchStage1, int n, scalar* dResult)
 } // namespace
 
 
+bool deviceReductionsGlobal()
+{
+    return globalComm() != nullptr;
+}
+
+ProcHookCounts& procHookCountsRef()
+{
+    static ProcHookCounts c;
+    return c;
+}
+
+
 scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
 {
     const int n = static_cast<int>(x.size());
@@ -260,6 +281,7 @@ scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
         reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, g_redDev);
     cudaCheck(cudaGetLastError(), "dot");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "dot result");
+    if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; return pc->allReduce(*g_redPinned, ReduceOp::Sum); }   // rank-order global sum
     return *g_redPinned;
 }
 
@@ -287,12 +309,18 @@ void maxRatioKernel(const scalar* __restrict__ x, const scalar* __restrict__ y, 
 scalar deviceMaxRatio(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
 {
     const int n = static_cast<int>(x.size());
-    if (n == 0 || (int)y.size() < n) return 0;
+    if (n == 0 || (int)y.size() < n)
+    {
+        // a rank with no cells still takes part in the global maximum (the identity of a max of ratios >= 0 is 0)
+        if (ProcComm* pc = globalComm()) return pc->allReduce(scalar(0), ReduceOp::Max);
+        return 0;
+    }
     ensureRedScratch();
     cudaCheck(cudaMemsetAsync(g_redDev, 0, sizeof(scalar), cudaStreamPerThread), "maxratio zero");
     maxRatioKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), g_redDev, n);
     cudaCheck(cudaGetLastError(), "maxratio");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "maxratio result");
+    if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; return pc->allReduce(*g_redPinned, ReduceOp::Max); }
     return *g_redPinned;
 }
 
@@ -307,6 +335,7 @@ scalar deviceSumMag(const DeviceBuffer<scalar>& x)
         reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, g_redDev);
     cudaCheck(cudaGetLastError(), "summag");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "summag result");
+    if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; return pc->allReduce(*g_redPinned, ReduceOp::Sum); }
     return *g_redPinned;
 }
 
@@ -320,6 +349,7 @@ void deviceDotInto(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y,
     else
         reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, dResult);
     cudaCheck(cudaGetLastError(), "dotInto");
+    if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; pc->allReduce(dResult, 1, ReduceOp::Sum, cudaStreamPerThread, procChannel()); }
 }
 
 
@@ -374,6 +404,33 @@ const DeviceBuffer<scalar>& deviceOnes(int n)
 void deviceMinMaxMeanInto(const DeviceBuffer<scalar>& x, scalar* dOut3)
 {
     const int n = static_cast<int>(x.size());
+    ProcComm* pc = globalComm();
+    if (pc)
+    {
+        // GLOBAL min, max and mean: the three local numbers (the sum, not yet the mean) reduced in rank order, the
+        // mean divided by the global count. A rank without cells contributes the identities.
+        if (n <= 0)
+        {
+            const scalar ident[3] = {1e300, -1e300, 0.0};
+            cudaCheck(cudaMemcpyAsync(dOut3, ident, sizeof(ident), cudaMemcpyHostToDevice, cudaStreamPerThread), "minmax ident");
+            cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "minmax ident sync");
+        }
+        else
+        {
+            const int nb = nBlocks(n);
+            scalar* part = ensurePartials(3 * nb);
+            minMaxSumKernel<<<nb, TPB>>>(x.data(), part, n, nb);
+            finalMinMaxSumKernel<<<3, TPB>>>(part, dOut3, nb);
+            cudaCheck(cudaGetLastError(), "minMaxMeanInto");
+        }
+        ++procHookCountsRef().reductions;
+        pc->allReduce(dOut3,     1, ReduceOp::Min, cudaStreamPerThread, procChannel());
+        pc->allReduce(dOut3 + 1, 1, ReduceOp::Max, cudaStreamPerThread, procChannel());
+        pc->allReduce(dOut3 + 2, 1, ReduceOp::Sum, cudaStreamPerThread, procChannel());
+        const scalar nGlobal = pc->allReduce(static_cast<scalar>(n), ReduceOp::Sum);      // host collective
+        if (nGlobal > 0) scaleMeanKernel<<<1, 1>>>(dOut3, nGlobal);
+        return;
+    }
     if (n <= 0) { cudaCheck(cudaMemsetAsync(dOut3, 0, 3*sizeof(scalar), cudaStreamPerThread), "minmax zero"); return; }
     const int nb = nBlocks(n);
     scalar* part = ensurePartials(3 * nb);
@@ -392,6 +449,7 @@ void deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult)
     else
         reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, dResult);
     cudaCheck(cudaGetLastError(), "summagInto");
+    if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; pc->allReduce(dResult, 1, ReduceOp::Sum, cudaStreamPerThread, procChannel()); }
 }
 
 
