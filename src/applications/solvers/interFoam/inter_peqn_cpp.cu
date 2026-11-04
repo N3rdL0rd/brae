@@ -441,7 +441,7 @@ bool adjustPhi(
     scalar adjustableMassOut = 0;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        if (patches[pi].type == "empty" || isCoupledInterfaceType(patches[pi].type)) continue;
+        if (patches[pi].type == "empty" || isCyclicFamilyType(patches[pi].type)) continue;
         const fvPatchField<vector>& Up = *U.boundary[pi];
         const std::vector<scalar>& phip = phi.boundary[pi];
         // `Up.fixesValue() && !isA<inletOutletFvPatchVectorField>(Up)`: a fixed outflow is not
@@ -505,7 +505,7 @@ bool adjustPhi(
     }
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        if (patches[pi].type == "empty" || isCoupledInterfaceType(patches[pi].type)) continue;
+        if (patches[pi].type == "empty" || isCyclicFamilyType(patches[pi].type)) continue;
         const fvPatchField<vector>& Up = *U.boundary[pi];
         if (Up.fixesValue() && !dynamic_cast<const InletOutletPatchField<vector>*>(&Up)) continue;
         for (scalar& v : phi.boundary[pi])

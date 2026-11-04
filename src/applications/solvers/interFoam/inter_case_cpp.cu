@@ -1,6 +1,7 @@
 // interFoam's createFields -- see inter_case_cpp.cuh for the provenance and for the four things the
 // order of this file encodes.
 #include "inter_case_cpp.cuh"
+#include "inter_parallel.cuh"   // mgpuGeometryOnly
 #include "time_instances.cuh"
 #include "inter_amr_cpp.cuh"
 #include "frozen_bc_guard.cuh"
@@ -2029,7 +2030,7 @@ InterFields buildInterFields(const CaseRoots&            roots,
             {
                 for (const FvPatch& q : patches)
                 {
-                    if (!isCoupledInterfaceType(q.type)) continue;
+                    if (!isCyclicFamilyType(q.type)) continue;
                     throw std::runtime_error(
                         "brae interFoam: ddtSchemes names CrankNicolson, the start directory holds the "
                         "scheme's state, and patch `" + q.name + "` is `" + q.type + "` -- a coupled pair. "
@@ -2142,7 +2143,7 @@ InterFields buildInterFields(const CaseRoots&            roots,
         const FvPatch* firstCoupled = nullptr;
         for (const FvPatch& q : patches)
         {
-            if (isCoupledInterfaceType(q.type) && !q.coupled)
+            if (isCyclicFamilyType(q.type) && !q.coupled)
             {
                 throw std::runtime_error(
                     "brae interFoam: patch `" + q.name + "` is " + q.type + " and its coupling is not "
@@ -2151,6 +2152,20 @@ InterFields buildInterFields(const CaseRoots&            roots,
                     "pair once cpu::cyclicACMI::setup() has, and a cyclicAMI pair once "
                     "cpu::cyclicAMIFvPatch::setup() has; processor patches are not ported here. Refused "
                     "rather than run as two walls.");
+            }
+            // A PROCESSOR PATCH IS NOT A CYCLIC: its other half lives on another rank and the operators across it
+            // are not ported. Refused by name unless the multi-GPU gate is open (inter_parallel.cuh), and kept
+            // out of every cyclic-specific refusal below, which name a cyclic and mean its same-mesh pair.
+            if (isProcessorType(q.type))
+            {
+                if (q.size > 0 && !mgpuGeometryOnly())
+                {
+                    throw std::runtime_error(
+                        "brae interFoam: patch `" + q.name + "` is a processor patch (rank "
+                        + std::to_string((int)q.myProcNo) + " <-> rank " + std::to_string((int)q.neighbProcNo)
+                        + "): processor patches need the multi-GPU coupling, not yet implemented.");
+                }
+                continue;
             }
             if (q.coupled && !firstCoupled)
             {
@@ -2161,7 +2176,7 @@ InterFields buildInterFields(const CaseRoots&            roots,
         // the file's `jump` on the owner is handed across before anything reads it
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            if (!patches[pi].coupled || !patches[pi].owner) continue;
+            if (!patches[pi].coupled || !patches[pi].owner || isProcessorType(patches[pi].type)) continue;
             if (const std::vector<scalar>* j = f.p_rgh.boundary[pi]->coupledJump())
             {
                 f.p_rgh.boundary[static_cast<std::size_t>(patches[pi].nbrPatch)]->setOwnerJump(*j);
@@ -2187,7 +2202,7 @@ InterFields buildInterFields(const CaseRoots&            roots,
             for (const FvPatch& q : patches)
             {
                 allRecoupled = allRecoupled
-                            && (!q.coupled || q.type == "cyclicAMI" || q.type == "cyclicACMI" || hasACMI);
+                            && (!q.coupled || isProcessorType(q.type) || q.type == "cyclicAMI" || q.type == "cyclicACMI" || hasACMI);
             }
             if (f.dynamicMesh && !allRecoupled)
                 throw std::runtime_error(who + "a moving mesh. The pair's weights and deltas are taken once.");
@@ -2224,7 +2239,7 @@ InterFields buildInterFields(const CaseRoots&            roots,
             // (tests/interfoam_ami_vs_openfoam.sh); across a cyclic or cyclicACMI no gate holds them
             for (const FvPatch& q : patches)
             {
-                if (!q.coupled || q.type == "cyclicAMI") continue;
+                if (!q.coupled || isProcessorType(q.type) || q.type == "cyclicAMI") continue;
                 if (f.momentumPredictorOn)
                     throw std::runtime_error(
                         "brae interFoam: the case runs a momentum predictor across the coupled patch `" + q.name
@@ -2250,7 +2265,7 @@ InterFields buildInterFields(const CaseRoots&            roots,
                 };
                 for (const FvPatch& q : patches)
                 {
-                    if (!q.coupled) continue;
+                    if (!q.coupled || isProcessorType(q.type)) continue;
                     const bool ami = q.type == "cyclicAMI";
                     if (f.gradULeastSq)
                         throw std::runtime_error(

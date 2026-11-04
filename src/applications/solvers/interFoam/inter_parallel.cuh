@@ -9,6 +9,7 @@
 #include "foam_dict.cuh"
 #include "primitive_mesh.cuh"
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,22 @@ inline bool fileExists(const std::string& p)
     return std::filesystem::exists(p) || std::filesystem::exists(p + ".gz");
 }
 }   // namespace parallelDetail
+
+// THE GATE OF THE MULTI-GPU COUPLING. Every by-name refusal of a processor patch (refuseProcessorCoupling below,
+// the case translation's coupled-patch block, setRDeltaT, the kOmegaSST closure) stays in force unless the
+// environment says BRAE_MGPU_GEOMETRY_ONLY=1: then they step aside for a `processor` patch AND the driver stops
+// right after the coupling geometry is built (braeInterFoam.cu: runProcessorGeometryOnly, which couples the
+// patches over ProcComm, builds the device interface and writes the geometry dump) -- the operators across a
+// processor face are not ported, so nothing past that point may run. Close the gate for good by deleting it
+// when the operator and solver work lands; no case file can open it.
+inline bool mgpuGeometryOnly()
+{
+    static const bool on = [] {
+        const char* e = std::getenv("BRAE_MGPU_GEOMETRY_ONLY");
+        return e != nullptr && e[0] == '1' && e[1] == '\0';
+    }();
+    return on;
+}
 
 // One line per patch: kind, size and, for a processor patch, the ranks it joins. Printed for every rank so a
 // decomposition can be read off the log of any of them.
@@ -141,6 +158,7 @@ inline void refuseProcessorCoupling(const CaseRoots& roots, const std::vector<Pa
         if (p.type != "processor" || p.size == 0) continue;
         if (roots.parallel)
         {
+            if (mgpuGeometryOnly()) continue;   // the gate: the driver builds the coupling geometry and stops
             throw std::runtime_error(
                 "-parallel: rank " + std::to_string(roots.rank) + " of " + std::to_string(roots.nProcs)
                 + " has the processor patch '" + p.name + "' (" + std::to_string((long)p.size) + " faces, rank "

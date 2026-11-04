@@ -89,7 +89,7 @@ GeometricField<scalar> makePcorr(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& p = patches[pi];
-        if (isCoupledInterfaceType(p.type) && !p.coupled)
+        if (isCyclicFamilyType(p.type) && !p.coupled)
         {
             throw std::runtime_error(
                 std::string(WHO) + "patch `" + p.name + "` is " + p.type + " and its coupling is not "

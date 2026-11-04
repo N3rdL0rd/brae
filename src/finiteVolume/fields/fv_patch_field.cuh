@@ -10,7 +10,7 @@
 #include "wedge_patch.cuh"   // the axisymmetric constraint patch's rotation tensors
 #include "foam_field_reader.cuh"
 #include "cf_pstream.cuh"
-#include "foam_dict.cuh"   // isCoupledInterfaceType
+#include "foam_dict.cuh"   // isCyclicFamilyType
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -4452,7 +4452,7 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // a cyclicAMI pair the interFoam host loop coupled (cyclic_ami_cpp): coupledFvPatchField's value and
     // snGrad, with patchNeighbourField the AMI interpolate the patch's stencil carries
     if (d.type == "cyclicAMI" && p.coupled)      return std::make_unique<CoupledCyclicPatchField<T>>(p);
-    if (isCoupledInterfaceType(d.type))          return std::make_unique<ZeroGradientPatchField<T>>(p);
+    if (isCyclicFamilyType(d.type))          return std::make_unique<ZeroGradientPatchField<T>>(p);
     if (d.type == "empty")           return std::make_unique<EmptyPatchField<T>>(p);
     if (d.type == "symmetryPlane" || d.type == "symmetry" || d.type == "slip")
         // slip = OF basicSymmetry, with assignable() false where symmetry's is true -- see the class

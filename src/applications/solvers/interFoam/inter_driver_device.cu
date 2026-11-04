@@ -62,7 +62,7 @@ std::vector<scalar> flattenPatches(const std::vector<std::vector<scalar>>& b,
     std::vector<scalar> v;
     for (std::size_t pi = 0; pi < b.size(); ++pi)
     {
-        if (pi < fvp.size() && isCoupledInterfaceType(fvp[pi].type)) continue;
+        if (pi < fvp.size() && isCyclicFamilyType(fvp[pi].type)) continue;
         v.insert(v.end(), b[pi].begin(), b[pi].end());
     }
     return v;
@@ -85,7 +85,7 @@ void uploadSurfaceVector(
     }
     for (std::size_t pi = 0; pi < fvp.size() && pi < f.boundary.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        if (isCyclicFamilyType(fvp[pi].type)) continue;
         for (const vector& v : f.boundary[pi])
         {
             b[0].push_back(v.x); b[1].push_back(v.y); b[2].push_back(v.z);
@@ -103,7 +103,7 @@ std::vector<scalar> patchValues(const GeometricField<scalar>& f, const std::vect
     std::vector<scalar> v;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        if (isCyclicFamilyType(fvp[pi].type)) continue;
         const std::vector<scalar>& b = f.boundary[pi]->value();
         v.insert(v.end(), b.begin(), b.end());
     }
@@ -546,7 +546,7 @@ std::vector<scalar> snGradBoundary(
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         const FvPatch& fp = fvp[pi];
-        if (skipCoupled && isCoupledInterfaceType(fp.type)) continue;
+        if (skipCoupled && isCyclicFamilyType(fp.type)) continue;
         if (skipEmpty && fp.type == "empty") continue;
         const std::vector<scalar> gIC = vf.boundary[pi]->gradientInternalCoeffs();
         const std::vector<scalar> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
@@ -564,7 +564,7 @@ std::vector<scalar> fullFace(const SurfaceScalarField& f, const std::vector<FvPa
     std::vector<scalar> v(f.internal);
     for (std::size_t pi = 0; pi < fvp.size() && pi < f.boundary.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;   // the device's Sf layout, see above
+        if (isCyclicFamilyType(fvp[pi].type)) continue;   // the device's Sf layout, see above
         v.insert(v.end(), f.boundary[pi].begin(), f.boundary[pi].end());
     }
     return v;
@@ -1437,7 +1437,7 @@ RunReport runInterFoamDevice(
             // EVERY DEVICE BOUNDARY ARRAY IS [non-coupled patches, in patch order] (device_mesh.cuh:41-44).
             // A loop over all of fvp here makes the mask longer than the device's boundary-face count and
             // shifts every patch after the pair onto the wrong faces.
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             const int fx = f.alpha1.boundary[pi]->fixesValue() ? 1 : 0;
             const int fl = (fvp[pi].type == "empty") ? 1 : ((fvp[pi].type == "wedge") ? 2 : 0);
             for (label i = 0; i < fvp[pi].size; ++i)
@@ -1468,7 +1468,7 @@ RunReport runInterFoamDevice(
         }
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             const std::vector<scalar>& src = (f.U.boundary[pi]->fluxName() == "rhoPhi")
                                            ? f.rhoPhi.boundary[pi] : f.phi.boundary[pi];
             v.insert(v.end(), src.begin(), src.end());
@@ -1505,7 +1505,7 @@ RunReport runInterFoamDevice(
         fx.reserve(aFixes.size());
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             const std::vector<scalar>* vf = f.alpha1.boundary[pi]->isVariableHeightFlowRate()
                                           ? f.alpha1.boundary[pi]->valueFractionPtr() : nullptr;
             const int patchFx = f.alpha1.boundary[pi]->fixesValue() ? 1 : 0;
@@ -1619,7 +1619,7 @@ RunReport runInterFoamDevice(
             };
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
                 if (fvp[pi].type == "empty")
                 {
@@ -1651,7 +1651,7 @@ RunReport runInterFoamDevice(
         std::size_t off = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
             out[pi].assign(flat.begin() + off, flat.begin() + off + n);
             off += n;
@@ -1676,7 +1676,7 @@ RunReport runInterFoamDevice(
         }
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (fvp[pi].type == "empty" || isCoupledInterfaceType(fvp[pi].type)) return false;
+            if (fvp[pi].type == "empty" || isCyclicFamilyType(fvp[pi].type)) return false;
             const auto* u = f.U.boundary[pi].get();
             const auto* p = f.p_rgh.boundary[pi].get();
             const auto* a = f.alpha1.boundary[pi].get();
@@ -1753,7 +1753,7 @@ RunReport runInterFoamDevice(
         std::size_t off = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
             if (off + n > flat.size()) return;
             // the same patches pushFluxToPatches tells: a still-updated() patch keeps the flux its assembly
@@ -1865,7 +1865,7 @@ RunReport runInterFoamDevice(
             const FvPatch& q = fvp[pi];
             const fvPatchField<scalar>& ap = *f.alpha1.boundary[pi];
             contactPatchStart[pi] = kind.size();
-            if (isCoupledInterfaceType(q.type) || q.coupled)
+            if (isCyclicFamilyType(q.type) || q.coupled)
             {
                 contactWhyHost = "alpha's patch `" + q.name + "` is coupled";
                 break;
@@ -2374,7 +2374,7 @@ RunReport runInterFoamDevice(
         std::vector<scalar> v;
         for (std::size_t pi = 0; pi < fvp.size() && pi < b.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type) || fvp[pi].type == "empty") continue;
+            if (isCyclicFamilyType(fvp[pi].type) || fvp[pi].type == "empty") continue;
             v.insert(v.end(), b[pi].begin(), b[pi].end());
         }
         return v;
@@ -2384,7 +2384,7 @@ RunReport runInterFoamDevice(
         std::vector<scalar> v;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type) || fvp[pi].type == "empty") continue;
+            if (isCyclicFamilyType(fvp[pi].type) || fvp[pi].type == "empty") continue;
             const std::vector<scalar>& b = vf.boundary[pi]->value();
             v.insert(v.end(), b.begin(), b.end());
         }
@@ -2907,7 +2907,7 @@ RunReport runInterFoamDevice(
         {
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 if (skipEmpty && fvp[pi].type == "empty") continue;
                 if (pi >= flux.size() || flux[pi].size() != static_cast<std::size_t>(fvp[pi].size))
                 {
@@ -2989,7 +2989,7 @@ RunReport runInterFoamDevice(
             static long compared = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const std::vector<scalar>& h = f.phi.boundary[pi];
                 const std::vector<scalar>& d = fluxBnd[pi];
                 if (h.size() != d.size()
@@ -3538,7 +3538,7 @@ RunReport runInterFoamDevice(
             std::size_t at = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type) || fvp[pi].type == "empty") continue;
+                if (isCyclicFamilyType(fvp[pi].type) || fvp[pi].type == "empty") continue;
                 for (const vector& u : f.U.boundary[pi]->value())
                 {
                     pack[at] = u.x;
@@ -3581,7 +3581,7 @@ RunReport runInterFoamDevice(
                 std::vector<scalar> all[3];
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    if (isCyclicFamilyType(fvp[pi].type)) continue;
                     for (const vector& u : f.U.boundary[pi]->value())
                     {
                         all[0].push_back(u.x);
@@ -3603,14 +3603,14 @@ RunReport runInterFoamDevice(
         std::size_t nOut = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (!isCoupledInterfaceType(fvp[pi].type)) nOut += static_cast<std::size_t>(fvp[pi].size);
+            if (!isCyclicFamilyType(fvp[pi].type)) nOut += static_cast<std::size_t>(fvp[pi].size);
         }
         bx.reserve(nOut);
         by.reserve(nOut);
         bz.reserve(nOut);
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             for (const vector& u : f.U.boundary[pi]->value())
             {
                 bx.push_back(u.x);
@@ -3648,7 +3648,7 @@ RunReport runInterFoamDevice(
         std::size_t nFaces = 0;
         for (const FvPatch& q : fvp)
         {
-            if (q.type == "empty" || isCoupledInterfaceType(q.type)) return false;
+            if (q.type == "empty" || isCyclicFamilyType(q.type)) return false;
             nFaces += static_cast<std::size_t>(q.size);
         }
         return nFaces == static_cast<std::size_t>(dm.nBndFaces) && nFaces > 0;
@@ -3905,7 +3905,7 @@ RunReport runInterFoamDevice(
                 std::size_t k = 0;
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    if (isCyclicFamilyType(fvp[pi].type)) continue;
                     if (skipEmpty && fvp[pi].type == "empty") continue;
                     for (label i = 0; i < fvp[pi].size; ++i, ++k)
                     {
@@ -3975,7 +3975,7 @@ RunReport runInterFoamDevice(
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
                     const FvPatch& q = fvp[pi];
-                    if (!isCoupledInterfaceType(q.type)) continue;
+                    if (!isCyclicFamilyType(q.type)) continue;
                     stepRhoBnd[pi].resize(static_cast<std::size_t>(q.size));
                     for (label i = 0; i < q.size; ++i)
                     {
@@ -4113,7 +4113,7 @@ RunReport runInterFoamDevice(
                 {
                     const FvPatch& q = fvp[pi];
                     const std::size_t n = static_cast<std::size_t>(q.size);
-                    if (isCoupledInterfaceType(q.type))
+                    if (isCyclicFamilyType(q.type))
                     {
                         rb[pi].resize(n);
                         for (label i = 0; i < q.size; ++i)
@@ -4347,7 +4347,7 @@ RunReport runInterFoamDevice(
         std::size_t at = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
             if (n > 0 && (pEmptyFromHost || fvp[pi].type != "empty"))
             {
@@ -4402,7 +4402,7 @@ RunReport runInterFoamDevice(
         std::size_t nFaces = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (fvp[pi].type == "empty" || isCoupledInterfaceType(fvp[pi].type)) return false;
+            if (fvp[pi].type == "empty" || isCyclicFamilyType(fvp[pi].type)) return false;
             const auto* pp = f.p_rgh.boundary[pi].get();
             const auto* up = f.U.boundary[pi].get();
             if (!pp || !up) return false;
@@ -4508,7 +4508,7 @@ RunReport runInterFoamDevice(
         // a patch's own run of the device's boundary arrays, for the patches the host handles
         const auto hostsPatch = [&](std::size_t pi)
         {
-            return !isCoupledInterfaceType(fvp[pi].type) && fvp[pi].size > 0
+            return !isCyclicFamilyType(fvp[pi].type) && fvp[pi].size > 0
                 && (pEmptyFromHost || fvp[pi].type != "empty");
         };
         std::vector<std::vector<scalar>> hBp(fvp.size()), rAp(fvp.size());
@@ -4518,7 +4518,7 @@ RunReport runInterFoamDevice(
             std::size_t at = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
                 if (pPatchCopies && hostsPatch(pi))
                 {
@@ -4570,7 +4570,7 @@ RunReport runInterFoamDevice(
             const FvPatch& q = fvp[pi];
             // the device's phiHbyA and rAUf arrays have no coupled patch in them, and a cyclic never
             // prescribes a gradient anyway
-            if (isCoupledInterfaceType(q.type)) continue;
+            if (isCyclicFamilyType(q.type)) continue;
             if (f.p_rgh.boundary[pi]->updateableSnGrad())
             {
                 if (!hostsPatch(pi) && q.size > 0)
@@ -4619,7 +4619,7 @@ RunReport runInterFoamDevice(
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
             const FvPatch& q = fvp[pi];
-            if (isCoupledInterfaceType(q.type))
+            if (isCyclicFamilyType(q.type))
             {
                 for (label i = 0; i < q.size; ++i)
                 {
@@ -4717,7 +4717,7 @@ RunReport runInterFoamDevice(
             std::size_t at = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;   // the pair's are the interface's
+                if (isCyclicFamilyType(fvp[pi].type)) continue;   // the pair's are the interface's
                 const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
                 if (hostsPatch(pi))
                 {
@@ -4752,7 +4752,7 @@ RunReport runInterFoamDevice(
             std::size_t at = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const std::vector<scalar> gIC = f.p_rgh.boundary[pi]->gradientInternalCoeffs();
                 const std::vector<scalar> gBC = f.p_rgh.boundary[pi]->gradientBoundaryCoeffs();
                 for (label i = 0; i < fvp[pi].size; ++i)
@@ -4827,7 +4827,7 @@ RunReport runInterFoamDevice(
             std::vector<scalar> flat;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const std::vector<scalar>& v = f.p_rgh.boundary[pi]->value();
                 flat.insert(flat.end(), v.begin(), v.end());
             }
@@ -4876,7 +4876,7 @@ RunReport runInterFoamDevice(
         std::size_t at = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
             if (pPatchCopies && n > 0 && fvp[pi].type != "empty")
             {
@@ -4895,7 +4895,7 @@ RunReport runInterFoamDevice(
             bval.copyTo(have);
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 if (fvp[pi].type == "empty")
                 {
                     for (label i = 0; i < fvp[pi].size; ++i)
@@ -4949,7 +4949,7 @@ RunReport runInterFoamDevice(
         if (adjustPhiSync || adjustPhiHostSum || fvp.empty()) return false;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (fvp[pi].type == "empty" || isCoupledInterfaceType(fvp[pi].type)) return false;
+            if (fvp[pi].type == "empty" || isCyclicFamilyType(fvp[pi].type)) return false;
             const fvPatchField<vector>* up = f.U.boundary[pi].get();
             if (!up || !up->fixesValue() || dynamic_cast<const InletOutletPatchField<vector>*>(up)) return false;
         }
@@ -5034,7 +5034,7 @@ RunReport runInterFoamDevice(
     {
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (fvp[pi].type == "empty" || isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (fvp[pi].type == "empty" || isCyclicFamilyType(fvp[pi].type)) continue;
             hPFaceCells.insert(hPFaceCells.end(), fvp[pi].faceCells.begin(), fvp[pi].faceCells.end());
         }
         hPFaceVals.resize(hPFaceCells.size());
@@ -5319,7 +5319,7 @@ RunReport runInterFoamDevice(
             phiOldPrevI = phiOldFile.internal;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 phiOldPrevB.insert(phiOldPrevB.end(),
                                    phiOldFile.boundary[pi].begin(), phiOldFile.boundary[pi].end());
             }
@@ -5346,7 +5346,7 @@ RunReport runInterFoamDevice(
         for (std::size_t pi = 0; pi < fvp.size() && why.empty(); ++pi)
         {
             // (a pair keeps the pass by itself: the step sees it)
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             const fvPatchField<scalar>& ap = *f.alpha1.boundary[pi];
             if (ap.contactAngleTheta0() >= scalar(0))
             {
@@ -5371,7 +5371,7 @@ RunReport runInterFoamDevice(
         // then takes the values the pass left, not the ones the hook uploaded in front of it
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             if (f.alpha1.boundary[pi]->contactAngleTheta0() >= scalar(0))
             {
                 C.alpha.curvaturePassMovesPatches = true;
@@ -5421,7 +5421,7 @@ RunReport runInterFoamDevice(
         long kept = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type))
+            if (isCyclicFamilyType(fvp[pi].type))
             {
                 continue;
             }
@@ -5547,12 +5547,12 @@ RunReport runInterFoamDevice(
         }
         std::size_t nB = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-            if (!isCoupledInterfaceType(fvp[pi].type)) nB += static_cast<std::size_t>(fvp[pi].size);
+            if (!isCyclicFamilyType(fvp[pi].type)) nB += static_cast<std::size_t>(fvp[pi].size);
         std::vector<scalar> b9(9*nB);
         std::size_t b = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             for (label i = 0; i < fvp[pi].size; ++i, ++b)
             {
                 const scalar* q = &f.gradUCache.bnd[pi][static_cast<std::size_t>(i)].xx;
@@ -5784,7 +5784,7 @@ RunReport runInterFoamDevice(
             dUox.copyFrom(cx); dUoy.copyFrom(cy); dUoz.copyFrom(cz);
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 for (const vector& v : uOOBnd[pi])
                 {
                     bx.push_back(v.x); by.push_back(v.y); bz.push_back(v.z);
@@ -6428,7 +6428,7 @@ RunReport runInterFoamDevice(
                 std::size_t at = 0;
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    if (isCyclicFamilyType(fvp[pi].type)) continue;
                     for (label i = 0; i < fvp[pi].size; ++i)
                     {
                         all[static_cast<std::size_t>(fvp[pi].start - nIf + i)] = flat[at++];
@@ -6619,7 +6619,7 @@ RunReport runInterFoamDevice(
             {
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    if (isCyclicFamilyType(fvp[pi].type)) continue;
                     for (const vector& v : f.U.boundary[pi]->value())
                     {
                         all[0].push_back(v.x);
@@ -6635,7 +6635,7 @@ RunReport runInterFoamDevice(
                 std::size_t at = 0;
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    if (isCoupledInterfaceType(fvp[pi].type) || fvp[pi].type == "empty") continue;
+                    if (isCyclicFamilyType(fvp[pi].type) || fvp[pi].type == "empty") continue;
                     for (const vector& v : f.U.boundary[pi]->value())
                     {
                         pack[at] = v.x;
@@ -7369,7 +7369,7 @@ RunReport runInterFoamDevice(
                     unflatten(dABnd, ab);
                     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                     {
-                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        if (isCyclicFamilyType(fvp[pi].type)) continue;
                         f.alpha1.boundary[pi]->setValue(ab[pi]);
                     }
                 }
@@ -7403,7 +7403,7 @@ RunReport runInterFoamDevice(
                     std::size_t off = 0;
                     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                     {
-                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        if (isCyclicFamilyType(fvp[pi].type)) continue;
                         const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
                         if (off + n > bx.size()) break;
                         uOldBndH[pi].resize(n);
@@ -7479,7 +7479,7 @@ RunReport runInterFoamDevice(
                     std::size_t off = 0;
                     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                     {
-                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        if (isCyclicFamilyType(fvp[pi].type)) continue;
                         const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
                         if (off + n > flat.size()) break;
                         out[pi].assign(flat.begin() + off, flat.begin() + off + n);
@@ -7779,7 +7779,7 @@ RunReport runInterFoamDevice(
                         std::vector<scalar> bx, by, bz;
                         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                         {
-                            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                            if (isCyclicFamilyType(fvp[pi].type)) continue;
                             for (const vector& v : uOldBndH[pi])
                             {
                                 bx.push_back(v.x); by.push_back(v.y); bz.push_back(v.z);
@@ -7837,7 +7837,7 @@ RunReport runInterFoamDevice(
                             std::vector<vector> flat;
                             for (std::size_t pi = 0; pi < fvp.size() && pi < b.size(); ++pi)
                             {
-                                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                                if (isCyclicFamilyType(fvp[pi].type)) continue;
                                 flat.insert(flat.end(), b[pi].begin(), b[pi].end());
                             }
                             return flat;
@@ -8016,7 +8016,7 @@ RunReport runInterFoamDevice(
                     std::size_t off = 0;
                     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                     {
-                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        if (isCyclicFamilyType(fvp[pi].type)) continue;
                         const std::vector<vector>& v = f.U.boundary[pi]->value();
                         if (f.U.boundary[pi]->fixesValue())
                         {
@@ -8169,7 +8169,7 @@ RunReport runInterFoamDevice(
                     std::vector<scalar> bx, by, bz;
                     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                     {
-                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        if (isCyclicFamilyType(fvp[pi].type)) continue;
                         for (const vector& u : f.U.boundary[pi]->value())
                         {
                             bx.push_back(u.x);
@@ -8210,7 +8210,7 @@ RunReport runInterFoamDevice(
                     std::size_t off = 0;
                     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                     {
-                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        if (isCyclicFamilyType(fvp[pi].type)) continue;
                         const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
                         f.rhoPhi.boundary[pi].assign(rb.begin() + off, rb.begin() + off + n);
                         off += n;
@@ -8374,7 +8374,7 @@ RunReport runInterFoamDevice(
                 std::size_t off = 0;
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    if (isCyclicFamilyType(fvp[pi].type)) continue;
                     std::vector<vector> v(static_cast<std::size_t>(fvp[pi].size));
                     for (label i = 0; i < fvp[pi].size; ++i, ++off)
                     {
@@ -8518,7 +8518,7 @@ RunReport runInterFoamDevice(
                     std::size_t off = 0;
                     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                     {
-                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        if (isCyclicFamilyType(fvp[pi].type)) continue;
                         const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
                         if (off + n > x.size()) break;
                         out[pi].resize(n);

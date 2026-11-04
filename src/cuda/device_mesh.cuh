@@ -10,7 +10,7 @@
 #include "fv_patch.cuh"
 #include "device_buffer.cuh"
 #include "interface/cyclic_interface.cuh"
-#include "foam_dict.cuh"   // isCoupledInterfaceType
+#include "foam_dict.cuh"   // isCyclicFamilyType
 #include <vector>
 
 namespace brae {
@@ -140,7 +140,7 @@ inline DeviceMesh buildDeviceMesh(
     std::vector<scalar> dBndX, dBndY, dBndZ;               // Cf - C(faceCell) per boundary face (cellLimited grad)
     for (const FvPatch& p : fvp)
     {
-        if (isCoupledInterfaceType(p.type)) continue;
+        if (isCyclicFamilyType(p.type)) continue;
         const label emp = (p.type == "empty") ? 1 : 0;
         for (label i = 0; i < p.size; ++i)
         {
