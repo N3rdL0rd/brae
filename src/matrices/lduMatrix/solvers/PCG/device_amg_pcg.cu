@@ -599,7 +599,7 @@ DeviceSolverPerf deviceAMGPCG(
 #ifdef BRAE_HAS_GS_DEVICE
     {
         static const bool pcgDev = envFlag("BRAE_PCG_DEVICE", true);                 // device-resident pressure solve (default ON; opt out BRAE_PCG_DEVICE=0)
-        if (pcgDev && !corrScaling && !split && !A.proc.active())
+        if (pcgDev && braeCondGraphsAvailable() && !corrScaling && !split && !A.proc.active())
         {
             static thread_local auto& dNf = *new DeviceBuffer<scalar>(1);
             cudaMemcpyAsync(dNf.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
@@ -805,7 +805,7 @@ DeviceSolverPerf deviceAMGPCG(
     // guarded already.
     {
         static const bool pcgDev = std::getenv("BRAE_PCG_DEVICE") == nullptr || std::string(std::getenv("BRAE_PCG_DEVICE")) != "0";
-        if (pcgDev && !corrScaling && !normFactorOnHost() && !amgSplit::wanted() && !A.proc.active())
+        if (pcgDev && braeCondGraphsAvailable() && !corrScaling && !normFactorOnHost() && !amgSplit::wanted() && !A.proc.active())
         {
             amgCouplePair(amg, A);
             return deviceAMGPCGGraph(A, amg, b, psi, dNormFactor, tol, relTol, maxIter, minIter);

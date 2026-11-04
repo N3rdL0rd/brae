@@ -662,7 +662,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     // is a different stopping rule and keeps this loop. Dispatched before the DILU update below: the graph
     // path factorises on its own stable copy of the matrix, and doing both cost 1,608 extra level launches
     // per outer iteration on sbMatched.
-    static const bool hostLoop = std::getenv("BRAE_BICG_HOST_LOOP") != nullptr;
+    static const bool hostLoop = std::getenv("BRAE_BICG_HOST_LOOP") != nullptr || !braeCondGraphsAvailable();
     static bool announcedHost = false;
     if (hostLoop && !announcedHost)
     {
@@ -803,7 +803,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
             "diagonal).");
     }
 #ifdef BRAE_HAS_GS_DEVICE
-    static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr || std::getenv("BRAE_BICG_HOST_LOOP") != nullptr;
+    static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr || std::getenv("BRAE_BICG_HOST_LOOP") != nullptr || !braeCondGraphsAvailable();
     if (checkEvery <= 1 && !hostLoop && !normFactorOnHost())
     {
         DeviceSolverPerf gp;

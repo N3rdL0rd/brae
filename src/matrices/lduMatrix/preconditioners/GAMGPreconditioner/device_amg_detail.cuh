@@ -22,6 +22,33 @@
 #define BRAE_HAS_GS_DEVICE 1
 #endif
 
+// ...and the DRIVER has to know them too. The toolkit decides what compiles; the driver decides what runs: a
+// binary built with CUDA 12.9 on a node whose driver is older than 12.4 (the V100 DGX-1 nodes run 535, "CUDA 12.2")
+// fails at cudaGraphInstantiate / kernel launch inside the conditional body instead of falling back. Every
+// dispatch to a device-resident (conditional WHILE) solver asks this first, so such a node takes the host-driven
+// loops, which compute the same numbers. BRAE_COND_GRAPH=0 forces the host loops, =1 skips the version check.
+inline bool braeCondGraphsAvailable()
+{
+    static const bool ok = []()
+    {
+#ifdef BRAE_HAS_GS_DEVICE
+        if (const char* e = std::getenv("BRAE_COND_GRAPH")) return e[0] != '0';
+        int drv = 0;
+        const bool known = cudaDriverGetVersion(&drv) == cudaSuccess;
+        if (!known || drv < 12040)
+        {
+            std::printf("  conditional graphs: driver supports CUDA %d.%d, they need 12.4 -- the solver loops run on the host\n",
+                        drv / 1000, (drv % 1000) / 10);
+            return false;
+        }
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return ok;
+}
+
 namespace brae {
 
 // finalizeAMG builds the V-cycle scratch + persistent PCG buffers + graph caches for a hierarchy. It is the one

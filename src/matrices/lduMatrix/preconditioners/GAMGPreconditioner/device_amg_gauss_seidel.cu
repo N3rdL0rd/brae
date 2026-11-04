@@ -956,7 +956,7 @@ void deviceSymGaussSeidelFused(
     }
 #ifdef BRAE_HAS_GS_DEVICE
     static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr;
-    if (shared && !hostLoop && !optIn)
+    if (shared && !hostLoop && !optIn && braeCondGraphsAvailable())
     {
         static bool announced = false;
         if (!announced)
@@ -1153,7 +1153,7 @@ scalar deviceSymGaussSeidel(
         return p.initialResidual;
     }
 #ifdef BRAE_HAS_GS_DEVICE
-    static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr;
+    static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr || !braeCondGraphsAvailable();
     if (!hostLoop)
     {
         DeviceSolverPerf p;
@@ -1325,7 +1325,7 @@ scalar deviceSymGaussSeidel(
         return p.initialResidual;
     }
 #ifdef BRAE_HAS_GS_DEVICE
-    if (!optIn && !hostLoopArm)
+    if (!optIn && !hostLoopArm && braeCondGraphsAvailable())
     {
         DeviceSolverPerf p;
         deviceSymGaussSeidelGraph(A, b, psi, dNormFactor, tol, relTol, maxIter, minIter, sweepsPer, symmetric, p);
