@@ -395,6 +395,17 @@ foreach(_np 1 2 3 4 8)
     set_tests_properties(proc_comm_mpi_np${_np} PROPERTIES TIMEOUT 300)
 endforeach()
 
+# Multi-GPU step E-I: distributed linear solvers (processor-interface hook, global reductions, AMG-PCG, symGaussSeidel)
+# against the monolithic solve; one process per rank (MPI-host backend), several ranks on one GPU is fine
+add_executable(test_dist_solvers tests/test_dist_solvers.cu)
+target_include_directories(test_dist_solvers PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_dist_solvers PRIVATE brae_core)
+foreach(_np 1 2 4 8)
+    add_test(NAME dist_solvers_np${_np}
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_dist_solvers>)
+    set_tests_properties(dist_solvers_np${_np} PROPERTIES TIMEOUT 900)
+endforeach()
+
 # loopback ops captured as one joint CUDA graph and replayed 1000 times; the MPI-host backend must refuse capture
 add_executable(test_proc_comm_graph tests/test_proc_comm_graph.cu)
 target_include_directories(test_proc_comm_graph PRIVATE ${BRAE_HEADER_DIRS})
