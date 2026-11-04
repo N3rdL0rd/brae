@@ -358,6 +358,16 @@ foreach(_np 1 2 3 4 8)
     set_tests_properties(proc_comm_mpi_np${_np} PROPERTIES TIMEOUT 300)
 endforeach()
 
+# loopback ops captured as one joint CUDA graph and replayed 1000 times; the MPI-host backend must refuse capture
+add_executable(test_proc_comm_graph tests/test_proc_comm_graph.cu)
+target_include_directories(test_proc_comm_graph PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_comm_graph PRIVATE brae_core)
+add_test(NAME proc_comm_graph_loopback COMMAND test_proc_comm_graph)
+set_tests_properties(proc_comm_graph_loopback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+add_test(NAME proc_comm_graph_mpi_refuses
+         COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 2 $<TARGET_FILE:test_proc_comm_graph> mpi)
+set_tests_properties(proc_comm_graph_mpi_refuses PROPERTIES TIMEOUT 120)
+
 # Multi-GPU Phase 0b: per-rank DeviceMesh upload + device-path reconstruction
 add_executable(test_gpu_decompose tests/test_gpu_decompose.cu)
 target_include_directories(test_gpu_decompose PRIVATE ${BRAE_HEADER_DIRS})
