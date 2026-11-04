@@ -5763,8 +5763,11 @@ RunReport runInterFoamDevice(
     for (label c = 0; c < nC; ++c)
     { ux[c] = f.U.internal[c].x; uy[c] = f.U.internal[c].y; uz[c] = f.U.internal[c].z; }
 
-    DeviceBuffer<scalar> dA(f.alpha1.internal), dAOld(f.alpha1.internal);
-    DeviceBuffer<scalar> dUx(ux), dUy(uy), dUz(uz), dUox(ux), dUoy(uy), dUoz(uz);
+    // THE CELL STATE a neighbour-reading kernel reads is allocated with its halo tail (cellArrayLength: nCells +
+    // nHalo, size() stays nCells; identical to a plain allocation without processor faces)
+    DeviceBuffer<scalar> dA = makeCellBuffer(dm, f.alpha1.internal), dAOld = makeCellBuffer(dm, f.alpha1.internal);
+    DeviceBuffer<scalar> dUx = makeCellBuffer(dm, ux), dUy = makeCellBuffer(dm, uy), dUz = makeCellBuffer(dm, uz);
+    DeviceBuffer<scalar> dUox = makeCellBuffer(dm, ux), dUoy = makeCellBuffer(dm, uy), dUoz = makeCellBuffer(dm, uz);
     // U.oldTime()'s PATCH values, snapshotted with the cells below: ddtCorr's boundary half
     // interpolates the STORED patch value on an uncoupled patch, not the face cell
     DeviceBuffer<scalar> dUobx, dUoby, dUobz;
@@ -5795,7 +5798,7 @@ RunReport runInterFoamDevice(
         }
     }
     DeviceBuffer<scalar> dPhiI(f.phi.internal);
-    DeviceBuffer<scalar> dPrgh(f.p_rgh.internal), dP;
+    DeviceBuffer<scalar> dPrgh = makeCellBuffer(dm, f.p_rgh.internal), dP;
     prghForHooks = &dPrgh;
     // The host's p_rgh patches made current from the device's gradient and cells: the same updateSnGrad and
     // evaluate the host hooks made, now where a writer or the end of the run reads them.
@@ -5821,7 +5824,7 @@ RunReport runInterFoamDevice(
     {
         dNHIf.copyFrom(coupledFace(f.nHatf, cyclics));
     }
-    DeviceBuffer<scalar> dABnd(patchValues(f.alpha1, fvp)), dK(f.K);
+    DeviceBuffer<scalar> dABnd(patchValues(f.alpha1, fvp)), dK = makeCellBuffer(dm, f.K);
     // |Sf| over the full face array IN THE DEVICE'S ORDER -- internal faces, then the boundary patches
     // with the coupled ones LEFT OUT, as every array the pressure step indexes it beside is laid out
     // (fullFace). It was uploaded in MESH order, which is the same array only while no coupled patch
