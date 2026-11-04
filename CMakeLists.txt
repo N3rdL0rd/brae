@@ -80,6 +80,7 @@ add_library(brae_core STATIC
     src/parallel/pstream/device_halo.cu
     src/parallel/pstream/device_reduce.cu
     src/parallel/proc_comm.cu
+    src/parallel/processor_coupling.cu
     src/OpenFOAM/meshes/interface/processor_interface.cu
     src/OpenFOAM/db/foam_token_reader.cu
     src/OpenFOAM/db/dynamicLibrary/codedBase/coded_library.cu
