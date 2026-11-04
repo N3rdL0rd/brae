@@ -9,11 +9,12 @@
 //   MpiHost   one process per rank under mpirun, cudaMemcpy staging through pinned host memory + MPI
 //             Isend/Irecv, reductions by MPI_Allgather + a fixed-rank-order host fold. For CI and np > GPUs.
 //             Host-synchronous per call, so NOT graph-capturable.
-//   Nccl      a later task. createNccl() throws "not implemented". The interface is already NCCL-shaped: a
-//             HaloPlan is the per-peer send/recv list of one ncclGroupStart/ncclSend/ncclRecv/ncclGroupEnd, every
-//             op takes the stream it is enqueued on, reductions are "allgather the n partials, fold locally in
-//             rank order" (identical bits on every rank, independent of NCCL's algorithm), and CommChannel
-//             selects the one of the two communicators (graph-only with graphUsageMode=0 / eager) an op uses.
+//   Nccl      one process per GPU under mpirun (CMake option BRAE_WITH_NCCL). A HaloPlan is the per-peer send/recv
+//             list of one ncclGroupStart/ncclSend/ncclRecv/ncclGroupEnd on the op's stream, reductions are
+//             "allgather the n partials, fold locally in rank order" (identical bits on every rank, independent of
+//             NCCL's algorithm), and CommChannel selects the one of the two communicators (graph-only with
+//             graphUsageMode=0 / eager) an op uses. Every op is CUDA-graph capturable (each rank captures its OWN
+//             graph, no joint graph); host-resident ops and aborts go over MPI (see proc_comm.cu).
 //
 // ---- semantics every backend keeps ---------------------------------------------------------------------------
 //  * np == 1 (size() == 1) is the IDENTITY with zero overhead: every op returns on its first line, before any
@@ -24,6 +25,8 @@
 //    the caller's kernels on that stream. The host-resident variants block.
 //  * Reductions are deterministic: the n partials are combined in rank order 0..np-1, so every rank gets the SAME
 //    BITS, independent of timing and of the number of repeats. Sum is ((v0+v1)+v2)+..., Min/Max are exact.
+//  * (NCCL/MPI backends) device ops only enqueue, so a remote abort surfaces at the next HOST collective (barrier,
+//    host reduction/bcast, makePlan, exchangeIntLists); loopback and MPI-host also check inside every op.
 //  * A rank-local exception must not deadlock the others: route it through collectiveAbort(msg) (or guarded()).
 //    Every rank then throws the SAME ProcCommAbort at its next collective. An exception that leaves a rank
 //    WITHOUT going through collectiveAbort hangs the other ranks (this is the SPMD contract of MPI as well).
@@ -196,9 +199,13 @@ public:
     static std::vector<std::unique_ptr<ProcComm>> createLoopback(int np, std::size_t reduceCapacity = 4096);
     // MPI-host: this process's rank handle; needs Pstream::init() (uses MPI_COMM_WORLD, Pstream rank/size).
     static std::unique_ptr<ProcComm> createMpiHost();
-    // NCCL: not implemented (a later task). Throws std::runtime_error("... not implemented").
+    // NCCL: one process per GPU under mpirun (needs Pstream::init(); GPU = Pstream::deviceId(), np <= GPUs per node).
+    // Throws std::runtime_error when this build has no NCCL (ncclBuilt() == false) or two ranks share a GPU.
     static std::unique_ptr<ProcComm> createNccl();
-    // Run-time selection: backend name "loopback" | "mpi" | "nccl" (default: env BRAE_COMM_BACKEND, else "mpi").
+    static bool ncclBuilt();                       // compiled with BRAE_WITH_NCCL
+    static const char* backendName(Backend b);     // "loopback" | "mpi" | "nccl"
+    // Run-time selection: backend name "loopback" | "mpi" | "nccl" | "auto". Default: env BRAE_COMM, then env
+    // BRAE_COMM_BACKEND, then auto = NCCL when built with it, np > 1 and every rank of a node can own a GPU, else mpi.
     // Loopback returns np handles (np: argument, else env BRAE_COMM_NP, else 1); the others return one.
     static std::vector<std::unique_ptr<ProcComm>> create(const std::string& backend = "", int np = 0);
 

@@ -1,8 +1,12 @@
-// brae::ProcComm: backends (loopback, MPI-host, NCCL stub), halo plans, synthetic partitioner.
+// brae::ProcComm: backends (loopback, MPI-host, NCCL), halo plans, synthetic partitioner.
 // The contract is documented in proc_comm.cuh.
 #include "proc_comm.cuh"
 
 #include <mpi.h>
+#include <unistd.h>
+#ifdef BRAE_WITH_NCCL
+#include <nccl.h>
+#endif
 
 #include <algorithm>
 #include <condition_variable>
@@ -805,16 +809,23 @@ void mpiCheck(int rc, const char* what)
     if (rc != MPI_SUCCESS) throw std::runtime_error(std::string("ProcComm MPI: ") + what + " failed");
 }
 
-class MpiHostComm final : public ProcComm
+// The NCCL backend derives from this class: its host-resident collectives (barrier, host reductions/bcast, int lists,
+// the abort status phase) are the MPI ones, its device ops are NCCL.
+class MpiHostComm : public ProcComm
 {
 public:
-    MpiHostComm() : ProcComm(Backend::MpiHost, Pstream::myProcNo(), Pstream::nProcs())
-    {
-        device_ = Pstream::deviceId();
-    }
+    MpiHostComm() : MpiHostComm(Backend::MpiHost) {}
     bool graphCapturable() const override { return false; }
 
 protected:
+    explicit MpiHostComm(Backend b) : ProcComm(b, Pstream::myProcNo(), Pstream::nProcs())
+    {
+        device_ = Pstream::deviceId();
+    }
+    // Called on EVERY rank, from inside the status phase that is about to throw a ProcCommAbort (all ranks reach it
+    // at the same collective). The NCCL backend uses it to abort and re-create its communicators.
+    virtual void abortSeen() {}
+
     std::unique_ptr<HaloPlan> doMakePlan(HaloPlanDesc desc, int maxComps) override
     {
         status(nullptr);
@@ -836,7 +847,13 @@ protected:
         }
         sp->setTables(rt, ft);
         setPlanState(*plan, std::move(st));
-        // the neighbours must agree on the message sizes
+        verifyPlanSizes(d);
+        return plan;
+    }
+
+    // The neighbours must agree on the message sizes (collective; every rank throws the same ProcCommAbort).
+    void verifyPlanSizes(const HaloPlanDesc& d)
+    {
         std::vector<int> nbr;
         std::vector<std::vector<int>> mine;
         for (const HaloNeighbour& n : d.nbrs) { nbr.push_back(n.rank); mine.push_back({n.sendCount, n.recvCount, n.faceCount}); }
@@ -849,7 +866,6 @@ protected:
         mpiCheck(MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD), "Allreduce");
         if (bad != 0)
             throw ProcCommAbort("ProcComm::makePlan: the ranks' halo plans do not match (send/recv/face counts)", 0);
-        return plan;
     }
 
     void doExchangeCells(const HaloPlan& plan, const HaloField* fields, int nFields, cudaStream_t s, CommChannel) override
@@ -948,7 +964,7 @@ protected:
         throw ProcCommAbort(msg, rank_);
     }
 
-private:
+protected:
     // The status phase opens every collective: all ranks allgather their abort flag (+ message). A raised
     // abort is thrown, with the message of the lowest raising rank, by every rank including the raiser.
     void status(const std::string* raise)
@@ -963,7 +979,11 @@ private:
         std::vector<AbortRec> all(size_);
         mpiCheck(MPI_Allgather(&mine, sizeof(AbortRec), MPI_BYTE, all.data(), sizeof(AbortRec), MPI_BYTE, MPI_COMM_WORLD), "Allgather");
         for (int r = 0; r < size_; ++r)
-            if (all[r].flag) throw ProcCommAbort(std::string(all[r].msg), r);
+            if (all[r].flag)
+            {
+                abortSeen();
+                throw ProcCommAbort(std::string(all[r].msg), r);
+            }
     }
 
     static void noCapture(cudaStream_t s)
@@ -1032,23 +1052,389 @@ std::unique_ptr<ProcComm> ProcComm::createMpiHost()
 }
 
 // ------------------------------------------------------------------------------------------------------------
-// NCCL backend: NOT IMPLEMENTED. CommSolvers.md step C. What it has to provide behind this same interface:
-//   makePlan      per-neighbour ncclSend/ncclRecv lists inside ONE ncclGroupStart/End on `stream` (pack kernel before,
-//                 unpack after; staging is plain cudaMalloc memory)
-//   allReduce     ncclAllGather of the n partials + fixed-rank-order local fold (same bits on every rank)
-//   channels      two communicators: commGraph (graph-only, graphUsageMode = 0 / NCCL_GRAPH_MIXING_SUPPORT = 0, used
-//                 only for CommChannel::Graph) and commEager (everything else); warm both up before any capture
-//   abort         the collectives learn the abort out of band (a device-visible flag polled by the unpack/fold kernels)
+// NCCL backend (CommSolvers.md step C), compiled with -DBRAE_WITH_NCCL (CMake option BRAE_WITH_NCCL).
+//   one process per GPU under mpirun; bootstrap: rank 0 ncclGetUniqueId, MPI_Bcast, ncclCommInitRankConfig.
+//   TWO communicators over the same ranks: `ce` (eager: warm-up, host-driven paths, function objects) and `cg`
+//   (graph-only, ncclConfig graphUsageMode = 0: every op that is captured in a CUDA graph / conditional WHILE
+//   body). An op uses cg when the caller asks for CommChannel::Graph or its stream is capturing; else ce.
+//   exchangeCells  pack kernel -> ONE ncclGroupStart/ncclRecv.../ncclSend.../ncclGroupEnd for all neighbours (one
+//                  message per neighbour carrying all components) -> unpack kernel; all on the caller's stream.
+//   exchangeFaces  the same group, sending straight from the caller's face array, then the combine kernel.
+//   allReduce      ncclAllGather of the n partials into a persistent buffer, then the rank-order fold kernel of the
+//                  other backends (Sum, Min, Max alike: identical bits on every rank, independent of NCCL's
+//                  algorithm/ring/tree; min/max would be exact with ncclAllReduce too, one code path is simpler).
+//   bcast          ncclBroadcast in place (exact).
+//   host ops       (barrier, allReduceHost, bcastHost, exchangeIntLists, makePlan's size check, abort) are the MPI
+//                  ones of MpiHostComm: they carry the abort record. The device ops only ENQUEUE and cannot throw a
+//                  remote abort; a rank learns it at its next HOST collective. Peers that already enqueued NCCL work
+//                  against the failed rank would hang on the stream, so every rank that sees an abort calls
+//                  ncclCommAbort on both communicators (kernels exit) and re-creates them (collective: all ranks
+//                  pass the same status phase). Graphs captured before an abort are invalid afterwards.
 // ------------------------------------------------------------------------------------------------------------
+#ifdef BRAE_WITH_NCCL
+namespace {
+
+void ncclCk(ncclResult_t r, const char* what)
+{
+    if (r != ncclSuccess)
+        throw std::runtime_error(std::string("ProcComm NCCL: ") + what + ": " + ncclGetErrorString(r));
+}
+
+unsigned long long hostHash()
+{
+    char name[256] = {0};
+    gethostname(name, sizeof(name) - 1);
+    unsigned long long h = 1469598103934665603ull;
+    for (const char* c = name; *c; ++c) { h ^= static_cast<unsigned char>(*c); h *= 1099511628211ull; }
+    return h;
+}
+
+struct NcclPlan : StagePlan
+{
+    // Launches every kernel the plan's ops use once, with no work, on `s`. CUDA loads kernels lazily at their first
+    // launch, and a lazy load can block behind a running (spinning) NCCL kernel: the first use must therefore not
+    // happen after an abort left kernels waiting for a failed peer.
+    void warmKernels(cudaStream_t s) const
+    {
+        if (nNbr == 0) return;
+        CompList cl;
+        cl.n = 0; cl.base = 0;
+        packCellsK<<<dim3(1, nNbr), 32, 0, s>>>(nullptr, dSendTab, cl, 1, dSend);
+        unpackCellsK<<<dim3(1, nNbr), 32, 0, s>>>(dRecvTab, cl, 1, 0);
+        combineFacesK<<<dim3(1, nNbr), 32, 0, s>>>(dFaceTab, dRecv, 2);
+        ck(cudaGetLastError(), "warm-up kernel launch");
+    }
+};
+
+class NcclComm final : public MpiHostComm
+{
+public:
+    NcclComm() : MpiHostComm(Backend::Nccl)
+    {
+        if (size_ == 1) return;   // identity: no communicator, no allocation
+        if (device_ < 0) throw std::runtime_error("ProcComm NCCL: this rank has no CUDA device");
+        // one rank per GPU (NCCL refuses two ranks on one device); every rank sees the same table, so all throw alike
+        struct Id { unsigned long long host; int dev; int pad; };
+        Id mine{hostHash(), device_, 0};
+        std::vector<Id> all(size_);
+        mpiCheck(MPI_Allgather(&mine, sizeof(Id), MPI_BYTE, all.data(), sizeof(Id), MPI_BYTE, MPI_COMM_WORLD), "Allgather");
+        // bring-up hook for a node with fewer GPUs than ranks: NCCL >= 2.3x runs several ranks on one GPU when
+        // NCCL_MULTI_RANK_GPU_ENABLE=1 (slow, only for testing the data path; never for measurements)
+        const char* share = std::getenv("BRAE_NCCL_ALLOW_SHARED_GPU");
+        if (share && share[0] == '1') setenv("NCCL_MULTI_RANK_GPU_ENABLE", "1", 0);
+        for (int a = 0; a < size_ && !(share && share[0] == '1'); ++a)
+            for (int b = a + 1; b < size_; ++b)
+                if (all[a].host == all[b].host && all[a].dev == all[b].dev)
+                    throw std::runtime_error("ProcComm NCCL: ranks " + std::to_string(a) + " and " + std::to_string(b)
+                                             + " are bound to the same GPU (device " + std::to_string(all[a].dev)
+                                             + "); NCCL needs one rank per GPU: use np <= GPUs per node, or BRAE_COMM=mpi");
+        ck(cudaSetDevice(device_), "cudaSetDevice");
+        // graph communicator without mixing support (the per-communicator form is ncclConfig.graphUsageMode; this
+        // env is the fallback for an NCCL without it and affects only comms that are never launched eagerly)
+        setenv("NCCL_GRAPH_MIXING_SUPPORT", "0", 0);
+        const char* e = std::getenv("BRAE_COMM_REDUCE_CAPACITY");
+        if (e && std::atoi(e) > 0) cap_ = static_cast<std::size_t>(std::atoi(e));
+        ck(cudaStreamCreateWithFlags(&wst_, cudaStreamNonBlocking), "warm-up stream");
+        for (int c = 0; c < 2; ++c) gath_[c] = dalloc<double>(cap_*static_cast<std::size_t>(size_));
+        scratch_ = dalloc<double>(8);
+        initComms();
+    }
+
+    ~NcclComm() override
+    {
+        if (size_ == 1) return;
+        cudaStreamSynchronize(wst_);
+        for (int c = 0; c < 2; ++c) if (comm_[c]) ncclCommDestroy(comm_[c]);
+        for (int c = 0; c < 2; ++c) cudaFree(gath_[c]);
+        cudaFree(scratch_);
+        cudaStreamDestroy(wst_);
+    }
+
+    bool graphCapturable() const override { return true; }
+
+protected:
+    std::unique_ptr<HaloPlan> doMakePlan(HaloPlanDesc desc, int maxComps) override
+    {
+        status(nullptr);
+        if (!broken_.empty()) throw std::runtime_error("ProcComm NCCL: communicators unusable after an abort: " + broken_);
+        std::unique_ptr<HaloPlan> plan = newPlan(std::move(desc));
+        auto st = std::make_unique<NcclPlan>();
+        NcclPlan* sp = st.get();
+        const HaloPlanDesc& d = detail::PlanAccess::desc(*plan);
+        sp->init(d, maxComps, true);
+        std::vector<RecvEntry> rt(d.nbrs.size());
+        std::vector<FaceEntry> ft(d.nbrs.size());
+        for (std::size_t k = 0; k < d.nbrs.size(); ++k)
+        {
+            const HaloNeighbour& n = d.nbrs[k];
+            rt[k] = {sp->dRecv, n.recvStart, n.recvCount, n.recvStart};
+            ft[k] = {sp->dRecv, n.faceStart, n.faceCount, n.faceStart};
+        }
+        sp->setTables(rt, ft);
+        setPlanState(*plan, std::move(st));
+        verifyPlanSizes(d);
+        // Warm-up: the lazy peer-to-peer connections of BOTH communicators are set up here with the largest messages
+        // this plan will send, so that no first-use latency/allocation happens in a timed region or a capture.
+        for (int c = 0; c < 2; ++c)
+        {
+            sendRecvGroup(c, wst_, d, sp->dSend, sp->dRecv, maxComps, true);
+            sendRecvGroup(c, wst_, d, sp->dSend, sp->dRecv, 1, false);
+            ck(cudaStreamSynchronize(wst_), "warm-up sync");
+        }
+        sp->warmKernels(wst_);
+        ck(cudaStreamSynchronize(wst_), "warm-up sync");
+        return plan;
+    }
+
+    void doExchangeCells(const HaloPlan& plan, const HaloField* fields, int nFields, cudaStream_t s, CommChannel ch) override
+    {
+        s = realStream(s);
+        FlatComps fc;
+        flatten(fields, nFields, fc);
+        if (fc.n == 0) return;
+        auto* st = static_cast<NcclPlan*>(planState(plan));
+        checkCapacity(*st, fc.n);
+        const int c = channel(s, ch);
+        st->pack(plan, fc, s);
+        sendRecvGroup(c, s, *st->desc, st->dSend, st->dRecv, fc.n, true);
+        st->unpack(plan, fc, s);
+    }
+
+    void doExchangeFaces(const HaloPlan& plan, double* arr, FaceOp op, cudaStream_t s, CommChannel ch) override
+    {
+        s = realStream(s);
+        auto* st = static_cast<NcclPlan*>(planState(plan));
+        const HaloPlanDesc& d = *st->desc;
+        if (d.nProcFaces == 0) return;
+        const int c = channel(s, ch);
+        grouped([&] {
+            for (const HaloNeighbour& n : d.nbrs)
+            {
+                if (!n.faceCount) continue;
+                ncclCk(ncclRecv(st->dRecv + n.faceStart, n.faceCount, ncclDouble, n.rank, comm_[c], s), "ncclRecv");
+                ncclCk(ncclSend(arr + n.faceStart, n.faceCount, ncclDouble, n.rank, comm_[c], s), "ncclSend");
+            }
+        });
+        st->combineFaces(arr, op, s);
+    }
+
+    void doAllReduceDevice(double* d, int n, ReduceOp op, cudaStream_t s, CommChannel ch) override
+    {
+        if (n <= 0) return;
+        if (static_cast<std::size_t>(n) > cap_)
+            throw std::length_error("ProcComm NCCL: device reduction of " + std::to_string(n) + " doubles exceeds the capacity "
+                                    + std::to_string(cap_) + " (env BRAE_COMM_REDUCE_CAPACITY)");
+        s = realStream(s);
+        const int c = channel(s, ch);
+        ncclCk(ncclAllGather(d, gath_[c], static_cast<std::size_t>(n), ncclDouble, comm_[c], s), "ncclAllGather");
+        SlotList sl;
+        sl.n = size_;
+        for (int r = 0; r < size_; ++r) sl.p[r] = gath_[c] + static_cast<std::size_t>(r)*n;
+        foldSlotsK<<<gridFor(n), 256, 0, s>>>(d, sl, n, opCode(op), 0);
+        ck(cudaGetLastError(), "fold launch");
+    }
+
+    void doBcastDevice(double* d, int n, int root, cudaStream_t s, CommChannel ch) override
+    {
+        if (root < 0 || root >= size_) throw std::invalid_argument("ProcComm::bcast: root out of range");
+        if (n <= 0) return;
+        s = realStream(s);
+        const int c = channel(s, ch);
+        ncclCk(ncclBroadcast(d, d, static_cast<std::size_t>(n), ncclDouble, root, comm_[c], s), "ncclBroadcast");
+    }
+
+    void abortSeen() override
+    {
+        // Every rank passes through here at the same status phase. Peers may have NCCL kernels enqueued against the
+        // failed rank that never complete: stop them, then rebuild both communicators collectively. NCCL_REVOKE:
+        // phase 1 stops every in-flight kernel of this rank WITHOUT freeing what a peer's kernel may still touch
+        // (ncclCommAbort frees at once: a peer that has not aborted yet could then read freed IPC/SHM buffers),
+        // an MPI barrier makes all ranks quiescent, only then are the communicators destroyed. Older NCCL without
+        // ncclCommRevoke falls back to ncclCommAbort on each rank (that race is possible there).
+        try
+        {
+#ifdef NCCL_REVOKE_DEFAULT
+            for (int c = 0; c < 2; ++c) if (comm_[c]) ncclCk(ncclCommRevoke(comm_[c], NCCL_REVOKE_DEFAULT), "ncclCommRevoke");
+            for (int c = 0; c < 2; ++c)
+            {
+                if (!comm_[c]) continue;
+                ncclResult_t st = ncclInProgress;
+                for (int spin = 0; st == ncclInProgress; ++spin)
+                {
+                    ncclCk(ncclCommGetAsyncError(comm_[c], &st), "ncclCommGetAsyncError");
+                    if (spin > 600000) throw std::runtime_error("ProcComm NCCL: communicator did not quiesce after ncclCommRevoke");
+                    if (st == ncclInProgress) usleep(100);
+                }
+            }
+            mpiCheck(MPI_Barrier(MPI_COMM_WORLD), "Barrier");
+            for (int c = 0; c < 2; ++c) if (comm_[c]) { ncclCommDestroy(comm_[c]); comm_[c] = nullptr; }
+#else
+            for (int c = 0; c < 2; ++c) if (comm_[c]) { ncclCommAbort(comm_[c]); comm_[c] = nullptr; }
+#endif
+            ck(cudaStreamSynchronize(wst_), "warm-up stream sync");
+            initComms();
+            broken_.clear();
+        }
+        catch (const std::exception& e)
+        {
+            broken_ = e.what();   // the abort itself is still delivered; device ops refuse until the process restarts
+        }
+    }
+
+private:
+    ncclComm_t comm_[2] = {nullptr, nullptr};   // 0 eager, 1 graph-only
+    double* gath_[2] = {nullptr, nullptr};      // [cap_*size_] allgather targets, one per channel
+    double* scratch_ = nullptr;
+    std::size_t cap_ = 4096;                    // doubles per rank of one device reduction
+    std::string broken_;                        // set when re-creating the communicators after an abort failed
+    cudaStream_t wst_ = nullptr;
+
+    // `0` means the per-thread default stream in this TU (compiled --default-stream per-thread), but NCCL (a separate
+    // library) would read it as the legacy stream: pass the explicit handle.
+    static cudaStream_t realStream(cudaStream_t s) { return s ? s : cudaStreamPerThread; }
+
+    static bool capturing(cudaStream_t s)
+    {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        ck(cudaStreamIsCapturing(s, &cs), "cudaStreamIsCapturing");
+        return cs != cudaStreamCaptureStatusNone;
+    }
+    int channel(cudaStream_t s, CommChannel ch) const
+    {
+        if (!broken_.empty()) throw std::runtime_error("ProcComm NCCL: communicators unusable after an abort: " + broken_);
+        return (ch == CommChannel::Graph || capturing(s)) ? 1 : 0;
+    }
+
+    template<class F> static void grouped(F&& f)
+    {
+        ncclCk(ncclGroupStart(), "ncclGroupStart");
+        try { f(); }
+        catch (...) { ncclGroupEnd(); throw; }
+        ncclCk(ncclGroupEnd(), "ncclGroupEnd");
+    }
+
+    // One group with every neighbour's receive and send (C components per cell); zero-length neighbours are skipped.
+    // NCCL's group semantics make the order inside the group irrelevant (no deadlock for any neighbour graph).
+    void sendRecvGroup(int c, cudaStream_t s, const HaloPlanDesc& d, double* dSend, double* dRecv, int C, bool cells)
+    {
+        if (cells)
+        {
+            grouped([&] {
+                for (const HaloNeighbour& n : d.nbrs)
+                {
+                    if (n.recvCount)
+                        ncclCk(ncclRecv(dRecv + static_cast<std::size_t>(C)*n.recvStart, static_cast<std::size_t>(C)*n.recvCount,
+                                        ncclDouble, n.rank, comm_[c], s), "ncclRecv");
+                    if (n.sendCount)
+                        ncclCk(ncclSend(dSend + static_cast<std::size_t>(C)*n.sendOffset, static_cast<std::size_t>(C)*n.sendCount,
+                                        ncclDouble, n.rank, comm_[c], s), "ncclSend");
+                }
+            });
+        }
+        else
+        {
+            grouped([&] {
+                for (const HaloNeighbour& n : d.nbrs)
+                {
+                    if (!n.faceCount) continue;
+                    ncclCk(ncclRecv(dRecv + n.faceStart, n.faceCount, ncclDouble, n.rank, comm_[c], s), "ncclRecv");
+                    ncclCk(ncclSend(dSend + n.faceStart, n.faceCount, ncclDouble, n.rank, comm_[c], s), "ncclSend");
+                }
+            });
+        }
+    }
+
+    // Both communicators, then one allgather on each (their kernels and rings exist before the first real use).
+    void initComms()
+    {
+        for (int c = 0; c < 2; ++c)
+        {
+            struct Boot { int ok; int pad; ncclUniqueId id; } boot;
+            std::memset(&boot, 0, sizeof(boot));
+            std::string why;
+            if (rank_ == 0)
+            {
+                const ncclResult_t r = ncclGetUniqueId(&boot.id);
+                boot.ok = r == ncclSuccess;
+                if (!boot.ok) why = ncclGetErrorString(r);
+            }
+            mpiCheck(MPI_Bcast(&boot, sizeof(boot), MPI_BYTE, 0, MPI_COMM_WORLD), "Bcast");
+            if (!boot.ok) throw std::runtime_error("ProcComm NCCL: ncclGetUniqueId failed on rank 0");
+            ncclConfig_t cfg = NCCL_CONFIG_INITIALIZER;
+#ifdef BRAE_NCCL_HAVE_GRAPH_USAGE_MODE
+            if (c == 1) cfg.graphUsageMode = 0;
+#endif
+            ncclCk(ncclCommInitRankConfig(&comm_[c], size_, boot.id, rank_, &cfg), "ncclCommInitRankConfig");
+        }
+        for (int c = 0; c < 2; ++c)
+        {
+            ncclCk(ncclAllGather(scratch_, gath_[c], 1, ncclDouble, comm_[c], wst_), "warm-up ncclAllGather");
+            SlotList sl;
+            sl.n = size_;
+            for (int r = 0; r < size_; ++r) sl.p[r] = gath_[c] + r;
+            for (int op = 0; op < 3; ++op) foldSlotsK<<<1, 32, 0, wst_>>>(scratch_ + 1, sl, 1, op, 0);   // module load of the fold kernel
+            ck(cudaGetLastError(), "warm-up fold launch");
+            ck(cudaStreamSynchronize(wst_), "warm-up sync");
+        }
+    }
+};
+
+} // namespace
+#endif // BRAE_WITH_NCCL
+
+bool ProcComm::ncclBuilt()
+{
+#ifdef BRAE_WITH_NCCL
+    return true;
+#else
+    return false;
+#endif
+}
+
 std::unique_ptr<ProcComm> ProcComm::createNccl()
 {
-    throw std::runtime_error("ProcComm NCCL backend: not implemented (CommSolvers.md step C); use loopback or mpi");
+#ifdef BRAE_WITH_NCCL
+    if (!Pstream::initialized()) throw std::logic_error("ProcComm::createNccl: Pstream::init() has not been called");
+    return std::unique_ptr<ProcComm>(new NcclComm());
+#else
+    throw std::runtime_error("ProcComm NCCL backend: this build has no NCCL (configure with -DBRAE_WITH_NCCL=ON and NCCL_ROOT); use loopback or mpi");
+#endif
 }
+
+const char* ProcComm::backendName(Backend b)
+{
+    return b == Backend::Loopback ? "loopback" : b == Backend::MpiHost ? "mpi" : "nccl";
+}
+
+namespace {
+// Ranks of this job that share this host (MPI_COMM_TYPE_SHARED).
+int nodeLocalRanks()
+{
+    MPI_Comm node;
+    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, Pstream::myProcNo(), MPI_INFO_NULL, &node);
+    int n = 1;
+    MPI_Comm_size(node, &n);
+    MPI_Comm_free(&node);
+    return n;
+}
+} // namespace
 
 std::vector<std::unique_ptr<ProcComm>> ProcComm::create(const std::string& backendIn, int np)
 {
     std::string b = backendIn;
-    if (b.empty()) { const char* e = std::getenv("BRAE_COMM_BACKEND"); b = e ? e : "mpi"; }
+    if (b.empty()) { const char* e = std::getenv("BRAE_COMM"); if (e) b = e; }
+    if (b.empty()) { const char* e = std::getenv("BRAE_COMM_BACKEND"); if (e) b = e; }
+    if (b.empty() || b == "auto")
+    {
+        // NCCL when this build has it and every rank on a node can own a GPU, else MPI-host
+        b = "mpi";
+        if (ncclBuilt() && Pstream::initialized() && Pstream::nProcs() > 1)
+        {
+            int nDev = 0;
+            if (cudaGetDeviceCount(&nDev) != cudaSuccess) { cudaGetLastError(); nDev = 0; }
+            if (nDev > 0 && nodeLocalRanks() <= nDev) b = "nccl";
+        }
+    }
     std::vector<std::unique_ptr<ProcComm>> v;
     if (b == "loopback")
     {
@@ -1057,7 +1443,7 @@ std::vector<std::unique_ptr<ProcComm>> ProcComm::create(const std::string& backe
     }
     if (b == "mpi") { v.push_back(createMpiHost()); return v; }
     if (b == "nccl") { v.push_back(createNccl()); return v; }
-    throw std::invalid_argument("ProcComm::create: unknown backend '" + b + "' (loopback | mpi | nccl)");
+    throw std::invalid_argument("ProcComm::create: unknown backend '" + b + "' (loopback | mpi | nccl | auto)");
 }
 
 // ------------------------------------------------------------------------------------------------------------
