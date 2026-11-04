@@ -373,7 +373,7 @@ void assembleUEqn(
                         deviceBCValue(dbU.comp[k], *U[k], ubv);
                         ub = &ubv;
                     }
-                    CellLimitInterface ifs[1];
+                    CellLimitInterface ifs[2];
                     const int nIfs = pairLimitInterface(k, nbrOut, ifs);
                     deviceCellLimitGrad(dm, *U[k], *ub, gxc[k], gyc[k], gzc[k], in.gradUSchemeLimitK,
                                         nIfs > 0 ? ifs : nullptr, nIfs);
@@ -456,7 +456,7 @@ void assembleUEqn(
                 addPairToGrad(k, gx[k], gy[k], gz[k]);
                 if (in.gradULimitK > 0.0)
                 {
-                    CellLimitInterface ifs[1];
+                    CellLimitInterface ifs[2];
                     DeviceBuffer<scalar> nbr;
                     const int nIfs = pairLimitInterface(k, nbr, ifs);
                     deviceCellLimitGrad(dm, *Usrc[k], gm.ub[k], gx[k], gy[k], gz[k], in.gradULimitK, ifs, nIfs);
@@ -490,7 +490,7 @@ void assembleUEqn(
                 // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`.
                 if (in.gradULimitK > 0.0)
                 {
-                    CellLimitInterface ifs[1];
+                    CellLimitInterface ifs[2];
                     DeviceBuffer<scalar> nbr;
                     const int nIfs = pairLimitInterface(k, nbr, ifs);
                     deviceCellLimitGrad(dm, *U[k], gm.ub[k], gxA[k], gyA[k], gzA[k], in.gradULimitK, ifs, nIfs);
