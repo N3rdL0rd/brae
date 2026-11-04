@@ -184,6 +184,7 @@ add_library(brae_core STATIC
     src/waveModels/waveGenerationModels/derived/McCowan/mccowan_wave_model_cpp.cu
     src/waveModels/waveAbsorptionModels/derived/shallowWaterAbsorption/shallow_water_absorption_cpp.cu
     src/transportModels/interfaceProperties/device_interface_properties.cu
+    src/transportModels/interfaceProperties/device_glibc_math.cu
     src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu
     src/transportModels/interfaceProperties/interface_properties_cpp.cu
     src/applications/solvers/interFoam/inter_solve_cpp.cu
@@ -270,6 +271,10 @@ add_library(brae_core STATIC
     src/cuda/device_ami.cu
     src/applications/solvers/simpleFoam/device_simple_foam.cu
 )
+# device_glibc_math.cu reproduces glibc's acos and cos bit for bit with every operation spelled out; no operation in
+# it may be contracted into an fma behind that.
+set_source_files_properties(src/transportModels/interfaceProperties/device_glibc_math.cu
+                            PROPERTIES COMPILE_OPTIONS "-fmad=false")
 target_include_directories(brae_core PUBLIC ${BRAE_HEADER_DIRS} ${MPI_CXX_INCLUDE_DIRS} ${SCOTCH_INCLUDE_DIR})
 # Link MPI libraries directly (not the imported target) so its CXX compile flags do not
 # reach nvcc, which would reject them.

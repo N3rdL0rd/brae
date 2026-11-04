@@ -138,6 +138,10 @@ struct DeviceContactAngleState
     DeviceBuffer<scalar> prevA12, changedVal;
     DeviceBuffer<int>    changedIdx, changedCount;
     bool a12Valid = false;
+    // the device's own libm half (device_glibc_math.cuh): the face's contact angle, and which variant reproduces the
+    // host's libm (-2 not yet tested, -1 none: the host loop)
+    DeviceBuffer<scalar> theta;
+    int b2Variant = -2;
     DeviceContactAngleState() = default;
     DeviceContactAngleState(const DeviceContactAngleState&) = delete;
     DeviceContactAngleState& operator=(const DeviceContactAngleState&) = delete;

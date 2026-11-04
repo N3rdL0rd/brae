@@ -1,5 +1,8 @@
 // Interface normal and curvature on the device -- see the header for what is here and what is not.
 #include "device_interface_properties.cuh"
+#include "device_glibc_math.cuh"
+#include <algorithm>
+#include <cstdio>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -527,6 +530,36 @@ void deviceContactAngleNHat(const DeviceMesh& dm, DeviceContactAngleState& s,
         s.gx.data(), s.gy.data(), s.gz.data(), s.refGrad.data(), deltaN,
         s.hx.data(), s.hy.data(), s.hz.data(), s.mag.data(), s.a12.data());
     ckIP(cudaGetLastError(), "contact angle: the boundary normal");
+    // b2 = cos(acos(a12) - theta) ON THE DEVICE, bit for bit what the host's glibc gives (device_glibc_math.cuh): glibc's
+    // own algorithm and tables, in the variant that this host's libm turns out to be, found by a self-test at the first
+    // call. No copy and no sync: the kernel is queued with the rest. Where no variant reproduces the host's libm the
+    // host loop below runs, as it always did.
+    //   BRAE_CONTROL_CA_B2_HOST=1 takes the host loop
+    static const bool b2Host = std::getenv("BRAE_CONTROL_CA_B2_HOST") != nullptr;
+    if (s.b2Variant == -2)
+    {
+        s.b2Variant = -1;
+        if (!b2Host && s.hostTheta.size() == n && s.hostKind.size() == n)
+        {
+            std::vector<scalar> thetas;
+            for (std::size_t i = 0; i < n && thetas.size() < 16; ++i)
+            {
+                if (s.hostKind[i] == 1 && std::find(thetas.begin(), thetas.end(), s.hostTheta[i]) == thetas.end())
+                {
+                    thetas.push_back(s.hostTheta[i]);
+                }
+            }
+            s.theta.copyFrom(s.hostTheta);
+            s.b2Variant = glibcB2Variant(thetas);
+            std::printf("  contact angle: b2 = cos(acos(a12) - theta) on the GPU with %s%s\n",
+                        glibcB2VariantName(s.b2Variant),
+                        s.b2Variant < 0 ? " (no device variant reproduces this host's libm bit for bit)" : "");
+        }
+    }
+    if (s.b2Variant >= 0)
+    {
+        glibcB2(s.b2Variant, s.n, s.kind.data(), s.theta.data(), s.a12.data(), s.b2.data());
+    }
     // b2 = cos(acos(a12) - theta) by the host's libm, which is what the host hooks take. CUDA's acos and cos
     // are not glibc's: MEASURED on 2e7 arguments, acos differs in its last bit on 19.6% and cos(acos(x)) on 13%,
     // and on G4 that moved the wall gradient by an ulp on ~100 faces a pass, fed back by the next. So the libm
@@ -535,65 +568,68 @@ void deviceContactAngleNHat(const DeviceMesh& dm, DeviceContactAngleState& s,
     // few thousand of 533,594 wall faces. MEASURED with `nsys`: 75% of the host time in the GPU's idle gaps (27%
     // of the step) was this loop and the two whole-array copies around it.
     //   BRAE_CONTROL_CA_B2_FULL=1 takes the whole array through the host's libm at every call, as before
-    static const bool b2Full = std::getenv("BRAE_CONTROL_CA_B2_FULL") != nullptr;
-    if (!s.hostA12)
+    if (s.b2Variant < 0)
     {
-        ckIP(cudaMallocHost(&s.hostA12, n*sizeof(scalar)), "pinned a12");
-        ckIP(cudaMallocHost(&s.hostB2, n*sizeof(scalar)), "pinned b2");
-        ckIP(cudaMallocHost(&s.hostIdx, n*sizeof(int)), "pinned changed indices");
-    }
-    const label* const kindh = s.hostKind.data();
-    const scalar* const thetah = s.hostTheta.data();
-    if (b2Full)
-    {
-        ckIP(cudaMemcpy(s.hostA12, s.a12.data(), n*sizeof(scalar), cudaMemcpyDeviceToHost), "a12 down");
-        const scalar* const a12h = s.hostA12;
-        scalar* const b2h = s.hostB2;
-        const long nl = static_cast<long>(n);
-        #pragma omp parallel for schedule(static)
-        for (long i = 0; i < nl; ++i)
+        static const bool b2Full = std::getenv("BRAE_CONTROL_CA_B2_FULL") != nullptr;
+        if (!s.hostA12)
         {
-            b2h[i] = kindh[i] == 1 ? std::cos(std::acos(a12h[i]) - thetah[i]) : scalar(0);
+            ckIP(cudaMallocHost(&s.hostA12, n*sizeof(scalar)), "pinned a12");
+            ckIP(cudaMallocHost(&s.hostB2, n*sizeof(scalar)), "pinned b2");
+            ckIP(cudaMallocHost(&s.hostIdx, n*sizeof(int)), "pinned changed indices");
         }
-        ckIP(cudaMemcpy(s.b2.data(), b2h, n*sizeof(scalar), cudaMemcpyHostToDevice), "b2 up");
-    }
-    else
-    {
-        if (s.prevA12.size() != n)
+        const label* const kindh = s.hostKind.data();
+        const scalar* const thetah = s.hostTheta.data();
+        if (b2Full)
         {
-            s.prevA12.resize(n);
-            s.changedVal.resize(n);
-            s.changedIdx.resize(n);
-            s.changedCount.resize(1);
-            s.a12Valid = false;
-        }
-        ckIP(cudaMemsetAsync(s.changedCount.data(), 0, sizeof(int), cudaStreamPerThread), "changed count zero");
-        caChangedKernel<<<nBlocks(s.n), TPB>>>(
-            s.n, s.a12.data(), s.prevA12.data(), s.a12Valid ? 0 : 1, s.changedCount.data(), s.changedIdx.data(),
-            s.changedVal.data());
-        ckIP(cudaGetLastError(), "contact angle: the faces whose a12 moved");
-        int m = 0;
-        ckIP(cudaMemcpy(&m, s.changedCount.data(), sizeof(int), cudaMemcpyDeviceToHost), "changed count down");
-        s.a12Valid = true;
-        if (m > 0)
-        {
-            ckIP(cudaMemcpy(s.hostIdx, s.changedIdx.data(), static_cast<std::size_t>(m)*sizeof(int),
-                            cudaMemcpyDeviceToHost), "changed indices down");
-            ckIP(cudaMemcpy(s.hostA12, s.changedVal.data(), static_cast<std::size_t>(m)*sizeof(scalar),
-                            cudaMemcpyDeviceToHost), "changed a12 down");
+            ckIP(cudaMemcpy(s.hostA12, s.a12.data(), n*sizeof(scalar), cudaMemcpyDeviceToHost), "a12 down");
             const scalar* const a12h = s.hostA12;
             scalar* const b2h = s.hostB2;
-            const int* const idxh = s.hostIdx;
+            const long nl = static_cast<long>(n);
             #pragma omp parallel for schedule(static)
-            for (int j = 0; j < m; ++j)
+            for (long i = 0; i < nl; ++i)
             {
-                const int i = idxh[j];
-                b2h[j] = kindh[i] == 1 ? std::cos(std::acos(a12h[j]) - thetah[i]) : scalar(0);
+                b2h[i] = kindh[i] == 1 ? std::cos(std::acos(a12h[i]) - thetah[i]) : scalar(0);
             }
-            ckIP(cudaMemcpy(s.changedVal.data(), b2h, static_cast<std::size_t>(m)*sizeof(scalar),
-                            cudaMemcpyHostToDevice), "changed b2 up");
-            caScatterKernel<<<(m + TPB - 1)/TPB, TPB>>>(m, s.changedIdx.data(), s.changedVal.data(), s.b2.data());
-            ckIP(cudaGetLastError(), "contact angle: the changed b2");
+            ckIP(cudaMemcpy(s.b2.data(), b2h, n*sizeof(scalar), cudaMemcpyHostToDevice), "b2 up");
+        }
+        else
+        {
+            if (s.prevA12.size() != n)
+            {
+                s.prevA12.resize(n);
+                s.changedVal.resize(n);
+                s.changedIdx.resize(n);
+                s.changedCount.resize(1);
+                s.a12Valid = false;
+            }
+            ckIP(cudaMemsetAsync(s.changedCount.data(), 0, sizeof(int), cudaStreamPerThread), "changed count zero");
+            caChangedKernel<<<nBlocks(s.n), TPB>>>(
+                s.n, s.a12.data(), s.prevA12.data(), s.a12Valid ? 0 : 1, s.changedCount.data(), s.changedIdx.data(),
+                s.changedVal.data());
+            ckIP(cudaGetLastError(), "contact angle: the faces whose a12 moved");
+            int m = 0;
+            ckIP(cudaMemcpy(&m, s.changedCount.data(), sizeof(int), cudaMemcpyDeviceToHost), "changed count down");
+            s.a12Valid = true;
+            if (m > 0)
+            {
+                ckIP(cudaMemcpy(s.hostIdx, s.changedIdx.data(), static_cast<std::size_t>(m)*sizeof(int),
+                                cudaMemcpyDeviceToHost), "changed indices down");
+                ckIP(cudaMemcpy(s.hostA12, s.changedVal.data(), static_cast<std::size_t>(m)*sizeof(scalar),
+                                cudaMemcpyDeviceToHost), "changed a12 down");
+                const scalar* const a12h = s.hostA12;
+                scalar* const b2h = s.hostB2;
+                const int* const idxh = s.hostIdx;
+                #pragma omp parallel for schedule(static)
+                for (int j = 0; j < m; ++j)
+                {
+                    const int i = idxh[j];
+                    b2h[j] = kindh[i] == 1 ? std::cos(std::acos(a12h[j]) - thetah[i]) : scalar(0);
+                }
+                ckIP(cudaMemcpy(s.changedVal.data(), b2h, static_cast<std::size_t>(m)*sizeof(scalar),
+                                cudaMemcpyHostToDevice), "changed b2 up");
+                caScatterKernel<<<(m + TPB - 1)/TPB, TPB>>>(m, s.changedIdx.data(), s.changedVal.data(), s.b2.data());
+                ckIP(cudaGetLastError(), "contact angle: the changed b2");
+            }
         }
     }
     caContactKernel<<<nBlocks(s.n), TPB>>>(
