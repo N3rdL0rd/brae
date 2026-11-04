@@ -312,6 +312,18 @@ int main(int argc, char *argv[])
 
             mixture.correct();
 
+            // ---- ORACLE INSTRUMENTATION (tools/mgpu_oracle): what the alpha step hands to momentum/pressure
+            if (braeOracleStep())
+            {
+                surfaceScalarField("oNHatf.dump", mixture.nHatf()).write();
+                volScalarField("oSigmaK.dump", mixture.sigmaK()()).write();
+                volScalarField("oAlphaEnd.dump", alpha1).write();
+                surfaceScalarField("oAlphaPhi10End.dump", alphaPhi10).write();
+                surfaceScalarField("oRhoPhi.dump", rhoPhi).write();
+                volScalarField("oRhoEnd.dump", rho).write();
+                surfaceScalarField("oPhiEntry.dump", phi).write();
+            }
+
             if (pimple.frozenFlow())
             {
                 continue;
@@ -332,6 +344,22 @@ int main(int argc, char *argv[])
         }
 
         runTime.write();
+
+        // ---- ORACLE INSTRUMENTATION (tools/mgpu_oracle): write the full state at chosen step indices
+        // (BRAE_WRITE_ITERS="1,20") and stop after step BRAE_STOP_ITER, so serial and -parallel runs
+        // end on the same step whatever adjustTimeStep does with deltaT.
+        {
+            const char* stopEnv = getenv("BRAE_STOP_ITER");
+            const bool stopNow = stopEnv && runTime.timeIndex() >= atoi(stopEnv);
+            if (stopNow)
+            {
+                runTime.writeAndEnd();
+            }
+            else if (braeInList("BRAE_WRITE_ITERS") && !runTime.writeTime())
+            {
+                runTime.writeNow();
+            }
+        }
 
         runTime.printExecutionTime(Info);
     }

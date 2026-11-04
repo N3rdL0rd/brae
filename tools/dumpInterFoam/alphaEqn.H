@@ -149,6 +149,14 @@
         // Cache the upwind-flux
         talphaPhi1Corr0 = talphaPhi1UD;
 
+        // ---- ORACLE INSTRUMENTATION: the semi-implicit upwind predictor's alpha and flux ----
+        if (braeOracleStep())
+        {
+            surfaceScalarField("oAlphaPhiUD.dump", talphaPhi1Corr0()).write();
+            volScalarField("oAlphaPredictor.dump", alpha1).write();
+        }
+        // ------------------------------------------------------------------------------------
+
         alpha2 = 1.0 - alpha1;
 
         mixture.correct();
@@ -180,6 +188,19 @@
             tmp<surfaceScalarField> talphaPhi1Corr(alphaPhiUn - alphaPhi10);
             volScalarField alpha10("alpha10", alpha1);
 
+            // ---- ORACLE INSTRUMENTATION: the unlimited MULESCorr inputs, one set per alpha corrector ----
+            if (braeOracleStep())
+            {
+                const Foam::word sfxM = "a" + Foam::name(aCorr);
+                surfaceScalarField("oPhir" + sfxM + ".dump", phir).write();
+                surfaceScalarField("oPhic" + sfxM + ".dump", phic).write();
+                surfaceScalarField("oAlphaPhiUn" + sfxM + ".dump", alphaPhiUn).write();
+                surfaceScalarField("oAlphaPhi10Pre" + sfxM + ".dump", alphaPhi10).write();
+                surfaceScalarField("oAlphaPhiCorrUnlim" + sfxM + ".dump", talphaPhi1Corr()).write();
+                volScalarField("oAlphaPreCorr" + sfxM + ".dump", alpha1).write();
+            }
+            // ---------------------------------------------------------------------------------------------
+
             MULES::correct
             (
                 geometricOneField(),
@@ -191,6 +212,17 @@
                 oneField(),
                 zeroField()
             );
+
+            // ---- ORACLE INSTRUMENTATION (tools/mgpu_oracle): writes only, gated on BRAE_ORACLE_ITERS ----
+            // MULESCorr's limited correction flux; lambda_eff = phiCorrLim/phiCorrUnlim face by face
+            // (MULES::correct scales the correction by its limiter lambda, in place).
+            if (braeOracleStep())
+            {
+                const Foam::word sfxM = "a" + Foam::name(aCorr);
+                surfaceScalarField("oAlphaPhiCorrLim" + sfxM + ".dump", talphaPhi1Corr()).write();
+                volScalarField("oAlphaCorr" + sfxM + ".dump", alpha1).write();
+            }
+            // ---------------------------------------------------------------------------------------------
 
             // Under-relax the correction for all but the 1st corrector
             if (aCorr == 0)
