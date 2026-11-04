@@ -65,6 +65,13 @@ to the host-driven loops — same iteration counts, residual histories and solut
 solve's graph cache is keyed on the same identity as the single-GPU one plus the processor interface and the halo plan.
 `tests/test_dist_solvers.cu` compares the two arms under `BRAE_COMM=nccl` (7 PCG and 7 Gauss-Seidel configurations per
 problem/decomposition, including maxIter caps, relTol, minIter and an already-converged start).
+They need a driver that supports CUDA 12.4 or newer (conditional graph nodes); where that is missing —
+the DGX-1 V100 nodes' driver 535 = CUDA 12.2 — `braeCondGraphsAvailable()` is false and every decomposed solve takes the
+host-driven loops, as `BRAE_COND_GRAPH=0` forces. The NCCL communicators are process-lifetime and deliberately leaked at
+exit: after WHILE graphs have run on the graph communicator, NCCL's `ncclCommDestroy`/`Abort` can wait forever for a
+global quiescence (measured at np=2 on one shared GPU), so the captured graphs are destroyed first (a registry in
+`proc_hooks.cuh`) and the communicators are left to the process teardown.
+
 
 ## Tools and tests
 
