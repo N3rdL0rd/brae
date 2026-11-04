@@ -646,6 +646,36 @@ scalar deviceInterPressureStep(
                                 knobs.corrScaling, minIter);
             timedPart.reset();
         }
+        else if (proc && (gamg || pcgGamg))
+        {
+            // The case's GAMG/PCG-with-GAMG is a serial V-cycle in this port. On a decomposed mesh the
+            // distributed AMG-PCG carries the processor interface in every product and reduction.
+            if (!in.amgPcg)
+            {
+                throw std::runtime_error(
+                    "brae interFoam device pressure step: a decomposed GAMG entry needs the distributed "
+                    "AMG-PCG cache; the case's serial GAMG cannot carry processor faces.");
+            }
+            AMGData& amg = in.amgPcg->get(dm.addressingId);
+            amgGalerkin(amg, diagC, P.upper, P.lower);
+            const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
+            const DeviceAlphaSolverControls& distSv = lastPass ? in.solve : in.solveInner;
+            perf = deviceAMGPCG(A, amg, b, p_rgh, nf, distSv.tol, distSv.relTol, distSv.maxIter,
+                                /*graph=*/false, amgPcgKnobs().checkEvery, /*corrScaling=*/false,
+                                gamg ? gamg->minIter : 0);
+        }
+        else if (proc && pcgDIC)
+        {
+            // The case's DIC-PCG has the same distributed matrix view as the AMG path. Keep its own
+            // preconditioner and stopping controls rather than substituting the serial DIC on a partial matrix.
+            if (!in.dic)
+            {
+                throw std::runtime_error(
+                    "brae interFoam device pressure step: a decomposed PCG with DIC needs the DIC schedule.");
+            }
+            const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
+            perf = deviceDICPCG(A, b, p_rgh, nf, sv.tol, sv.relTol, sv.maxIter, 0, *in.dic);
+        }
         else if (gamg)
         {
             if (!in.dic || !in.gamgCache)
