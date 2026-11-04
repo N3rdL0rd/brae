@@ -138,19 +138,12 @@ int main(int argc, char** argv)
                     sweep.push_back(argv[j]);
                 if (!sweep.empty()) return braesweep::runSweepCases(sweep);
             }
-        // -parallel (the OpenFOAM convention): the distributed DEVICE path, one rank per GPU.
-        //   mpirun -np N brae -case <dir> -parallel
-        // Gated on the flag rather than on Pstream::nProcs() so a plain `brae -case ...` never initialises
-        // MPI -- which also keeps the -cases fork orchestrator above clear of it.
-        // -parallel (multi-GPU) is OUT OF SCOPE; the distributed solver lives in legacy/ and is not built.
-        // REFUSE rather than fall through to the single-GPU path: under `mpirun -np N` that would run N
-        // redundant identical solves, each writing over the others' time directories.
-        for (int i = 1; i < argc; ++i)
-            if (std::string(argv[i]) == "-parallel")
-                throw std::runtime_error(
-                    "brae: -parallel (multi-GPU) is not supported in this build. The distributed solver was "
-                    "moved to legacy/ and is out of scope; see legacy/README.md. Run brae single-GPU without "
-                    "-parallel (and without mpirun).");
+        // -parallel (the OpenFOAM convention) belongs to the solvers that read a decomposed case:
+        // brae_interFoam takes `-parallel [-rank N -nprocs M]` (processor<rank>/, common/case_roots.cuh).
+        // This executable's own steady solvers do not, so the refusal is below, AFTER dispatchSolver has
+        // handed an interFoam case on with its arguments. The distributed simpleFoam lives in legacy/ and is
+        // not built. REFUSE rather than fall through to the single-GPU path: under `mpirun -np N` that would
+        // run N redundant identical solves, each writing over the others' time directories.
         std::string caseDir = ".";
         bool partition = false;                              // -partition: build mesh + AMG caches, then exit (no solve)
         for (int i = 1; i < argc; ++i)
@@ -160,6 +153,8 @@ int main(int argc, char** argv)
                 caseDir = argv[++i];
             else if (a == "-partition")
                 partition = true;
+            else if (a == "-rank" || a == "-nprocs")
+                ++i;                                         // the value is not a case directory
             else if (a[0] != '-')
                 caseDir = a;
         }
@@ -168,6 +163,12 @@ int main(int argc, char** argv)
         // read or CUDA init. -partition is solver-agnostic prep (mesh + AMG cache) and always runs here.
         // Registry + rules: solvers/common/solver_dispatch.cuh.
         if (!partition) dispatchSolver(caseDir, argc, argv);
+        for (int i = 1; i < argc; ++i)
+            if (std::string(argv[i]) == "-parallel")
+                throw std::runtime_error(
+                    "brae: -parallel (multi-GPU) is not supported for this solver. The distributed solver was "
+                    "moved to legacy/ and is out of scope; see legacy/README.md. Only `application interFoam` "
+                    "reads a decomposed case (`-parallel`). Run brae single-GPU without -parallel (and without mpirun).");
 
         // The REBUILT simpleFoam (UEqn.cu + pEqn.cu + simpleFoam.cu), selected with BRAE_SIMPLEFOAM_V2=1.
         // It covers a strict subset of what the code below runs, so it is opt-in -- but once selected it

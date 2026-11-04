@@ -184,6 +184,8 @@ struct Services
     const std::vector<FvPatch>*                        patches = nullptr;
     const std::map<std::string, std::vector<label>>*   cellZones = nullptr;
     Source                                             src;
+    // false on every rank but 0 under -parallel: OpenFOAM writes postProcessing/ from the master alone
+    bool                                               isMaster = true;
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -776,11 +778,13 @@ class DatFile
 {
 public:
     DatFile() = default;
-    DatFile(std::string dir, std::string file) : dir_(std::move(dir)), file_(std::move(file)) {}
+    DatFile(std::string dir, std::string file, bool enabled = true)
+      : dir_(std::move(dir)), file_(std::move(file)), enabled_(enabled) {}
 
     void header(const std::string& line) { head_.push_back(line); }
     void row(const std::string& line)
     {
+        if (!enabled_) return;   // a rank that is not the master keeps no file
         if (!os_.is_open())
         {
             std::filesystem::create_directories(dir_);
@@ -800,6 +804,7 @@ public:
 
 private:
     std::string               dir_, file_;
+    bool                      enabled_ = true;
     std::vector<std::string>  head_;
     std::ofstream             os_;
 };
@@ -819,6 +824,11 @@ public:
     std::map<std::string, std::map<std::string, scalar>> results;        // object -> "operation(field)" -> value
 
     std::size_t nCells() const { return svc.geom->V().size(); }
+
+    DatFile datFile(const std::string& object, const std::string& file) const
+    {
+        return DatFile(dir(object), file, svc.isMaster);
+    }
 
     std::string dir(const std::string& object) const
     {
@@ -1218,7 +1228,7 @@ public:
         {
             return;
         }
-        dat_ = DatFile(rt.dir(name), "volFieldValue.dat");
+        dat_ = rt.datFile(name, "volFieldValue.dat");
         dat_.header("# Region type : " + region_.description);
         dat_.header("# Cells       : " + std::to_string(region_.n));
         dat_.header("# Volume      : " + fmtNum(region_.volume, rt.svc.precision));
@@ -1378,7 +1388,7 @@ public:
         {
             return;
         }
-        dat_ = DatFile(rt.dir(name), "surfaceFieldValue.dat");
+        dat_ = rt.datFile(name, "surfaceFieldValue.dat");
         dat_.header("# Region type : patch " + patchName_);
         dat_.header("# Faces       : " + std::to_string(nFaces_));
         dat_.header("# Area        : " + fmtNum(area_, rt.svc.precision));
@@ -1611,7 +1621,7 @@ public:
         }
         for (const std::string& f : fields_)
         {
-            DatFile df(rt.dir(name), f);
+            DatFile df = rt.datFile(name, f);
             for (std::size_t i = 0; i < points_.size(); ++i)
             {
                 df.header("# Probe " + std::to_string(i) + " (" + fmtNum(points_[i].x, rt.svc.precision) + " "
@@ -1689,7 +1699,7 @@ public:
             }
         }
         refuseKey(d, name, "location", "only the default (location written) is ported");
-        dat_ = DatFile(rt.dir(name), "fieldMinMax.dat");
+        dat_ = rt.datFile(name, "fieldMinMax.dat");
         dat_.header("# Field minima and maxima");
         dat_.header("# Time          field           min             location(min)           processor       "
                     "max             location(max)           processor");
@@ -2074,7 +2084,8 @@ inline std::shared_ptr<FunctionObjectList> createFunctionObjects(
     const std::map<std::string, std::vector<label>>&  zones,
     const std::string&                                phaseField,
     bool                                              meshChanges,
-    const Source&                                     src)
+    const Source&                                     src,
+    bool                                              isMaster)
 {
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
     Services s;
@@ -2087,6 +2098,7 @@ inline std::shared_ptr<FunctionObjectList> createFunctionObjects(
     s.patches = &patches;
     s.cellZones = &zones;
     s.src = src;
+    s.isMaster = isMaster;
     std::shared_ptr<FunctionObjectList> list = FunctionObjectList::read(controlDict, s);
     if (list && meshChanges)
     {

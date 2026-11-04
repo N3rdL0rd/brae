@@ -419,7 +419,7 @@ void interMeshUpdate(
 
 
 RunReport runInterFoam(
-    const std::string& caseDir,
+    const CaseRoots& roots,
     const std::string& startDir,
     const PrimitiveMesh& m,
     const FvGeometry& g,
@@ -433,7 +433,7 @@ RunReport runInterFoam(
     AlphaTaps* alphaTaps,
     InterWriter* writer)
 {
-    InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
+    InterFields f = buildInterFields(roots, startDir, m, g, patches);
     if (writer)
     {
         registerUnwritten(*writer, f, patches);
@@ -873,8 +873,8 @@ RunReport runInterFoam(
             foPatch = f.alpha1.boundary[pi]->value();
             return foPatch;
         };
-        fos = brae::fo::createFunctionObjects(caseDir, startDir, m, g, patches, f.cellZones, f.alphaName,
-                                              f.meshIsDynamic, src);
+        fos = brae::fo::createFunctionObjects(roots.dictDir, startDir, m, g, patches, f.cellZones, f.alphaName,
+                                              f.meshIsDynamic, src, roots.isMaster());
     }
     SurfaceScalarField alphaPhi10Write;
     // alpha.<phase1>_0 of a sub-cycled alpha: alpha as the step found it, taken only on a write step

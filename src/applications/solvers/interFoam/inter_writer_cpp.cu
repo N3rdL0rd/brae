@@ -1517,16 +1517,16 @@ void volPatch(
 
 
 InterWriter::InterWriter(
-    const std::string& caseDir,
+    const CaseRoots& roots,
     const std::string& startDir,
     const std::vector<FvPatch>& patches,
     const std::string& phase1Name)
-  : caseDir_(caseDir),
+  : outRoot_(roots.procDir),
     startDir_(startDir),
     patches_(patches),
     phase1_(phase1Name)
 {
-    const FoamDict cd = readDict(caseDir + "/system/controlDict");
+    const FoamDict cd = readDict(roots.dictDir + "/system/controlDict");
 
     // Time::writeControlNames (Time.C:63-73). clockTime and cpuTime write on elapsed seconds, which no two
     // runs share; brae does not implement them and says so rather than never writing.
@@ -2444,7 +2444,7 @@ void InterWriter::write(const InterWriteState& s)
         }
     }
 
-    const std::string dir = caseDir_ + "/" + name;
+    const std::string dir = outRoot_ + "/" + name;
     pending_.clear();
 
     // uniform/time first, always ascii and never compressed (TimeIO.C:508-539)
@@ -3462,7 +3462,7 @@ void InterWriter::write(const InterWriteState& s)
     written_.push_back(name);
     while (purge_ > 0 && static_cast<int>(written_.size()) > purge_)
     {
-        job->remove.push_back(caseDir_ + "/" + written_.front());
+        job->remove.push_back(outRoot_ + "/" + written_.front());
         written_.pop_front();
     }
     if (inStep)

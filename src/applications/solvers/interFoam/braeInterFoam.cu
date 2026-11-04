@@ -194,6 +194,7 @@
 #include "fv_patch.cuh"
 #include "inter_driver_cpp.cuh"
 #include "start_time.cuh"
+#include "case_roots.cuh"
 #include "time_instances.cuh"
 #include "foam_dict.cuh"
 #include <cstdio>
@@ -209,6 +210,8 @@ int main(int argc, char** argv)
     // before any CUDA call: see device_schedule.cuh
     brae::setCudaSchedule();
     bool onDevice = false;
+    bool parallel = false;
+    int rankFlag = -1, nProcsFlag = -1;
     std::string caseDir = ".";
     // WHAT `brae` HANDS ON IS WHAT THIS TAKES: the launcher forwards its own arguments unchanged
     // (solver_dispatch.cuh), and a user may have typed the case as `-case <dir>` or as a bare directory. A bare
@@ -226,14 +229,29 @@ int main(int argc, char** argv)
         {
             onDevice = true;
         }
+        else if (a == "-parallel")
+        {
+            parallel = true;
+        }
+        else if ((a == "-rank" || a == "-nprocs") && i + 1 < argc)
+        {
+            char* end = nullptr;
+            const long v = std::strtol(argv[i + 1], &end, 10);
+            (a == "-rank" ? rankFlag : nProcsFlag) = (end != argv[i + 1] && *end == '\0' && v >= 0) ? (int)v : -2;
+            ++i;
+        }
         else if (a == "-help" || a == "--help" || a == "-h")
         {
             std::printf("brae_interFoam: OpenFOAM's interFoam, re-ported.\n"
-                        "  usage: brae_interFoam [-case] <dir> [-device]\n"
+                        "  usage: brae_interFoam [-case] <dir> [-device] [-parallel [-rank N -nprocs M]]\n"
                         "    -device  run the time loop on the GPU (runInterFoamDevice). The same\n"
                         "             components and the same case translation; the boundary\n"
                         "             conditions stay on the host. Without it the HOST loop runs: the\n"
                         "             reference the gates hold to OpenFOAM, on one core.\n"
+                        "    -parallel  read decomposePar's processor<rank>/ of the case: dictionaries from the\n"
+                        "             case, mesh, fields and output from the rank's directory. Rank and size come\n"
+                        "             from mpirun's environment, or from -rank N -nprocs M. A decomposition with\n"
+                        "             processor faces is refused until the multi-GPU coupling lands.\n"
                         "  `brae <dir>` on a case whose controlDict says `application interFoam` runs\n"
                         "  this binary with -device.\n");
             return 0;
@@ -259,7 +277,14 @@ int main(int argc, char** argv)
                 "the option `" + unknownOption + "` is not one this solver takes. It takes `-case <dir>` or a "
                 "bare case directory, and `-device` for the GPU loop.");
         }
-        const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+        if (rankFlag == -2 || nProcsFlag == -2)
+        {
+            throw std::runtime_error("`-rank` and `-nprocs` take a non-negative integer.");
+        }
+        // the dictionary root (the case) and the rank's root (processor<rank> under -parallel, the case itself
+        // otherwise): common/case_roots.cuh
+        const CaseRoots roots = makeCaseRoots(caseDir, parallel, rankFlag, nProcsFlag);
+        const FoamDict controlDict = readDict(roots.dictDir + "/system/controlDict");
         // THE ENTRIES Time READS, AS Time READS THEM (Time.C:146-190, TimeIO.C:268-356). `deltaT` is
         // mandatory -- it defaulted to 1e-3 here; `startFrom` defaults to latestTime -- it defaulted to
         // startTime, so a case without the entry restarted from 0 over its own output; any other word than
@@ -312,10 +337,10 @@ int main(int argc, char** argv)
         // the probe is the case's OWN phase field: `alpha.water` here sent a `startFrom latestTime` restart
         // of any other phase name (hifoam's alpha.liquidN2) silently back to startTime, where the writer
         // would then overwrite and purge the run's own output
-        const std::string phase1 = cpu::twoPhase::readTransportProperties(caseDir).phase1Name;
+        const std::string phase1 = cpu::twoPhase::readTransportProperties(roots.dictDir).phase1Name;
         const std::string alphaProbe = "alpha." + phase1;
         const std::string startName =
-            resolveStartTime(caseDir, startFrom, startBuf, alphaProbe.c_str());
+            resolveStartTime(roots.masterProcDir(), startFrom, startBuf, alphaProbe.c_str());
         const scalar startTime = static_cast<scalar>(std::strtod(startName.c_str(), nullptr));
 
         // WHICH TIME DIRECTORY THE MESH COMES FROM, which is a search and not a path: a run that refined or
@@ -323,14 +348,22 @@ int main(int argc, char** argv)
         // boundary separately (cpu::timePaths::meshInstances, mirroring polyMesh.C:175-245). This used to be
         // `constant/polyMesh` in four places, so a genuine restart read the mesh the case STARTED from.
         const cpu::timePaths::MeshInstances mi =
-            cpu::timePaths::meshInstancesForStartDir(caseDir, caseDir + "/" + startName);
+            cpu::timePaths::meshInstancesForStartDir(roots.procDir, roots.procDir + "/" + startName);
         if (mi.points != "constant" || mi.faces != "constant")
         {
             std::fprintf(stderr, "brae: mesh instances -- points '%s', faces '%s', boundary '%s'\n",
                          mi.points.c_str(), mi.faces.c_str(), mi.boundary.c_str());
         }
         PrimitiveMesh m;
-        m.read(mi.pointsDir(caseDir), mi.facesDir(caseDir), mi.boundaryDir(caseDir));
+        m.read(mi.pointsDir(roots.procDir), mi.facesDir(roots.procDir), mi.boundaryDir(roots.procDir));
+        // a decomposed case's processor patches are not coupled yet: stop rather than solve each piece as a closed tank
+        for (const PatchInfo& pp : m.patches())
+        {
+            if (pp.type == "processor" && pp.size > 0)
+            {
+                throw std::runtime_error("processor patch '" + pp.name + "' needs the multi-GPU coupling, not yet implemented.");
+            }
+        }
         FvGeometry g;
         g.build(m);
         // mirrorACMI: this loop couples a coincident cyclicACMI pair itself; the device loop, handed the
@@ -354,7 +387,7 @@ int main(int argc, char** argv)
         // beside its faces (DeviceCyclic's CyclicNbr) and reads the neighbour the host does.
         // the BOUNDARY instance: the AMI entries are read from polyMesh/boundary, which polyMesh
         // resolves separately from the faces and never older than them
-        amiPairs = cpu::cyclicAMIFvPatch::setup(mi.boundaryDir(caseDir), m, g, patches);
+        amiPairs = cpu::cyclicAMIFvPatch::setup(mi.boundaryDir(roots.procDir), m, g, patches);
         // ...handed to the host loop mutable as well, for a case whose mesh moves (MutableMesh)
         MutableMesh mutableMesh;
         mutableMesh.m = &m;
@@ -366,7 +399,7 @@ int main(int argc, char** argv)
         // The start directory OpenFOAM would use. `0` is written as `0` and not `0.000000`, which is what
         // every tutorial ships -- and under `startFrom latestTime` it is the directory resolveStartTime
         // found, whose NAME is what OpenFOAM's timeName() would be (so `0.002` and not `0.0020000`).
-        const std::string startDir = caseDir + "/" + startName;
+        const std::string startDir = roots.procDir + "/" + startName;
 
         // An upper bound on the steps, and endTime below is the REAL bound. A fixed-step case needs
         // exactly (end-start)/dt; an adjustTimeStep case cannot be counted ahead of time, because
@@ -393,14 +426,14 @@ int main(int argc, char** argv)
         std::printf("%s", hostAllocatorNotice.c_str());
 
         // the time directories, at OpenFOAM's write times (inter_writer_cpp.cuh)
-        cpu::interFoam::InterWriter writer(caseDir, startDir, patches, phase1);
+        cpu::interFoam::InterWriter writer(roots, startDir, patches, phase1);
 
         // ONE case translation and ONE time loop per path, both the ones the gates call. A private
         // copy here would be the defect this file's header names.
         const RunReport r = onDevice
-            ? runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
+            ? runInterFoamDevice(roots, startDir, m, g, patches, nSteps, /*verbose=*/true,
                                  /*fieldsOut=*/nullptr, endTime, /*tapsOut=*/nullptr, &mutableMesh, &writer)
-            : runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
+            : runInterFoam(roots, startDir, m, g, patches, nSteps, /*verbose=*/true,
                            /*fieldsOut=*/nullptr, endTime, /*pressureTaps=*/nullptr, &mutableMesh,
                            /*alphaTaps=*/nullptr, &writer);
 

@@ -22,6 +22,7 @@
 // and only the output of which is incomplete -- and every refused file is named at construction so a long
 // run is not lost silently.
 #pragma once
+#include "case_roots.cuh"
 #include "cf_types.cuh"
 #include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "foam_dict.cuh"
@@ -136,7 +137,7 @@ public:
     // writeControl brae cannot honour (clockTime, cpuTime, an unknown word) and a missing or invalid
     // writeInterval, where OpenFOAM stops too (TimeIO.C:284-297).
     InterWriter(
-        const std::string& caseDir,
+        const CaseRoots& roots,
         const std::string& startDir,
         const std::vector<FvPatch>& patches,
         const std::string& phase1Name);
@@ -283,7 +284,7 @@ private:
         const std::string& text,
         bool compressible) const;
 
-    std::string caseDir_;
+    std::string outRoot_;   // where the time directories are written (and purged): CaseRoots::procDir
     std::string startDir_;
     const std::vector<FvPatch>& patches_;
     std::string phase1_;

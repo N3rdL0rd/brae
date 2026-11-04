@@ -603,7 +603,7 @@ void updateVelocityPatches(GeometricField<vector>& U, const std::vector<FvPatch>
 
 
 RunReport runInterFoamDevice(
-    const std::string& caseDir,
+    const CaseRoots& roots,
     const std::string& startDir,
     const PrimitiveMesh& m,
     const FvGeometry& g,
@@ -619,7 +619,7 @@ RunReport runInterFoamDevice(
     // the pressure hierarchy's small-mesh rule (device_amg.cu, amgMergeFor): two coarsening passes a level on a
     // fine grid of 10,000 cells or fewer
     amgMergeSmallMeshes(10000);
-    InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
+    InterFields f = buildInterFields(roots, startDir, m, g, fvp);
     if (writer)
     {
         registerUnwritten(*writer, f, fvp);
@@ -1282,7 +1282,7 @@ RunReport runInterFoamDevice(
     // one hierarchy build a changed mesh, shared by pcorr's solve and p_rgh's (AmgHierarchyMemo)
     AmgHierarchyMemo amgHierarchyMemo;
     DevicePcorrSolver pcorrSolver;
-    pcorrSolver.caseDir = caseDir;
+    pcorrSolver.caseDir = roots.procDir;   // the AMG cache lives with the mesh it was built for
     pcorrSolver.amgMemo = &amgHierarchyMemo;
     // a mesh that moves and does not refine keeps its topology, so pcorr's hierarchy is built once: the case
     // for its smoothed-aggregation hierarchy (DevicePcorrSolver::fixedTopology)
@@ -5708,7 +5708,7 @@ RunReport runInterFoamDevice(
     DeviceAmgPcgCache amgPcgCache;
     amgPcgCache.mesh = &m;
     amgPcgCache.geometry = &g;
-    amgPcgCache.caseDir = caseDir;
+    amgPcgCache.caseDir = roots.procDir;
     amgPcgCache.memo = &amgHierarchyMemo;
     C.amgPcg = &amgPcgCache;
     C.gamgLog = &gamgLog;
@@ -6075,8 +6075,8 @@ RunReport runInterFoamDevice(
                 return true;
             };
         }
-        fos = brae::fo::createFunctionObjects(caseDir, startDir, m, g, fvp, f.cellZones, f.alphaName,
-                                              f.meshIsDynamic, src);
+        fos = brae::fo::createFunctionObjects(roots.dictDir, startDir, m, g, fvp, f.cellZones, f.alphaName,
+                                              f.meshIsDynamic, src, roots.isMaster());
     }
     DeviceBuffer<scalar> dAlphaPhiWriteI, dAlphaPhiWriteB, dAlphaPhiWriteIf;
     // alpha.<phase1>_0 of a sub-cycled alpha: alpha as the step found it, downloaded only on a write step

@@ -946,12 +946,15 @@ std::vector<ClaimedTangentialVelocity> claimTangentialVelocity(
 }   // namespace
 
 
-InterFields buildInterFields(const std::string&          caseDir,
+InterFields buildInterFields(const CaseRoots&            roots,
                              const std::string&          startDir,
                              const PrimitiveMesh&        m,
                              const FvGeometry&           g,
                              const std::vector<FvPatch>& patches)
 {
+    // The dictionaries (system/, constant/<dictionary>) are the case's; the mesh, its zones and every field
+    // are the rank's (processor<rank> under -parallel, the case itself otherwise).
+    const std::string& caseDir = roots.dictDir;
     InterFields f;
     const label nC = m.nCells();
 
@@ -1357,8 +1360,8 @@ InterFields buildInterFields(const std::string&          caseDir,
         // that starts from rest the two are the same directory; on a genuine restart of a refined or moved
         // mesh they are not, and reading constant/ then gives the START mesh's zones for the mesh the run
         // is actually on -- or none at all.
-        const cpu::timePaths::MeshInstances mi = cpu::timePaths::meshInstancesForStartDir(caseDir, startDir);
-        const std::string facesPolyMeshDir = mi.facesDir(caseDir);
+        const cpu::timePaths::MeshInstances mi = cpu::timePaths::meshInstancesForStartDir(roots.procDir, startDir);
+        const std::string facesPolyMeshDir = mi.facesDir(roots.procDir);
         f.cellZones = readCellZones(facesPolyMeshDir);
         f.amr = std::make_shared<InterAmr>(readInterAmr(caseDir, facesPolyMeshDir, m, patches, g));
         // ...and the change carries them: it renumbers this copy, and the driver reads it back so the

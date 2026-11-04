@@ -38,6 +38,7 @@
 #include "inter_cn_restart.cuh"
 #include "MRF_cpp.cuh"
 #include "cf_types.cuh"
+#include "case_roots.cuh"
 #include "foam_dict.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -446,7 +447,7 @@ void updateMixtureBoundary(
     const std::vector<FvPatch>& patches,
     MixturePatches which = MixturePatches::all);
 
-InterFields buildInterFields(const std::string&          caseDir,
+InterFields buildInterFields(const CaseRoots&            roots,
                              const std::string&          startDir,
                              const PrimitiveMesh&        m,
                              const FvGeometry&           g,
