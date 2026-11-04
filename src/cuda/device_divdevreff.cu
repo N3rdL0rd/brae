@@ -411,7 +411,6 @@ void deviceDivDevReff(
     DeviceBuffer<scalar>& srcZ,
     const DeviceCyclic* cyc,
     const DeviceAMI* ami,
-    const DeviceProcStress* proc,
     const DeviceBuffer<scalar>* const* UbStored,
     scalar gradULimitK,
     bool gradULeastSq,
@@ -420,14 +419,14 @@ void deviceDivDevReff(
 {
     const int nC = dm.nCells, nB = dm.nBndFaces;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
-    if (gradULeastSq && (cyc || ami || proc))
+    if (gradULeastSq && (cyc || ami))
         throw std::runtime_error("deviceDivDevReff: grad(U) leastSquares is not computed across a coupled interface.");
     const bool given = (gradUGiven != nullptr);
     if ((gradUGiven == nullptr) != (gradBGiven == nullptr))
         throw std::runtime_error(
             "deviceDivDevReff: a given grad(U) needs its cells AND the boundary gaussGrad corrected when it was "
             "formed; the caller gave one without the other.");
-    if (given && (cyc || ami || proc || gradULimitK > scalar(0) || gradULeastSq
+    if (given && (cyc || ami || gradULimitK > scalar(0) || gradULeastSq
                || gradUGiven->size() != static_cast<std::size_t>(9) * nC
                || gradBGiven->size() != static_cast<std::size_t>(9) * nB))
         throw std::runtime_error(
@@ -481,12 +480,6 @@ void deviceDivDevReff(
                 deviceCopy(bvals[i], *UbStored[i]);
             else
                 deviceBCValue(dbU.comp[i], *Uc[i], bvals[i]);
-            if (proc)   // processor faces are bcType 8: deviceBCValue leaves them, the halo supplies the value
-            {
-                proc->halo->exchange(Uc[i]->data());
-                proc->halo->scatterBoundaryValues(Uc[i]->data(), *proc->weights, *proc->procStart, bvals[i].data());
-                proc->halo->waitExchange();   // recv buffer is reused by the next component -- see device_halo.cuh
-            }
         }
         DeviceBuffer<scalar>* gxs = ws.gxs;
         DeviceBuffer<scalar>* gys = ws.gys;
@@ -564,33 +557,6 @@ void deviceDivDevReff(
     sigmaKernel<<<nBlocks(nB), TPB>>>(nB, gradB.data(), nuBnd.data(), sigmaB.data());
     cudaCheck(cudaGetLastError(), "ddr sigmaB");
 
-    // Processor faces: OVERWRITE the sigmaB just computed from dev2(T(gradB)). A cut face is interior to the
-    // global mesh, so its stress is the INTERPOLATED cell sigma (host parallelDivDevReff reads it from
-    // distributeFromCells<tensor>(sigC, P)), not a boundary-gradient stress. Doing this per tensor component
-    // keeps the exchange on the existing scalar halo. The zero is required: scatterBoundaryValues atomicAdds.
-    if (proc)
-    {
-        for (int q = 0; q < 9; ++q)
-        {
-            for (int i = 0; i < proc->halo->nInterfaces(); ++i)
-            {
-                const std::size_t n = proc->halo->size(i);
-                if (n == 0) continue;
-                cudaCheck(
-                    cudaMemsetAsync(
-                        sigmaB.data() + static_cast<std::size_t>(q) * nB + (*proc->procStart)[i],
-                        0,
-                        n * sizeof(scalar),
-                        cudaStreamPerThread),
-                    "ddr sigmaB proc zero");
-            }
-            const scalar* sigC_q = sigmaC.data() + static_cast<std::size_t>(q) * nC;
-            proc->halo->exchange(sigC_q);
-            proc->halo->scatterBoundaryValues(sigC_q, *proc->weights, *proc->procStart,
-                                              sigmaB.data() + static_cast<std::size_t>(q) * nB);
-            proc->halo->waitExchange();   // the next component reuses the recv buffer
-        }
-    }
 
     if (stageDumpActive() && stageDumpFirstOnly("ddrSigma"))
     {   // sigma = nuEff*dev2(T(grad(U))) per cell, the input to the tensor divergence. Packed 9*nC,

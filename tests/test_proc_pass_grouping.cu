@@ -37,6 +37,9 @@ void runFixture(ProcComm& comm, int rank);
 int main()
 {
     auto comms = ProcComm::createLoopback(2);
+    // DevicePool is documented single-threaded (device_buffer.cuh); this fixture runs one solver rank per host
+    // thread, so it must use raw cudaMalloc rather than the shared free list.
+    setenv("BRAE_NO_DEVICE_POOL", "1", 1);
     std::vector<std::thread> ranks;
     std::vector<int> rankBad(2, 0);
     for (int r = 0; r < 2; ++r)

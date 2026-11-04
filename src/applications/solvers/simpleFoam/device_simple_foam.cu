@@ -1410,7 +1410,7 @@ void amgFineCoeffKernel(
         if (ctl_.maxwell) deviceBCValue(dbExtrap_, nuConst_, ddrNuBnd);
         deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], ddrNuCell, ctl_.maxwell ? ddrNuBnd : nuEffBnd,
                          ddrX, ddrY, ddrZ,
-                         hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr, nullptr,
+                         hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr,
                          // null: this driver evaluates U's boundary before the assembly, so re-deriving
                          // it here is the same number. See the header (queue item 30).
                          nullptr, ctl_.gradULimitK);

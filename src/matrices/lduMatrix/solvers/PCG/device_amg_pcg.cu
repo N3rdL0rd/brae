@@ -9,7 +9,6 @@
 #include "device_blas.cuh"          // dot / axpy / reductions
 #include "proc_hooks.cuh"          // ProcComm + the hooks' channel (decomposed solves)
 #include "device_ldu.cuh"           // DeviceLduView / deviceAmul (the processor-interface hook is in deviceAmul)
-#include "device_halo.cuh"          // DeviceHalo + DeviceReducer (on-stream NVSHMEM reduce) for the distributed PCG
 #include "device_amg_detail.cuh"
 #include "device_pcg.cuh"         // normFactorOnHost, deviceReadScalar    // BRAE_HAS_GS_DEVICE, gsScaleInvK-adjacent constants + env flags + nBlocks/TPB
 #include "amg_kernels.cuh"          // zeroT<> etc. (if referenced)

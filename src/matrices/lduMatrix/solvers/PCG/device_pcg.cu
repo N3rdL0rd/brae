@@ -5,8 +5,6 @@
 #include "device_amg.cuh"   // AMGData + amgVCycleApply (the distributed AMG-PCG preconditioner)
 #include "device_amg_detail.cuh"  // BRAE_HAS_GS_DEVICE (conditional graph nodes); needs device_amg.cuh first for AMGLevel
 #include "device_blas.cuh"
-#include "device_halo.cuh"
-#include "device_reduce.cuh"   // DeviceReducer: on-stream NVSHMEM global reduction (replaces host MPI_Allreduce)
 #include "cf_pstream.cuh"
 #include <cuda_runtime.h>
 #include <map>

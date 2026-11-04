@@ -498,12 +498,6 @@ foreach(_np 1 2 4 8)
                      ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily/constant/polyMesh)
 endforeach()
 
-# Multi-GPU Phase 1a: NVSHMEM bootstrap + symmetric heap (host-side) smoke test
-# ---------------------------------------------------------------------------------------------------
-# The multi-GPU (distributed) test suite lived here, guarded by if(BRAE_WITH_NVSHMEM). It moved to
-# legacy/tests/ along with the distributed solvers -- multi-GPU is OUT OF SCOPE. See legacy/README.md.
-# Nothing in legacy/ is built or registered; do not re-add it without an explicit decision to resume.
-# ---------------------------------------------------------------------------------------------------
 
 add_executable(test_mesh_topology tests/test_mesh_topology.cu)
 target_include_directories(test_mesh_topology PRIVATE ${BRAE_HEADER_DIRS})
@@ -2162,7 +2156,7 @@ set_tests_properties(komegasstlm_flatplate PROPERTIES LABELS slow TIMEOUT 600)
 # through the single-GPU device path AND the distributed path, then compare. This is the comparison that catches
 # real AMI-coupling bugs -- the bounded-div/deferred-rot/linearUpwind-grad fixes all lived in SHARED distributed
 # code, so a np2-vs-np1 oracle passes with both ranks wrong; only distributed-vs-single-GPU exposes them. np=1 is
-# bit-exact (tol 1e-6); np=2 exercises the cross-rank NVSHMEM AMI gather (tol 1e-3, the residualControl floor).
+# bit-exact (tol 1e-6); np=2 exercises the cross-rank AMI gather over ProcComm (tol 1e-3, the residualControl floor).
 # _np(N)$ names auto-pick up PROCESSORS=N + (N>1) RESOURCE_LOCK gpu_multirank from the block below.
 foreach(_np 1 2)
     if(_np EQUAL 1)
@@ -5401,7 +5395,7 @@ add_test(NAME gpu_crossover COMMAND test_gpu_crossover ${CMAKE_CURRENT_SOURCE_DI
 # slot and launches many concurrently -> on the self-hosted SINGLE-GPU runner that oversubscribes the GPU/CPU with
 # dozens of ranks at once, the cause of the flaky failures (parallel_spmv_np2, parallel_pcg_np8 under load; each
 # passes in isolation). Setting PROCESSORS=N makes the scheduler reserve N slots per test, so it never overcommits.
-# PROCESSORS alone still allowed TWO np=2 tests to run at once under -j4 (4 ranks -> 4 CUDA/NVSHMEM contexts on the
+# PROCESSORS alone still allowed TWO np=2 tests to run at once under -j4 (4 ranks -> 4 CUDA contexts on the
 # one GPU -> intermittent init/heap-contention crash, exit 8). RESOURCE_LOCK on the np>=2 tests makes them mutually
 # exclusive (at most one multi-rank GPU test at a time); the many np=1 / single-GPU tests still parallelise freely.
 get_property(_brae_all_tests DIRECTORY PROPERTY TESTS)
@@ -5440,8 +5434,8 @@ endif()
 # rather than at install time.
 # Keep the library search path on the way out. CMake strips the build RPATH at install time and replaces it
 # with INSTALL_RPATH, which is empty by default -- so the first `cmake --install` produced binaries that could
-# not find libnvshmem_host.so.3 and failed for every user, not only under sudo. USE_LINK_PATH carries the
-# directories of the libraries actually linked (NVSHMEM, OpenMPI) into the installed binary.
+# not find the MPI/NCCL shared libraries and failed for every user, not only under sudo. USE_LINK_PATH carries the
+# directories of the libraries actually linked into the installed binary.
 foreach(exe IN ITEMS brae brae-agent brae_pimpleFoam)
     if(TARGET ${exe})
         set_target_properties(${exe} PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)

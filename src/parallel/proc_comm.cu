@@ -512,12 +512,10 @@ std::unique_ptr<HaloPlan> ProcComm::buildPlanFromPatches(int nCells, std::vector
             part[static_cast<std::size_t>(rank_)*size_ + p.nbrRank] = static_cast<int>(p.faceCells.size()) + 1;
             // +1 distinguishes "no patch" from "a patch with zero faces"
         }
-        std::vector<int> all(part.size());
-        MPI_Allreduce(part.data(), all.data(), static_cast<int>(part.size()), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-        // all[] holds, per ordered pair, this rank's announced size; compare with the transpose by allgathering
-        // the rows instead: one allgather of the full matrix is the simplest symmetric form.
-        std::vector<int> matrix(static_cast<std::size_t>(size_)*part.size());
-        MPI_Allgather(part.data(), static_cast<int>(part.size()), MPI_INT, matrix.data(), static_cast<int>(part.size()), MPI_INT, MPI_COMM_WORLD);
+        // allgather through the backend's own (bounded, abort-aware) path: loopback answers locally, MPI-host
+        // and NCCL run the bounded nonblocking allgather on the status communicator.
+        std::vector<int> matrix;
+        allgatherInts(part, matrix);
         std::string bad;
         for (int a = 0; a < size_ && bad.empty(); ++a)
             for (int b = 0; b < size_; ++b)
@@ -803,6 +801,22 @@ protected:
         g_->sync();
         for (std::size_t k = 0; k < nbr.size(); ++k) g_->mail[rank_][nbr[k]].clear();
         return recv;
+    }
+
+    void allgatherInts(const std::vector<int>& send, std::vector<int>& recv) override
+    {
+        // Every rank publishes its row in the mailbox, rendezvous, then reads all rows in rank order. recv is
+        // [rank][row-entry], exactly like the MPI backends' allgather.
+        g_->mail[rank_][rank_] = send;
+        g_->sync();
+        recv.clear();
+        for (int r = 0; r < size_; ++r)
+        {
+            const auto& row = g_->mail[r][r];
+            recv.insert(recv.end(), row.begin(), row.end());
+        }
+        g_->sync();
+        g_->mail[rank_][rank_].clear();
     }
 
     [[noreturn]] void doAbort(const std::string& msg) override

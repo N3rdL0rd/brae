@@ -6,7 +6,6 @@
 #include "proc_comm.cuh"       // ProcComm::current(): the rank in the hierarchy cache file name
 #include "proc_hooks.cuh"      // procGraphUnregister / the captured-graph registry
 #include "device_ldu.cuh"
-#include "device_halo.cuh"      // DeviceHalo + its DeviceReducer (on-stream NVSHMEM reduce)
 #include "device_amg_detail.cuh"  // shared inline primitives: safeDiag/warpReduceSum/blockDot + env-flag readers + AMG constants
 #include "device_amg_coarse.cuh"  // deviceCoarsePCG/JacobiSingleBlock (internal coarse solvers, defined in device_amg_coarse.cu)
 #include "amg_kernels.cuh"        // mixed-precision V-cycle template kernels (zeroT/smoothT/residualT/gsColorT/restrictT/prolongT)

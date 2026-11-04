@@ -55,7 +55,7 @@ Build:
 |---|---|
 | `BRAE_WITH_NCCL` (default OFF) | build the NCCL backend; `-DNCCL_ROOT=<dir with include/nccl.h and lib/libnccl.so>` (or `NCCL_HOME`, `CMAKE_PREFIX_PATH`). NCCL 2.28 or newer is recommended; a graph communicator needs `graphUsageMode=0` (set by `ProcComm`) |
 | `BRAE_NCCL_TEST_NP` | process counts of the NCCL tests, for example `"1;2;4;8"` (needs that many GPUs) |
-| `BRAE_WITH_NVSHMEM` | no longer used by the multi-GPU code; configure `OFF` on a DGX-1 |
+| NVSHMEM | removed: use `BRAE_WITH_NCCL` (or the default MPI-host backend); there is no `BRAE_WITH_NVSHMEM` option |
 
 CUDA graphs: on the NCCL backend the np > 1 AMG-PCG and symGaussSeidel loops run as ONE conditional-WHILE graph per rank
 (the halo exchange and the deterministic allgather-based reductions inside the body on the graph-only communicator, the
