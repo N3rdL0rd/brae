@@ -6284,6 +6284,10 @@ RunReport runInterFoamDevice(
         std::vector<scalar> r(contErrQueued.size());
         cudaCheck(cudaMemcpy(r.data(), dContErrRecord.data(), r.size()*sizeof(scalar), cudaMemcpyDeviceToHost),
                   "the queued continuity sums");
+        if (procComm && !r.empty())
+        {
+            procComm->allReduce(r.data(), static_cast<int>(r.size()), ReduceOp::Sum, cudaStreamPerThread);
+        }
         for (std::size_t k = 0; k < r.size(); ++k)
         {
             writer->addContinuityError(contErrQueued[k].first, r[k], contErrQueued[k].second);
