@@ -4,6 +4,7 @@
 #include <filesystem>
 #include "inter_phase_time.cuh"
 #include "inter_driver_cpp.cuh"
+#include "proc_globals.cuh"
 #include "inter_amr_cpp.cuh"
 #include "inter_correct_phi_cpp.cuh"
 #include "inter_solve_cpp.cuh"
@@ -2086,6 +2087,9 @@ RunReport runInterFoam(
                 const vector& v = f.U.internal[c];
                 maxU = std::fmax(maxU, std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z));
             }
+            aMin = pg::min(aMin);   // -parallel: the line is the whole run's (identity without a communicator)
+            aMax = pg::max(aMax);
+            maxU = pg::max(maxU);
             // %.17g on t and dt -- round-trip precision -- because these two are what a clock gate
             // reads back. At %.9g the gate bottomed out at 2.389e-09 on host AND device and stayed
             // there when the fields moved four orders closer to OpenFOAM's: it was measuring this
@@ -2118,6 +2122,8 @@ RunReport runInterFoam(
         const std::vector<scalar> d = fvc::div(f.phi, m, g, patches);
         for (scalar v : d) rep.worstDivPhi = std::fmax(rep.worstDivPhi, std::fabs(v));
     }
+    // -parallel: the report's statistics are the whole run's, not this rank's (no-op without a communicator)
+    pg::reduceEndStats(rep.maxU, rep.worstDivPhi, rep.alphaMin, rep.alphaMax, rep.alphaMass);
     if (gamgCache.built)
     {
         const GamgAgglomeration& a = gamgCache.agglomeration;

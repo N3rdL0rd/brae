@@ -9,6 +9,7 @@
 #include "foam_token_reader.cuh"
 #include "brae_notice.cuh"
 #include "inter_phase_time.cuh"
+#include "proc_globals.cuh"
 #include <charconv>
 #include <zlib.h>
 #include <algorithm>
@@ -1699,7 +1700,16 @@ void InterWriter::stepTaken(scalar deltaT)
 void InterWriter::addContinuityError(scalar deltaT, scalar sumVf, scalar sumV)
 {
     // continuityErrs.H: globalContErr = deltaT*contErr.weightedAverage(V) (DimensionedField.C
-    // weightedAverage: gSum(V*f)/gSum(V) where gSum(V) > SMALL)
+    // weightedAverage: gSum(V*f)/gSum(V) where gSum(V) > SMALL). The caller's sums are THIS rank's; under
+    // -parallel the two gSums are one collective over the ranks (both numbers in one message), so every rank
+    // adds the same globalContErr and every rank writes the same uniform/cumulativeContErr.
+    if (pg::parallel())
+    {
+        double sums[2] = {static_cast<double>(sumVf), static_cast<double>(sumV)};
+        pg::sum(sums, 2);
+        sumVf = sums[0];
+        sumV = sums[1];
+    }
     if (sumV > kSmall)
     {
         cumulativeContErr_ += deltaT*(sumVf/sumV);

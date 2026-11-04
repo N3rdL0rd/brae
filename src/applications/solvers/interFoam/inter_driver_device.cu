@@ -4,6 +4,7 @@
 // is separately landed and separately gated; what this file owns is the wiring, and that wiring is
 // what tests/test_device_inter_dambreak_alpha.cu measures against the host driver on damBreak.
 #include "inter_phase_time.cuh"
+#include "proc_globals.cuh"
 #include "inter_driver_cpp.cuh"
 #include "inter_set_rdeltat_cpp.cuh"
 #include "device_fvc_smooth.cuh"
@@ -8602,6 +8603,8 @@ RunReport runInterFoamDevice(
                 read[1].dSrc = range.data() + 1; read[1].hDst = &hi;
                 deviceReadValues(read, 2);
             }
+            lo = pg::min(lo);   // -parallel: the line is the whole run's range (identity without a communicator)
+            hi = pg::max(hi);
             std::printf("   t = %.17g  dt = %.17g  Co %.3f  alphaCo %.3f  [device]  "
                         "alpha [%.3e, %.15g]\n",
                         (double)rep.time, (double)rep.deltaT, (double)rep.CoNum,
@@ -8734,6 +8737,8 @@ RunReport runInterFoamDevice(
         rep.alphaMax = std::fmax(rep.alphaMax, av[c]);
         rep.alphaMass += av[c]*g.V()[c];
     }
+    // -parallel: the report's statistics are the whole run's, not this rank's (no-op without a communicator)
+    pg::reduceEndStats(rep.maxU, rep.worstDivPhi, rep.alphaMin, rep.alphaMax, rep.alphaMass);
     (void)nFaces;
     (void)nBf;
     if (fieldsOut) *fieldsOut = std::move(f);
