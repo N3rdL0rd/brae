@@ -5492,3 +5492,6 @@ set_tests_properties(mgpu_np1_byte_identical PROPERTIES SKIP_RETURN_CODE 77 TIME
 add_test(NAME mgpu_stage_gate
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_stage_gate.sh $<TARGET_FILE:brae_interFoam>)
 set_tests_properties(mgpu_stage_gate PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
+add_test(NAME mgpu_alpha_stage_gate
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_alpha_stage_gate.sh $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(mgpu_alpha_stage_gate PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400)

@@ -24,9 +24,14 @@ TOL=${5:-1e-11}
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 ORACLE_ROOT=${ORACLE_ROOT:-/mnt/storage/brae-scratch/oracle}
 OUT_ROOT=${OUT_ROOT:-/tmp/mgpu_stage}
+BRAE_STAGE_ALPHA_REQUESTED=${BRAE_STAGE_ALPHA:-0}
+CASE_LABEL=$(basename "$CASE")
 SUF=""; [ "$NP" = 1 ] || { [ "$METHOD" = scotch ] || SUF="_$METHOD"; }
-OUT=$OUT_ROOT/${CASE}_np${NP}${SUF}
-FIELDS=sAlpha.dump,sPhi.dump,sNHatf.dump,sSigmaK.dump,sStf.dump,sRho.dump,sSnGradRho.dump,sPhic.dump,sPhir.dump,sAlphaPhiUn.dump
+OUT=$OUT_ROOT/${CASE_LABEL}_np${NP}${SUF}
+FIELDS=
+if [ "${BRAE_STAGE_ALPHA:-0}" != 1 ]; then
+    FIELDS=sAlpha.dump,sPhi.dump,sNHatf.dump,sSigmaK.dump,sStf.dump,sRho.dump,sSnGradRho.dump,sPhic.dump,sPhir.dump,sAlphaPhiUn.dump
+fi
 [ -x "$ORACLE_ROOT/bin/dumpInterFoam" ] || { echo "no dump tool: ORACLE_ROOT=$ORACLE_ROOT $HERE/setup.sh" >&2; exit 1; }
 source "$ORACLE_ROOT/of_env.sh"
 export OMP_NUM_THREADS=1 OMPI_MCA_rmaps_base_oversubscribe=1 OMPI_MCA_btl_vader_single_copy_mechanism=none
@@ -34,47 +39,100 @@ export LD_LIBRARY_PATH=/usr/lib64/openmpi/lib:${LD_LIBRARY_PATH:-}
 SOLVER=$ORACLE_ROOT/bin/dumpInterFoam
 rm -rf "$OUT"; mkdir -p "$OUT"; cd "$OUT"
 
-cp -r "$HERE/cases/$CASE" state
+CASE_SRC=$CASE; [ -d "$CASE" ] || CASE_SRC=$HERE/cases/$CASE
+cp -r "$CASE_SRC" state
 ( cd state
   rm -f system/decomposeParDict.*
+
   blockMesh > ../log.blockMesh 2>&1; topoSet > ../log.topoSet 2>&1
   cp -r 0.orig 0; mv 0/alpha.water.orig 0/alpha.water; rm -rf 0.orig
   setFields > ../log.setFields 2>&1 )
 if [ "$NP" != 1 ]; then
-    DICT=$HERE/cases/$CASE/system/decomposeParDict.$METHOD$NP
+    DICT=$CASE_SRC/system/decomposeParDict.$METHOD$NP
     [ -f "$DICT" ] || { echo "no $DICT" >&2; exit 1; }
     cp "$DICT" state/system/decomposeParDict
     ( cd state && decomposePar -force > ../log.decompose 2>&1 )
 fi
 # one real step: the state the stages are taken on
 export BRAE_STOP_ITER=1 BRAE_WRITE_ITERS=1
+unset BRAE_STAGE_ALPHA
 if [ "$NP" = 1 ]; then ( cd state && "$SOLVER" > ../log.step1 2>&1 )
 else ( cd state && mpirun --bind-to none -np "$NP" "$SOLVER" -parallel > ../log.step1 2>&1 ); fi
 unset BRAE_STOP_ITER BRAE_WRITE_ITERS
-cp -r state of; cp -r state bd
+if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then
+    rm -rf corrected
+    cp -r state corrected
+    sed -i 's/^startFrom .*/startFrom       latestTime;/' corrected/system/controlDict
+    if [ "$NP" = 1 ]; then ( cd corrected && BRAE_STAGE_STATE=1 "$SOLVER" > ../log.corrected 2>&1 )
+    else ( cd corrected && BRAE_STAGE_STATE=1 mpirun --bind-to none -np "$NP" "$SOLVER" -parallel > ../log.corrected 2>&1 ); fi
+    rm -rf of bd
+    cp -r corrected of; cp -r corrected bd
+fi
+if [ "$BRAE_STAGE_ALPHA_REQUESTED" != 1 ]; then
+    cp -r state of; cp -r state bd
+fi
 # both start from the step-1 time directory
 sed -i 's/^startFrom .*/startFrom       latestTime;/' of/system/controlDict bd/system/controlDict
+if [ -d ofExplicit ]; then sed -i 's/^startFrom .*/startFrom       latestTime;/' ofExplicit/system/controlDict; fi
 
-# OpenFOAM: the stages
-export BRAE_STAGE_DUMP=1
-if [ "$NP" = 1 ]; then ( cd of && "$SOLVER" > ../log.of 2>&1 )
-else ( cd of && mpirun --bind-to none -np "$NP" "$SOLVER" -parallel > ../log.of 2>&1 ); fi
+# OpenFOAM: first the alpha step in alpha-stage mode, then the explicit stages from the unchanged input.
+if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then export BRAE_STAGE_ALPHA=1; fi
+if [ "$BRAE_STAGE_ALPHA" = 1 ]; then
+    if [ "$NP" = 1 ]; then ( cd of && "$SOLVER" > ../log.of 2>&1 )
+    else ( cd of && mpirun --bind-to none -np "$NP" "$SOLVER" -parallel > ../log.of 2>&1 ); fi
+fi
+ORUN=of; [ -d ofExplicit ] && ORUN=ofExplicit
+if [ "$BRAE_STAGE_ALPHA_REQUESTED" != 1 ]; then
+    export BRAE_STAGE_DUMP=1
+    if [ "$NP" = 1 ]; then ( cd "$ORUN" && "$SOLVER" >> ../log.of 2>&1 )
+    else ( cd "$ORUN" && mpirun --bind-to none -np "$NP" "$SOLVER" -parallel >> ../log.of 2>&1 ); fi
+    unset BRAE_STAGE_DUMP
+fi
+unset BRAE_STAGE_ALPHA
 unset BRAE_STAGE_DUMP
 
 # brae: the same stages (start from the latest time, as OpenFOAM's -latestTime)
 export BRAE_MGPU_STAGE_DUMP=$OUT/bd
+if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then export BRAE_STAGE_ALPHA=1; fi
 if [ "$NP" = 1 ]; then "$BRAE" -case bd -device > log.brae 2>&1
 else mpirun --bind-to none -np "$NP" "$BRAE" -case bd -parallel -device > log.brae 2>&1; fi
+
 unset BRAE_MGPU_STAGE_DUMP
 grep -a "stage dump" log.brae | head -n 8
 
 T=$(ls -d state/[0-9]* 2>/dev/null | xargs -n1 basename | sort -g | tail -n 1)
 [ -n "$T" ] && [ "$T" != 0 ] || T=$(ls -d state/processor0/[0-9]* | xargs -n1 basename | sort -g | tail -n 1)
+if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then
+    for D in of/processor*; do
+        [ -d "$D" ] || continue
+        AT=$(find "$D" -name sAlphaAfter.dump -printf '%h\n' | head -n 1)
+        [ -n "$AT" ] || { echo "oracle wrote no alpha stage in $D" >&2; exit 1; }
+        [ "$AT" = "$D/$T" ] || { mkdir -p "$D/$T"; cp "$AT"/sAlphaAfter.dump "$AT"/sAlphaPhi.dump "$AT"/sRhoAfter.dump "$D/$T/"; }
+    done
+    if [ "$NP" = 1 ]; then
+        AT=$(find of -name sAlphaAfter.dump -printf '%h\n' | head -n 1)
+        [ "$AT" = "of/$T" ] || { mkdir -p "of/$T"; cp "$AT"/sAlphaAfter.dump "$AT"/sAlphaPhi.dump "$AT"/sRhoAfter.dump "of/$T/"; }
+    fi
+fi
+if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then
+    for F in sAlphaAfter.dump sAlphaPhi.dump sRhoAfter.dump; do
+        find of -path "*/$T/$F" -print -quit 2>/dev/null | grep -q . || {
+            echo "missing oracle post-alpha field of/*/$T/$F" >&2; exit 1; }
+        find bd -path "*/$T/$F" -print -quit 2>/dev/null | grep -q . || {
+            echo "missing brae post-alpha field bd/*/$T/$F" >&2; exit 1; }
+    done
+fi
 echo "state time $T; case $CASE np $NP $METHOD"
 set +e
-python3 "$HERE/compare_fields.py" of bd --times "$T" --fields "$FIELDS" --tol "$TOL" > compare.md
-RC=$?
+if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then
+    python3 "$HERE/compare_fields.py" of bd --times "$T" --fields sAlphaAfter.dump,sAlphaPhi.dump,sRhoAfter.dump --tol "$TOL" > compare_alpha.md
+    RC=$?
+    cat compare_alpha.md
+else
+    python3 "$HERE/compare_fields.py" "${ORUN:-of}" bd --times "$T" --fields "$FIELDS" --tol "$TOL" > compare.md
+    RC=$?
+    cat compare.md
+fi
 set -e
-cat compare.md
 [ "${KEEP:-0}" = 1 ] || rm -rf state
 exit $RC

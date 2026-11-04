@@ -33,6 +33,17 @@
 
 namespace brae {
 
+struct DeviceProcCommCounts
+{
+    long long cellExchanges = 0;
+    long long faceExchanges = 0;
+};
+inline DeviceProcCommCounts& deviceProcCommCountsRef()
+{
+    static DeviceProcCommCounts c;
+    return c;
+}
+
 class DeviceProcCtx
 {
 public:
@@ -131,6 +142,23 @@ inline void procExchange(
         hf.push_back(HaloField{f->data(), 1, 0, 1});
     }
     c.comm().exchangeCells(c.plan(), hf.data(), static_cast<int>(hf.size()), cudaStreamPerThread);
+    ++deviceProcCommCountsRef().cellExchanges;
+}
+
+// 2b. syncTools::syncFaceList(minEqOp) across processor patches. The input is the interface array (one
+// entry per processor face); both ranks keep the smaller limiter. A local periodic pair's twin sync is
+// a separate, local operation in the MULES kernel.
+inline void procSyncFacesMin(const DeviceProcCtx& c, DeviceBuffer<scalar>& ifArray)
+{
+    if (c.nFaces() == 0) return;
+    if (ifArray.size() < static_cast<std::size_t>(c.nFaces()))
+        throw std::runtime_error("brae processor interface: a face limiter has no processor segment.");
+    //   BRAE_CONTROL_PROC_NO_LAMBDA_SYNC=1: a gate's CONTROL, deliberately wrong -- each rank keeps its
+    //   own one-sided limiter, so the two sides of a cut face can transport different alpha fluxes.
+    static const bool noSync = std::getenv("BRAE_CONTROL_PROC_NO_LAMBDA_SYNC") != nullptr;
+    if (noSync) return;
+    c.comm().exchangeFaces(c.plan(), ifArray.data(), FaceOp::Min, cudaStreamPerThread);
+    ++deviceProcCommCountsRef().faceExchanges;
 }
 
 // 3. the interface array (one entry per processor face, the order of the processor patches) into / out of the

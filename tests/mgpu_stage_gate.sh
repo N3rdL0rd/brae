@@ -34,4 +34,10 @@ if BRAE_CONTROL_PROC_NO_EXCHANGE=1 "$HERE/tools/mgpu_oracle/stage_gate.sh" "$BRA
     cat "$OUT_ROOT/log.ctl"; echo "FAIL: the control (BRAE_CONTROL_PROC_NO_EXCHANGE=1) passed the gate"; exit 1
 fi
 echo "== control BRAE_CONTROL_PROC_NO_EXCHANGE=1 fails the gate, as it must"
+if [ "${BRAE_STAGE_ALPHA:-0}" = 1 ]; then
+    if BRAE_STAGE_ALPHA=1 BRAE_CONTROL_PROC_NO_LAMBDA_SYNC=1 "$HERE/tools/mgpu_oracle/stage_gate.sh" "$BRAE" tank 2 scotch > "$OUT_ROOT/log.lambda_ctl" 2>&1; then
+        cat "$OUT_ROOT/log.lambda_ctl"; echo "FAIL: BRAE_CONTROL_PROC_NO_LAMBDA_SYNC=1 passed the alpha gate"; exit 1
+    fi
+    echo "== control BRAE_CONTROL_PROC_NO_LAMBDA_SYNC=1 fails the alpha gate, as it must"
+fi
 echo PASS

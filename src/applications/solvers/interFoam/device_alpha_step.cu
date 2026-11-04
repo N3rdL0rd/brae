@@ -455,6 +455,9 @@ void deviceAlphaCorrector(
             deviceSubtractFaces(in.cyc->n, unIf, *in.alphaPhiIf, corrIf);
         }
 
+        DeviceBuffer<scalar> procCorr;
+        if (proc) procGather(*proc, corrBnd, procCorr);
+
         // saved BEFORE the correction, for the relaxation below
         alpha10.resize(static_cast<std::size_t>(nC));
         ckS(cudaMemcpy(alpha10.data(), alpha1.data(), sizeof(scalar)*nC, cudaMemcpyDeviceToDevice),
@@ -472,7 +475,9 @@ void deviceAlphaCorrector(
         part.emplace("alpha corrector: the correction limited and applied (MULESCorr)");
         deviceMulesLimitCorr(dm, nIf, nBf, rDeltaT, alpha1, *bnd.alpha1, *bnd.fixesValue, *bnd.flag,
                              unBnd, corrInt, corrBnd, mf, mulesCtl, nullptr, nullptr,
-                             havePair ? in.cyc : nullptr, havePair ? &corrIf : nullptr);
+                             proc ? &proc->cyc() : (havePair ? in.cyc : nullptr),
+                             proc ? &procCorr : (havePair ? &corrIf : nullptr));
+        if (proc) procScatter(*proc, procCorr, corrBnd);
         deviceMulesCorrect(dm, rDeltaT, corrInt, corrBnd, mf, alpha1,
                            havePair ? in.cyc : nullptr, havePair ? &corrIf : nullptr);
         part.emplace("alpha corrector: the relaxation and alphaPhi10 (MULESCorr)");
@@ -505,6 +510,7 @@ void deviceAlphaCorrector(
                                                     in.alphaPhiIf->data());
             ckS(cudaGetLastError(), "alphaPhi10 += w*corr, interface");
         }
+        if (proc) procExchange(*proc, {&alpha1}, "alpha1 after CMULES correction");
         return;
     }
 
@@ -578,15 +584,23 @@ void deviceAlphaCorrector(
         deviceMulesDonorFluxCyclic(*in.cyc, rawPhi ? in.cyc->phi : *in.phiCNIf, alpha1, phiBDIf);
         deviceSubtractFaces(in.cyc->n, unIf, phiBDIf, corrIfEx);
     }
-    part.emplace("alpha corrector: the limiter (explicit)");
+    DeviceBuffer<scalar> procPhiCN, procDonor, procCorr, procLambda;
+    if (proc)
+    {
+        procGather(*proc, *in.phiCNBnd, procPhiCN);
+        deviceMulesDonorFluxCyclic(proc->cyc(), procPhiCN, alpha1, procDonor);
+        procScatter(*proc, procDonor, phiBDBnd);
+        procGather(*proc, unBnd, procCorr);
+        deviceSubtractFaces(proc->nFaces(), procCorr, procDonor, procCorr);
+        procScatter(*proc, procCorr, corrBnd);
+    }
     deviceMulesLimiter(dm, nIf, nBf, rDeltaT, alpha1, alpha1Old, *bnd.alpha1,
                        *bnd.fixesValue, *bnd.flag, phiBDInt, phiBDBnd, corrInt, corrBnd,
                        mf, mulesCtl, lamInt, lamBnd,
-                       havePairEx ? in.cyc : nullptr,
-                       havePairEx ? &phiBDIf : nullptr,
-                       havePairEx ? &corrIfEx : nullptr,
-                       havePairEx ? &lamIf : nullptr);
-    interStepProbe("corrector: limiter", lamInt);
+                       proc ? &proc->cyc() : (havePairEx ? in.cyc : nullptr),
+                       proc ? &procDonor : (havePairEx ? &phiBDIf : nullptr),
+                       proc ? &procCorr : (havePairEx ? &corrIfEx : nullptr),
+                       proc ? &procLambda : (havePairEx ? &lamIf : nullptr));
     if (havePairEx)
     {
         interStepProbe("corrector: pair limiter", lamIf);
@@ -594,6 +608,14 @@ void deviceAlphaCorrector(
     part.emplace("alpha corrector: the blend and the explicit solve");
     deviceMulesBlend(nIf, nBf, phiBDInt, phiBDBnd, lamInt, lamBnd, corrInt, corrBnd,
                      alphaPhi10Int, alphaPhi10Bnd);
+    if (proc)
+    {
+        DeviceBuffer<scalar> scaled;
+        deviceMultiplyFaces(proc->nFaces(), procLambda, procCorr, scaled);
+        DeviceBuffer<scalar> limited;
+        addFaces(proc->nFaces(), procDonor, scaled, limited);
+        procScatter(*proc, limited, alphaPhi10Bnd);
+    }
     if (havePairEx)
     {
         // phiPsi = phiBD + lambda*phiCorr on the pair too (MULESTemplates.C:634)
@@ -616,6 +638,7 @@ void deviceAlphaCorrector(
                              havePairEx ? in.cyc : nullptr,
                              havePairEx ? in.alphaPhiIf : nullptr);
     interStepProbe("corrector: solved", alpha1);
+    if (proc) procExchange(*proc, {&alpha1}, "alpha1 after explicit MULES");
 }
 
 } // namespace brae
