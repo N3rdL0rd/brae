@@ -5,6 +5,7 @@
 // NCCL's graph-only communicator, graphUsageMode = 0) and everything else stays on the eager one. Loopback and MPI-host
 // ignore the channel. Thread-local, default Eager.
 #include "proc_comm.cuh"
+#include <cstdlib>
 
 namespace brae {
 
@@ -26,5 +27,16 @@ public:
 private:
     CommChannel saved_;
 };
+
+// Do the distributed solver loops (AMG-PCG, symGaussSeidel) run as CUDA-graph WHILE loops with the collectives inside
+// the body? Only on the NCCL backend (each rank captures its own graph; MPI-host throws inside a capture and a
+// loopback body would need one joint graph); BRAE_PROC_GRAPH=0 selects the host-driven loops there too. Read at every
+// solve (the tests switch it), not cached.
+inline bool procGraphLoops(const ProcComm& c)
+{
+    const char* e = std::getenv("BRAE_PROC_GRAPH");
+    if (e && e[0] == '0') return false;
+    return c.backend() == ProcComm::Backend::Nccl && c.graphCapturable();
+}
 
 } // namespace brae

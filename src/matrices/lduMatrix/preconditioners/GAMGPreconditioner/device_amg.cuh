@@ -108,6 +108,13 @@ struct PCGGraphCache {
     // serial graph: entries that differ in them -- interFoam's p_rgh and p_rghFinal, relTol 0.01 and 0 -- then
     // share one captured graph instead of re-capturing at every solve.
     DeviceBuffer<scalar> sCtl;
+    // THE DECOMPOSED-MESH WHILE GRAPH (deviceAMGPCGProcGraph, NCCL graph communicator): the processor-interface
+    // coefficient copied per solve like the pair's, the {z.r, sum|r|} pair one collective carries, the residual
+    // history (a test hook, sized by the cap it was captured with) and the identity of what the capture baked.
+    DeviceBuffer<scalar> gProcCoeff, procPair, dHist;
+    const void* keyProcComm = nullptr; const void* keyProcPlan = nullptr;
+    const void* keyProcFaceCell = nullptr; const void* keyProcNbrIdx = nullptr; const void* keyProcRank = nullptr;
+    int keyProcFaces = -1; int keyHistCap = -1; const void* keyPA = nullptr;
     ~PCGGraphCache();
 };
 
@@ -501,10 +508,12 @@ DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const De
                               DeviceBuffer<scalar>& psi, scalar normFactor, scalar tol, scalar relTol, int maxIter,
                               bool captureVcycle = false, int checkEvery = 1, bool corrScaling = false,
                               int minIter = 0);
-// DECOMPOSED MESH (Afine.proc.active(), device_ldu.cuh): the loop is the host-driven one on every rank at once. The
-// products exchange halos, the dots/residual are global, every rank takes the same iteration count; the V-cycle is
-// each rank's own block. normFactor must be the global one (deviceNormFactor on the same view). The CUDA-graph
-// WHILE variant is not used for a decomposed solve (see deviceAMGPCGProc in device_amg_pcg.cu).
+// DECOMPOSED MESH (Afine.proc.active(), device_ldu.cuh): the products exchange halos, the dots/residual are global, every
+// rank takes the same iteration count; the V-cycle is each rank's own block. normFactor must be the global one
+// (deviceNormFactor on the same view). On the NCCL backend the whole loop is ONE CUDA graph per rank (conditional WHILE
+// node, halo + the two deterministic collectives inside the body, device-side stop on the reduced residual; see
+// deviceAMGPCGProcGraph in device_amg_pcg.cu), bit-identical to the host-driven loop, which every other backend runs and
+// BRAE_PROC_GRAPH=0 selects (proc_hooks.cuh procGraphLoops). The same switch governs deviceSymGaussSeidel.
 //
 // Test hook: while set, a decomposed solve appends its residual history (initial, then after every iteration, as
 // normalised) to *history (replaced at the start of each solve). Pass nullptr to stop.
