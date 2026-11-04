@@ -91,30 +91,41 @@ inline ProcComm* globalComm()
     return (pc && pc->size() > 1) ? pc : nullptr;
 }
 
-// Persistent reduction scratch (one-time alloc, process-lifetime): a device accumulator + a PINNED host mirror.
-// Removes the per-reduction cudaMalloc/cudaFree + H2D-zero-init that dominated the device SIMPLE-loop wall; the
-// zero-init is now a cheap async memset on the per-thread stream and the result D2H uses pinned memory. Single
-// solve at a time (cf is one host thread per solve), so a function-local static accumulator is safe.
-scalar* g_redDev = nullptr;       // device accumulator (1 scalar)
-scalar* g_redPinned = nullptr;    // pinned host mirror (1 scalar)
-scalar* g_partials = nullptr;     // stage-1 block partials; grown on demand, never shrunk
-int     g_partialsCap = 0;
-int     g_partialsEpoch = 0;      // bumped on every regrow: a captured graph holding the old pointer must rebuild
+// Persistent reduction scratch, ONE PER HOST THREAD. The loopback backend runs one solver rank per host thread,
+// with its own cudaStreamPerThread and ProcComm::setThreadCurrent handle, so process-wide scratch would let one
+// rank's D2H read pick up another rank's accumulator. thread_local also gives each rank its own CUDA-device
+// ownership: a rank thread binds its device before its first reduction, and its allocations are never shared.
+// The buffers are intentionally leaked (no destructor after CUDA teardown), as the other device caches are.
+struct RedScratch
+{
+    scalar* dev = nullptr;             // device accumulator (1 scalar)
+    scalar* pinned = nullptr;          // pinned host mirror (1 scalar)
+    scalar* partials = nullptr;        // stage-1 block partials; grown on demand, never shrunk
+    int partialsCap = 0;
+    int partialsEpoch = 0;             // bumped on every regrow: a graph holding the old pointer must rebuild
+};
+RedScratch& redScratch()
+{
+    thread_local RedScratch* s = new RedScratch;
+    return *s;
+}
 inline scalar* ensurePartials(int nb)
 {
-    if (nb > g_partialsCap)
+    RedScratch& s = redScratch();
+    if (nb > s.partialsCap)
     {
-        if (g_partials) cudaCheck(cudaFree(g_partials), "partials free");
-        cudaCheck(cudaMalloc(reinterpret_cast<void**>(&g_partials), (std::size_t)nb*sizeof(scalar)), "partials alloc");
-        g_partialsCap = nb;
-        ++g_partialsEpoch;
+        if (s.partials) cudaCheck(cudaFree(s.partials), "partials free");
+        cudaCheck(cudaMalloc(reinterpret_cast<void**>(&s.partials), (std::size_t)nb*sizeof(scalar)), "partials alloc");
+        s.partialsCap = nb;
+        ++s.partialsEpoch;
     }
-    return g_partials;
+    return s.partials;
 }
 inline void ensureRedScratch()
 {
-    if (!g_redDev)    cudaCheck(cudaMalloc(reinterpret_cast<void**>(&g_redDev), sizeof(scalar)), "red dev alloc");
-    if (!g_redPinned) cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&g_redPinned), sizeof(scalar)), "red pinned alloc");
+    RedScratch& s = redScratch();
+    if (!s.dev)    cudaCheck(cudaMalloc(reinterpret_cast<void**>(&s.dev), sizeof(scalar)), "red dev alloc");
+    if (!s.pinned) cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&s.pinned), sizeof(scalar)), "red pinned alloc");
 }
 
 
@@ -266,7 +277,8 @@ bool deviceReductionsGlobal()
 
 ProcHookCounts& procHookCountsRef()
 {
-    static ProcHookCounts c;
+    // Per loopback rank thread: concurrent solver ranks must not race a shared diagnostic counter.
+    thread_local ProcHookCounts c;
     return c;
 }
 
@@ -274,15 +286,16 @@ ProcHookCounts& procHookCountsRef()
 scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
 {
     const int n = static_cast<int>(x.size());
+    RedScratch& rs = redScratch();
     ensureRedScratch();
     if (deviceOfOrderReductions())
-        seqDotKernel<<<1, 1>>>(x.data(), y.data(), g_redDev, n);
+        seqDotKernel<<<1, 1>>>(x.data(), y.data(), rs.dev, n);
     else
-        reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, g_redDev);
+        reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, rs.dev);
     cudaCheck(cudaGetLastError(), "dot");
-    cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "dot result");
-    if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; return pc->allReduce(*g_redPinned, ReduceOp::Sum); }   // rank-order global sum
-    return *g_redPinned;
+    cudaCheck(cudaMemcpy(rs.pinned, rs.dev, sizeof(scalar), cudaMemcpyDeviceToHost), "dot result");
+    if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; return pc->allReduce(*rs.pinned, ReduceOp::Sum); }
+    return *rs.pinned;
 }
 
 
@@ -315,13 +328,14 @@ scalar deviceMaxRatio(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>&
         if (ProcComm* pc = globalComm()) return pc->allReduce(scalar(0), ReduceOp::Max);
         return 0;
     }
+    RedScratch& rs = redScratch();
     ensureRedScratch();
-    cudaCheck(cudaMemsetAsync(g_redDev, 0, sizeof(scalar), cudaStreamPerThread), "maxratio zero");
-    maxRatioKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), g_redDev, n);
+    cudaCheck(cudaMemsetAsync(rs.dev, 0, sizeof(scalar), cudaStreamPerThread), "maxratio zero");
+    maxRatioKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), rs.dev, n);
     cudaCheck(cudaGetLastError(), "maxratio");
-    cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "maxratio result");
-    if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; return pc->allReduce(*g_redPinned, ReduceOp::Max); }
-    return *g_redPinned;
+    cudaCheck(cudaMemcpy(rs.pinned, rs.dev, sizeof(scalar), cudaMemcpyDeviceToHost), "maxratio result");
+    if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; return pc->allReduce(*rs.pinned, ReduceOp::Max); }
+    return *rs.pinned;
 }
 
 
@@ -335,15 +349,16 @@ scalar deviceSumMag(const DeviceBuffer<scalar>& x)
         if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; return pc->allReduce(scalar(0), ReduceOp::Sum); }
         return 0;
     }
+    RedScratch& rs = redScratch();
     ensureRedScratch();
     if (deviceOfOrderReductions())
-        seqSumMagKernel<<<1, 1>>>(x.data(), g_redDev, n);
+        seqSumMagKernel<<<1, 1>>>(x.data(), rs.dev, n);
     else
-        reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, g_redDev);
+        reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, rs.dev);
     cudaCheck(cudaGetLastError(), "summag");
-    cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "summag result");
-    if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; return pc->allReduce(*g_redPinned, ReduceOp::Sum); }
-    return *g_redPinned;
+    cudaCheck(cudaMemcpy(rs.pinned, rs.dev, sizeof(scalar), cudaMemcpyDeviceToHost), "summag result");
+    if (ProcComm* pc = globalComm()) { ++procHookCountsRef().reductions; return pc->allReduce(*rs.pinned, ReduceOp::Sum); }
+    return *rs.pinned;
 }
 
 
@@ -392,9 +407,10 @@ void deviceGatherIndexedInto(const DeviceBuffer<scalar>& src, const DeviceBuffer
 
 const DeviceBuffer<scalar>& deviceOnes(int n)
 {
-    // Leaked on purpose, like the other device caches: no static destructor may run after the CUDA
-    // context is torn down.
-    static auto& cache = *new std::map<int, DeviceBuffer<scalar>>();
+    // Per loopback rank thread: concurrent ranks cannot race the std::map or read a buffer allocated in another
+    // rank's CUDA device context. Leaked on purpose, like the other device caches: no static destructor may run
+    // after the CUDA context is torn down.
+    thread_local auto& cache = *new std::map<int, DeviceBuffer<scalar>>();
     auto it = cache.find(n);
     if (it == cache.end())
     {
@@ -462,7 +478,7 @@ void deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult)
 
 int deviceReductionScratchEpoch()
 {
-    return g_partialsEpoch;
+    return redScratch().partialsEpoch;
 }
 
 
@@ -479,7 +495,7 @@ int deviceReductionScratchEpoch()
 //
 // Bumped when long-lived device memory is released -- solver teardown -- not on the per-iteration
 // temporaries the pool churns, so a steady run never invalidates and the cache keeps its value.
-namespace { int g_deviceGraphGeneration = 0; }
+namespace { thread_local int g_deviceGraphGeneration = 0; }   // a loopback rank has its own graph cache/device
 
 int deviceGraphGeneration()
 {

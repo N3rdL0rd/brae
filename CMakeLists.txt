@@ -396,6 +396,16 @@ foreach(_np 1 2 3 4 8)
     set_tests_properties(proc_comm_mpi_np${_np} PROPERTIES TIMEOUT 300)
 endforeach()
 
+# Reduction scratch/caches/counters are per loopback rank thread (finding 7): concurrent ranks use differently
+# sized buffers and check every host-read result against independent global arithmetic.
+add_executable(test_loopback_reduction_threads tests/test_loopback_reduction_threads.cu)
+target_include_directories(test_loopback_reduction_threads PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_loopback_reduction_threads PRIVATE brae_core)
+foreach(_np 2 4 8)
+    add_test(NAME loopback_reduction_threads_np${_np} COMMAND test_loopback_reduction_threads ${_np})
+    set_tests_properties(loopback_reduction_threads_np${_np} PROPERTIES TIMEOUT 300)
+endforeach()
+
 # Global Courant numbers / time steps and zero-cell-rank collective participation (findings 4 and 6).
 add_executable(test_courant_global tests/test_courant_global.cu)
 target_include_directories(test_courant_global PRIVATE ${BRAE_HEADER_DIRS})
