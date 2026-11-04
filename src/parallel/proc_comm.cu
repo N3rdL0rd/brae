@@ -41,7 +41,12 @@ template<class T> T* dalloc(std::size_t n)
 template<class T> T* dupload(const std::vector<T>& v)
 {
     T* p = dalloc<T>(v.size());
-    if (p) ck(cudaMemcpy(p, v.data(), v.size()*sizeof(T), cudaMemcpyHostToDevice), "upload");
+    if (p)
+    {
+        // pageable H2D may return before the DMA is done: complete it before another stream can read the memory
+        ck(cudaMemcpyAsync(p, v.data(), v.size()*sizeof(T), cudaMemcpyHostToDevice, cudaStreamPerThread), "upload");
+        ck(cudaStreamSynchronize(cudaStreamPerThread), "upload sync");
+    }
     return p;
 }
 
