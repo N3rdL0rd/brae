@@ -449,6 +449,27 @@ std::vector<std::vector<int>> ProcComm::exchangeIntLists(const std::vector<int>&
     return doExchangeInts(nbrRanks, send);
 }
 
+std::vector<std::vector<double>> ProcComm::exchangeFaceData(const std::vector<int>& nbrRanks,
+                                                            const std::vector<std::vector<double>>& send)
+{
+    static_assert(sizeof(double) == 2*sizeof(int), "exchangeFaceData packs a double as two ints");
+    if (nbrRanks.size() != send.size()) throw std::invalid_argument("ProcComm::exchangeFaceData: size mismatch");
+    std::vector<std::vector<int>> packed(send.size());
+    for (std::size_t k = 0; k < send.size(); ++k)
+    {
+        packed[k].resize(2*send[k].size());
+        if (!send[k].empty()) std::memcpy(packed[k].data(), send[k].data(), send[k].size()*sizeof(double));
+    }
+    const std::vector<std::vector<int>> got = exchangeIntLists(nbrRanks, packed);   // np == 1: no neighbours, empty
+    std::vector<std::vector<double>> recv(got.size());
+    for (std::size_t k = 0; k < got.size(); ++k)
+    {
+        recv[k].resize(got[k].size()/2);
+        if (!recv[k].empty()) std::memcpy(recv[k].data(), got[k].data(), recv[k].size()*sizeof(double));
+    }
+    return recv;
+}
+
 void ProcComm::collectiveAbort(const std::string& msg)
 {
     if (size_ == 1) throw std::runtime_error(msg);

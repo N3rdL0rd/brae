@@ -294,6 +294,11 @@ public:
     // neighbour's face order (ProcessorPatchDesc::nbrFaceCells).
     std::vector<std::vector<int>> exchangeIntLists(const std::vector<int>& nbrRanks,
                                                    const std::vector<std::vector<int>>& send);
+    // Neighbour exchange of double lists (host, blocking), BIT-EXACT: recv[k] = list sent by nbrRanks[k]. Setup-time
+    // data of a processor patch (the neighbour's Cf, Sf and cell centre per face). Carried by exchangeIntLists as
+    // int pairs, so every backend has it and none had to change.
+    std::vector<std::vector<double>> exchangeFaceData(const std::vector<int>& nbrRanks,
+                                                      const std::vector<std::vector<double>>& send);
 
     // ---- collective error handling --------------------------------------------------------------------------
     // Records the abort (the first one wins; the lowest raising rank on the MPI backend), then throws
