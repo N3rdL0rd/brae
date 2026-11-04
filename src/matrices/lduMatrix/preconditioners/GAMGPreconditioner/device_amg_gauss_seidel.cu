@@ -942,6 +942,7 @@ void deviceSymGaussSeidelFused(
         return e && std::string(e) == "0";
     }();
     bool shared = nComp >= 2 && nComp <= GS_FUSED_MAX && !fusedOff;
+    for (int k = 0; k < nComp && shared; ++k) shared = !comps[k].A->proc.active();   // decomposed: one component at a time
     for (int k = 1; k < nComp && shared; ++k)
         shared = comps[k].A->upper == comps[0].A->upper && comps[k].A->lower == comps[0].A->lower
               && comps[k].A->owner == comps[0].A->owner && comps[k].A->nCells == comps[0].A->nCells;
@@ -1008,6 +1009,61 @@ static scalar deviceSymGaussSeidelF32(
     scalar,
     scalar,
     int);   // FP32 turbulence GS (defined below)
+
+// smoothSolver ON A DECOMPOSED MESH (A.proc.active()): OpenFOAM -parallel's symGaussSeidelSmoother, per sweep:
+//     bPrime = source - sum over processor faces of coeff * psi_neighbour      (the halo of psi, exchanged once, FROZEN
+//                                                                               across the forward and reverse halves)
+//     forward then reverse walk of the rank's own block with bPrime             (the exact level-scheduled sweep)
+// then lduMatrix::residual (halo again) and the global sum|r| / normFactor, which every rank reads identically, so every
+// rank leaves the loop at the same sweep. The initial residual and normFactor are the caller's global ones. Host loop:
+// the decision needs a collective per evaluation (a graph-capturable communicator could host it inside the WHILE body).
+static scalar deviceSymGaussSeidelProc(
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    DeviceSolverPerf* perf,
+    int minIter,
+    int sweepsPer,
+    bool symmetric)
+{
+    const DeviceLduView Aloc = deviceBlockLocal(A);            // the walk is the block's: internal faces only
+    const DeviceGaussSeidelLevels& lv = gsLevelsFor(Aloc);
+    GSLevelCoefs lc;
+    GSLevelCells cc;
+    gsLevelCoefsRefresh(Aloc, lv, lc);
+    DeviceBuffer<scalar> Ax, r, bEff;
+    deviceAmul(A, psi, Ax);                                    // halo of psi, then A*psi
+    deviceCopy(r, b);
+    deviceAxpy(-1.0, Ax, r);
+    const scalar initRes = deviceSumMag(r) / normFactor;       // global
+    if (initRes < tol && minIter <= 0)
+    {
+        if (perf) *perf = {initRes, initRes, 0};
+        return initRes;
+    }
+    int sweeps = 0;
+    scalar finalRes = initRes;
+    while (sweeps < maxIter)
+    {
+        for (int s = 0; s < sweepsPer; ++s)
+        {
+            deviceProcFrozenRhs(A, psi, b, bEff);              // halo of psi; bPrime = b - interface terms (frozen)
+            gsLevelCellsRefresh(Aloc, bEff, lv, cc);
+            deviceSymGaussSeidelSweepExact(Aloc, bEff, psi, lv, symmetric, &lc, &cc);
+        }
+        sweeps += sweepsPer;
+        deviceResidual(A, psi, b, r);                          // halo of psi, then lduMatrix::residual
+        finalRes = deviceSumMag(r) / normFactor;               // global
+        if ((finalRes < tol || finalRes < relTol*initRes) && sweeps >= minIter) break;
+    }
+    if (perf) *perf = {initRes, finalRes, sweeps};
+    return initRes;
+}
+
 scalar deviceSymGaussSeidel(
     const DeviceLduView& A,
     const DeviceBuffer<scalar>& b,
@@ -1026,6 +1082,9 @@ scalar deviceSymGaussSeidel(
     // until nIterations >= minIter. The three opt-in fast paths below bake the stop test without it, so
     // a floor takes the host loop, which honours it exactly.
     const bool floored = minIter > 0;
+    if (A.proc.active())
+        return deviceSymGaussSeidelProc(A, b, psi, normFactor, tol, relTol, maxIter, perf, minIter,
+                                        (nSweeps > 1) ? nSweeps : 1, symmetric);
     // nSweeps (fvSolution solvers/<field>/nSweeps, smoothSolver.C:78, default 1) is how many smoothing
     // sweeps run between residual EVALUATIONS: smoothSolver.C:186 smooths nSweeps_ times per pass of the
     // do-while and :205 then advances nIterations by nSweeps_, so the stop test is consulted only on a
@@ -1250,7 +1309,7 @@ scalar deviceSymGaussSeidel(
     bool symmetric)
 {
     announceNormFactorMode();
-    if (normFactorOnHost())
+    if (normFactorOnHost() || A.proc.active())      // a decomposed mesh takes the host-driven loop (see deviceSymGaussSeidelProc)
         return deviceSymGaussSeidel(A, b, psi, deviceReadScalar(dNormFactor), tol, relTol, maxIter, perf, minIter, nSweeps, symmetric);
     const int  sweepsPer = (nSweeps > 1) ? nSweeps : 1;
     static const bool optIn = std::getenv("BRAE_TURB_FP32") != nullptr || std::getenv("BRAE_TURB_JACOBI") != nullptr;
