@@ -225,7 +225,7 @@ static void deviceSymGaussSeidelGraph(
         cp.conditional.type = cudaGraphCondTypeWhile;
         cp.conditional.size = 1;
         cudaGraphNode_t cnode;
-        cudaCheck(cudaGraphAddNode(&cnode, c.graph, nullptr, nullptr, 0, &cp), "gs cond node");
+        cudaCheck(braeGraphAddNode(&cnode, c.graph, nullptr, 0, &cp), "gs cond node");
         cudaGraph_t body = cp.conditional.phGraph_out[0];
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "gs capture begin");
         // smoothSolver.C:186: nSweeps sweeps, THEN one residual evaluation
@@ -454,7 +454,7 @@ static void deviceSymGaussSeidelGraphFused(
         cp.conditional.type = cudaGraphCondTypeWhile;
         cp.conditional.size = 1;
         cudaGraphNode_t cnode;
-        cudaCheck(cudaGraphAddNode(&cnode, c.graph, nullptr, nullptr, 0, &cp), "gs fused cond node");
+        cudaCheck(braeGraphAddNode(&cnode, c.graph, nullptr, 0, &cp), "gs fused cond node");
         cudaGraph_t body = cp.conditional.phGraph_out[0];
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "gs fused capture begin");
         for (int sw = 0; sw < sweepsPer; ++sw) deviceSymGaussSeidelSweepExactFused(sA[0], ops, lv, symmetric, &c.lc, ccp);

@@ -12,6 +12,7 @@
 #include "cf_types.cuh"     // scalar / label
 #include <cuda_runtime.h>   // __shfl_down_sync, __syncthreads
 #include <cstdlib>          // std::getenv / std::atoi (env-flag readers)
+#include "cuda_graph_compat.cuh"  // braeGraphAddNode / braeStreamGetCaptureInfo (CUDA 12 vs 13 signatures)
 
 // Device-resident (conditional-graph WHILE) solver variants require CUDA 13's stream-capture-to-graph + conditional
 // nodes. Defined here (not inline in device_amg.cu) so it gates BOTH the device-resident GS solver and the

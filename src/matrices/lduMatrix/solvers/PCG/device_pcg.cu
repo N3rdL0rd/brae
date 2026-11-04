@@ -508,7 +508,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         wp.conditional.type = cudaGraphCondTypeWhile;
         wp.conditional.size = 1;
         cudaGraphNode_t wnode;
-        cudaCheck(cudaGraphAddNode(&wnode, c.graph, nullptr, nullptr, 0, &wp), "bicg while node");
+        cudaCheck(braeGraphAddNode(&wnode, c.graph, nullptr, 0, &wp), "bicg while node");
         cudaGraph_t body = wp.conditional.phGraph_out[0];
         // the IF/ELSE handle lives on the graph that will contain the IF node: the WHILE body
         cudaCheck(cudaGraphConditionalHandleCreate(&c.hIf, body, 0, cudaGraphCondAssignDefault), "bicg if handle");
@@ -532,7 +532,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         cudaStreamCaptureStatus st;
         const cudaGraphNode_t* deps = nullptr;
         size_t nDeps = 0;
-        cudaCheck(cudaStreamGetCaptureInfo(cudaStreamPerThread, &st, nullptr, nullptr, &deps, nullptr, &nDeps), "bicg capture info");
+        cudaCheck(braeStreamGetCaptureInfo(cudaStreamPerThread, &st, &deps, &nDeps), "bicg capture info");
         std::vector<cudaGraphNode_t> depv(deps, deps + nDeps);
         cudaGraph_t tmp;
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "bicg capture A end");
@@ -542,7 +542,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         ip.conditional.type = cudaGraphCondTypeIf;
         ip.conditional.size = 2;                                                          // body[0] = if, body[1] = else
         cudaGraphNode_t inode;
-        cudaCheck(cudaGraphAddNode(&inode, body, depv.data(), nullptr, depv.size(), &ip), "bicg if node");
+        cudaCheck(braeGraphAddNode(&inode, body, depv.data(), depv.size(), &ip), "bicg if node");
         // IF: the mid-iteration exit
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, ip.conditional.phGraph_out[0], nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "bicg capture if");
         deviceAxpyDev(s.alpha.data(), c.yA, psi);

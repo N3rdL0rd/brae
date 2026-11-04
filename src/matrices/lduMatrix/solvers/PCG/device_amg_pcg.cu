@@ -318,7 +318,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         cudaStreamCaptureStatus st;
         const cudaGraphNode_t* deps = nullptr;
         std::size_t nDeps = 0;
-        cudaCheck(cudaStreamGetCaptureInfo(cudaStreamPerThread, &st, nullptr, nullptr, &deps, nullptr, &nDeps), "pcg capture info");
+        cudaCheck(braeStreamGetCaptureInfo(cudaStreamPerThread, &st, &deps, &nDeps), "pcg capture info");
         std::vector<cudaGraphNode_t> depv(deps, deps + nDeps);
         cudaGraph_t tmp;
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "pcg prologue capture end");
@@ -328,7 +328,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         cp.conditional.type = cudaGraphCondTypeWhile;
         cp.conditional.size = 1;
         cudaGraphNode_t cnode;
-        cudaCheck(cudaGraphAddNode(&cnode, c.graph, depv.data(), nullptr, depv.size(), &cp), "pcg cond node");
+        cudaCheck(braeGraphAddNode(&cnode, c.graph, depv.data(), depv.size(), &cp), "pcg cond node");
         cudaGraph_t body = cp.conditional.phGraph_out[0];
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "pcg capture begin");
         // ONE body for every iteration: iteration 0 takes pcgSearchDirK's p = w branch.
@@ -493,7 +493,7 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
         cp.conditional.type = cudaGraphCondTypeWhile;
         cp.conditional.size = 1;
         cudaGraphNode_t cnode;
-        cudaCheck(cudaGraphAddNode(&cnode, c.graph, nullptr, nullptr, 0, &cp), "pgraph cond node");
+        cudaCheck(braeGraphAddNode(&cnode, c.graph, nullptr, 0, &cp), "pgraph cond node");
         cudaGraph_t body = cp.conditional.phGraph_out[0];
         cudaCheck(cudaStreamBeginCaptureToGraph(strm, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "pgraph capture begin");
         deviceScalarCopy(dWArA, dWArAold);
