@@ -501,6 +501,14 @@ DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const De
                               DeviceBuffer<scalar>& psi, scalar normFactor, scalar tol, scalar relTol, int maxIter,
                               bool captureVcycle = false, int checkEvery = 1, bool corrScaling = false,
                               int minIter = 0);
+// DECOMPOSED MESH (Afine.proc.active(), device_ldu.cuh): the loop is the host-driven one on every rank at once. The
+// products exchange halos, the dots/residual are global, every rank takes the same iteration count; the V-cycle is
+// each rank's own block. normFactor must be the global one (deviceNormFactor on the same view). The CUDA-graph
+// WHILE variant is not used for a decomposed solve (see deviceAMGPCGProc in device_amg_pcg.cu).
+//
+// Test hook: while set, a decomposed solve appends its residual history (initial, then after every iteration, as
+// normalised) to *history (replaced at the start of each solve). Pass nullptr to stop.
+void amgPcgSetHistory(std::vector<scalar>* history);
 // the same solve with the normFactor on the device (item 66)
 DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const DeviceBuffer<scalar>& b,
                               DeviceBuffer<scalar>& psi, const scalar* dNormFactor, scalar tol, scalar relTol, int maxIter,

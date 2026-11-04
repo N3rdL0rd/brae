@@ -8,6 +8,7 @@
 #include "inter_phase_time.cuh"
 #include "device_amg.cuh"          // AMGData / DeviceSolverPerf / amgGalerkin / amgVCycleApply / deviceAMGPCG decls
 #include "device_blas.cuh"          // dot / axpy / reductions
+#include "proc_hooks.cuh"          // ProcComm + the hooks' channel (decomposed solves)
 #include "device_ldu.cuh"           // DeviceLduView / deviceAmul / deviceParallelAmul (distributed matvec)
 #include "device_halo.cuh"          // DeviceHalo + DeviceReducer (on-stream NVSHMEM reduce) for the distributed PCG
 #include "device_amg_detail.cuh"
@@ -613,6 +614,121 @@ static void chargeSplit(
     interPhase::charge(label, all, 1);
 }
 
+namespace {
+std::vector<scalar>* g_pcgHistory = nullptr;
+// BRAE_PROC_PCG_UNFUSED=1: a decomposed solve takes the plain loop below (3 collectives per iteration) where it
+// would take the fused two-collective one. The two are bit-identical; the plain one is the fused one's oracle.
+bool procPcgUnfused()
+{
+    return std::getenv("BRAE_PROC_PCG_UNFUSED") != nullptr;
+}
+}   // namespace
+
+void amgPcgSetHistory(std::vector<scalar>* history)
+{
+    g_pcgHistory = history;
+}
+
+// AMG-PCG ON A DECOMPOSED MESH (A.proc.active()): OpenFOAM -parallel's PCG, with a per-rank block-local V-cycle as the
+// preconditioner.
+//   * the product A*p exchanges p's halo first (deviceAmul, through A.proc), the V-cycle runs on the block (vcycleAt
+//     strips the hook), every dot and |r| is the global one (reductions.cu hook), so EVERY RANK TAKES THE SAME
+//     DECISION from the same allreduced residual and therefore the same iteration count;
+//   * normFactor is the caller's: the global one (deviceNormFactor on the same view).
+// Host-driven: the decision is read once per iteration. The CUDA-graph WHILE loop needs collectives in a conditional
+// body, which only a graph-capturable communicator can do (ProcComm::graphCapturable(), the NCCL backend's graph
+// channel; MPI-host throws inside a capture, and on the loopback backend all ranks' bodies would have to be one joint
+// graph, which a per-thread conditional node cannot be): until then a decomposed solve is this loop on every backend.
+//
+// FUSED: two collectives per iteration, not three. The last collective of an iteration carries sum|r| (the
+// decision) together with the NEXT iteration's z.r, which needs the next preconditioner application and so a
+// V-cycle that the converging iteration does not use (one V-cycle per solve thrown away). Every number is the one
+// the plain loop (BRAE_PROC_PCG_UNFUSED) computes: the same local partials, folded in the same rank order.
+static DeviceSolverPerf deviceAMGPCGProc(
+    const DeviceLduView& A,
+    AMGData& amg,
+    const DeviceBuffer<scalar>& b,
+    DeviceBuffer<scalar>& psi,
+    scalar normFactor,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    int minIter)
+{
+    ProcComm& comm = *A.proc.comm;
+    const int nC = A.nCells;
+    amg.corrScaling = false;
+    const DeviceLduView Aloc = deviceBlockLocal(A);
+    DeviceBuffer<scalar>& wA = amg.wA;
+    DeviceBuffer<scalar>& rA = amg.rA;
+    DeviceBuffer<scalar> pA(static_cast<std::size_t>(nC), deviceProcHalo(A.proc));    // the operand of A*p: halo tail
+    DeviceBuffer<scalar> Ax(nC), pair(2);
+    deviceAmul(A, psi, Ax, /*onField=*/true);                                       // halo of psi, then A*psi
+    deviceCopy(rA, b);
+    deviceAxpy(-1.0, Ax, rA);
+    DeviceSolverPerf perf;
+    perf.initialResidual = deviceSumMag(rA)/normFactor;                             // global
+    perf.finalResidual = perf.initialResidual;
+    auto converged = [&](scalar fr){ return (fr<tol) || (relTol>0.0 && fr<relTol*perf.initialResidual); };
+    std::vector<scalar>* hist = g_pcgHistory;
+    if (hist) hist->assign(1, perf.initialResidual);
+    ensureSpectrum(amg, Aloc);
+    const bool fp32 = amgSinglePrecisionCycle(amg);
+    if (fp32) amgCastFP32(amg, Aloc);
+    auto applyPrecond = [&]()
+    {
+        if (fp32)
+        {
+            const LduF A0 = lduF(Aloc, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);
+            cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, rA.data(), amg.vBF[0].data());
+            vcycleAtF(0, amg, Aloc, A0, amg.vBF[0].data(), amg.vXF[0].data());
+            cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), wA.data());
+        }
+        else vcycleAt(0, amg, Aloc, rA, wA);
+    };
+    scalar* dWArA    = pair.data();                 // pair = { z.r, sum|r| }: one collective carries both
+    scalar* dSumMag  = pair.data() + 1;
+    scalar* dWArAold = amg.sWArAold.data();
+    scalar* dPap     = amg.sPap.data();
+    scalar* dAlpha   = amg.sAlpha.data();
+    scalar* dNegAlpha= amg.sNegAlpha.data();
+    scalar* dBeta    = amg.sBeta.data();
+    int nIter = 0;
+    if (minIter > 0 || !converged(perf.finalResidual))
+    {
+        applyPrecond();                                     // wA = M^-1 rA
+        deviceDotInto(wA, rA, dWArA);                       // global z.r (the first iteration's)
+        do
+        {
+            if (nIter == 0) deviceCopy(pA, wA);             // p = w
+            else
+            {
+                deviceScalarDiv(dWArA, dWArAold, dBeta);    // Fletcher-Reeves beta
+                deviceFusedScaleAxpy(pA, dBeta, wA);
+            }
+            deviceAmul(A, pA, wA);                          // halo of p, then A*p
+            deviceDotInto(wA, pA, dPap);                    // collective 1: global p.Ap
+            deviceScalarDivNeg(dWArA, dPap, dAlpha, dNegAlpha);
+            deviceAxpyDev(dAlpha, pA, psi);
+            deviceAxpyDev(dNegAlpha, wA, rA);
+            ++nIter;
+            deviceScalarCopy(dWArA, dWArAold);
+            applyPrecond();                                 // the NEXT iteration's z (unused if this one converges)
+            {
+                LocalReductions localOnly;
+                deviceDotInto(wA, rA, dWArA);
+                deviceSumMagInto(rA, dSumMag);
+            }
+            ++procHookCountsRef().reductions;
+            comm.allReduce(pair.data(), 2, ReduceOp::Sum, cudaStreamPerThread, procChannel());   // collective 2
+            perf.finalResidual = deviceReadScalar(dSumMag)/normFactor;
+            if (hist) hist->push_back(perf.finalResidual);
+        } while ((nIter < maxIter && !converged(perf.finalResidual)) || nIter < minIter);
+    }
+    perf.nIterations = nIter;
+    return perf;
+}
+
 DeviceSolverPerf deviceAMGPCG(
     const DeviceLduView& A,
     AMGData& amg,
@@ -629,6 +745,11 @@ DeviceSolverPerf deviceAMGPCG(
 {
     // the matrix's coupled pair onto every grid of the hierarchy, this solve's coefficients (AMGPair)
     amgCouplePair(amg, A);
+    // A decomposed mesh: the fused global-decision loop, unless asked for the plain one or the options only it has
+    if (A.proc.active() && !procPcgUnfused() && !corrScaling && checkEvery <= 1)
+    {
+        return deviceAMGPCGProc(A, amg, b, psi, normFactor, tol, relTol, maxIter, minIter);
+    }
     // BRAE_AMG_PCG_SPLIT: this solve takes the plain loop below, uncaptured, the residual read at every
     // iteration as the graph reads it, with a lap after every part (device_amg_split.cuh)
     const bool split = amgSplit::wanted();
@@ -640,7 +761,7 @@ DeviceSolverPerf deviceAMGPCG(
 #ifdef BRAE_HAS_GS_DEVICE
     {
         static const bool pcgDev = envFlag("BRAE_PCG_DEVICE", true);                 // device-resident pressure solve (default ON; opt out BRAE_PCG_DEVICE=0)
-        if (pcgDev && !corrScaling && !split)
+        if (pcgDev && !corrScaling && !split && !A.proc.active())
         {
             static thread_local auto& dNf = *new DeviceBuffer<scalar>(1);
             cudaMemcpyAsync(dNf.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
@@ -652,7 +773,7 @@ DeviceSolverPerf deviceAMGPCG(
     amg.corrScaling = corrScaling;                             // seen by vcycleAt (scaled prolongation)
     DeviceBuffer<scalar>& wA = amg.wA;                          // persistent (fixed addr) so the captured graph stays valid
     DeviceBuffer<scalar>& rA = amg.rA;
-    DeviceBuffer<scalar> pA(nC), Ax(nC), rOld(nC);             // rOld: previous residual for flexible-CG beta (corrScaling)
+    DeviceBuffer<scalar> pA(static_cast<std::size_t>(nC), deviceProcHalo(A.proc)), Ax(nC), rOld(nC);   // rOld: previous residual for flexible-CG beta (corrScaling); pA: halo tail on a decomposed mesh
     if (split) amgSplit::begin();
     // A*psi with `onField`: psi IS the solution field, the one product a jump cyclic applies its jump to
     deviceAmul(A, psi, Ax, /*onField=*/true);
@@ -662,6 +783,8 @@ DeviceSolverPerf deviceAMGPCG(
     perf.initialResidual = deviceSumMag(rA)/normFactor;
     perf.finalResidual = perf.initialResidual;
     auto converged = [&](scalar fr){ return (fr<tol) || (relTol>0.0 && fr<relTol*perf.initialResidual); };
+    std::vector<scalar>* procHist = A.proc.active() ? g_pcgHistory : nullptr;       // the decomposed solve's test hook
+    if (procHist) procHist->assign(1, perf.initialResidual);
 
     amgSplit::lap(amgSplit::prologue);
     // One-time Chebyshev spectrum estimate (host scalars -> must precede any graph capture); no-op unless Chebyshev.
@@ -804,6 +927,7 @@ DeviceSolverPerf deviceAMGPCG(
             {
                 deviceSumMagInto(rA, dResNorm);
                 perf.finalResidual = deviceReadScalar(dResNorm)/normFactor;   // the only host sync
+                if (procHist) procHist->push_back(perf.finalResidual);
             }
             amgSplit::lap(amgSplit::residualRead);
         } while ((nIter < maxIter && !converged(perf.finalResidual)) || nIter < minIter);
@@ -843,7 +967,7 @@ DeviceSolverPerf deviceAMGPCG(
     // guarded already.
     {
         static const bool pcgDev = std::getenv("BRAE_PCG_DEVICE") == nullptr || std::string(std::getenv("BRAE_PCG_DEVICE")) != "0";
-        if (pcgDev && !corrScaling && !normFactorOnHost() && !amgSplit::wanted())
+        if (pcgDev && !corrScaling && !normFactorOnHost() && !amgSplit::wanted() && !A.proc.active())
         {
             amgCouplePair(amg, A);
             return deviceAMGPCGGraph(A, amg, b, psi, dNormFactor, tol, relTol, maxIter, minIter);
