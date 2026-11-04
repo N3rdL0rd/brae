@@ -12,6 +12,8 @@
 #include "interface/cyclic_interface.cuh"
 #include "foam_dict.cuh"   // isCyclicFamilyType
 #include <vector>
+#include <algorithm>
+#include <stdexcept>
 
 namespace brae {
 
@@ -32,6 +34,14 @@ inline unsigned long long nextDeviceAddressingId()
 struct DeviceMesh
 {
     int nCells = 0, nInternalFaces = 0, nBndFaces = 0;
+    // THE MULTI-GPU TAIL (InterFoamStep.md section 7). A mesh with `processor` patches keeps their faces as
+    // the LAST boundary faces of the gather below (bcType 8) and adds, after the nCells owned cells, nHalo
+    // slots holding the neighbour ranks' cells: a cell array a processor operator reads has nCellsExt =
+    // nCells + nHalo entries, the neighbour of processor face i sits at index nCells + slot (DeviceProcInterface,
+    // device_processor.cuh). nBndFacesPhys = the boundary faces BEFORE them (every physical patch), the length
+    // of a per-physical-face array. With no processor faces: nHalo = 0, nCellsExt = nCells, nBndFacesPhys =
+    // nBndFaces, and nothing else in this struct differs from the single-GPU mesh.
+    int nHalo = 0, nCellsExt = 0, nBndFacesPhys = 0;
     unsigned long long addressingId = 0;                // see nextDeviceAddressingId
     DeviceBuffer<label>  owner, nei;                    // internal faces
     DeviceBuffer<scalar> w, V, Sfx, Sfy, Sfz;           // weights(nIf), V(nC), Sf components(all faces)
@@ -138,8 +148,20 @@ inline DeviceMesh buildDeviceMesh(
     }
     std::vector<label> bndCell, bndGFace, bndIsEmpty;      // non-cyclic boundary faces (cyclic patches skipped)
     std::vector<scalar> dBndX, dBndY, dBndZ;               // Cf - C(faceCell) per boundary face (cellLimited grad)
+    int nPhysBnd = -1;                                     // boundary faces before the first processor face
+    label haloEnd = nC;                                    // one past the last halo slot (nC + nHalo)
     for (const FvPatch& p : fvp)
     {
+        if (isProcessorType(p.type))
+        {
+            if (p.size > 0 && nPhysBnd < 0) nPhysBnd = static_cast<int>(bndCell.size());
+            if (p.coupled) haloEnd = std::max(haloEnd, p.haloBase + p.nHaloCells);
+        }
+        else if (nPhysBnd >= 0 && p.size > 0 && !isCyclicFamilyType(p.type))
+        {
+            throw std::runtime_error("brae device mesh: patch '" + p.name + "' has faces after a processor patch; "
+                                     "processor patches must be the last boundary patches.");
+        }
         if (isCyclicFamilyType(p.type)) continue;
         const label emp = (p.type == "empty") ? 1 : 0;
         for (label i = 0; i < p.size; ++i)
@@ -190,6 +212,9 @@ inline DeviceMesh buildDeviceMesh(
     dm.nCells = nC;
     dm.nInternalFaces = nIf;
     dm.nBndFaces = nB;
+    dm.nBndFacesPhys = nPhysBnd < 0 ? nB : nPhysBnd;
+    dm.nHalo = static_cast<int>(haloEnd - nC);
+    dm.nCellsExt = nC + dm.nHalo;
     dm.addressingId = nextDeviceAddressingId();
     dm.owner.copyFrom(ownI);
     dm.nei.copyFrom(neiI);

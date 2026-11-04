@@ -196,6 +196,7 @@
 #include "start_time.cuh"
 #include "case_roots.cuh"
 #include "inter_parallel.cuh"
+#include "inter_proc_geometry.cuh"
 #include "time_instances.cuh"
 #include "foam_dict.cuh"
 #include <cstdio>
@@ -252,7 +253,8 @@ int main(int argc, char** argv)
                         "    -parallel  read decomposePar's processor<rank>/ of the case: dictionaries from the\n"
                         "             case, mesh, fields and output from the rank's directory. Rank and size come\n"
                         "             from mpirun's environment, or from -rank N -nprocs M. A decomposition with\n"
-                        "             processor faces is refused until the multi-GPU coupling lands.\n"
+                        "             processor faces is refused until the multi-GPU coupling lands\n"
+                        "             (BRAE_MGPU_GEOMETRY_ONLY=1 couples the patches, writes the geometry dump and stops).\n"
                         "  `brae <dir>` on a case whose controlDict says `application interFoam` runs\n"
                         "  this binary with -device.\n");
             return 0;
@@ -388,6 +390,13 @@ int main(int argc, char** argv)
         // the BOUNDARY instance: the AMI entries are read from polyMesh/boundary, which polyMesh
         // resolves separately from the faces and never older than them
         amiPairs = cpu::cyclicAMIFvPatch::setup(mi.boundaryDir(roots.procDir), m, g, patches);
+        // THE MULTI-GPU GATE (BRAE_MGPU_GEOMETRY_ONLY=1, inter_parallel.cuh): couple the processor patches, build the
+        // device interface, write the geometry dump and stop. With the gate closed refuseProcessorCoupling above has
+        // already stopped a decomposition with processor faces by name.
+        if (roots.parallel && mgpuGeometryOnly())
+        {
+            return runProcessorGeometryOnly(argc, argv, roots, m, g, patches);
+        }
         // ...handed to the host loop mutable as well, for a case whose mesh moves (MutableMesh)
         MutableMesh mutableMesh;
         mutableMesh.m = &m;
