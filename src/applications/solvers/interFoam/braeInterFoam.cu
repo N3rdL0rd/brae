@@ -195,6 +195,7 @@
 #include "inter_driver_cpp.cuh"
 #include "start_time.cuh"
 #include "case_roots.cuh"
+#include "inter_parallel.cuh"
 #include "time_instances.cuh"
 #include "foam_dict.cuh"
 #include <cstdio>
@@ -356,14 +357,13 @@ int main(int argc, char** argv)
         }
         PrimitiveMesh m;
         m.read(mi.pointsDir(roots.procDir), mi.facesDir(roots.procDir), mi.boundaryDir(roots.procDir));
-        // a decomposed case's processor patches are not coupled yet: stop rather than solve each piece as a closed tank
-        for (const PatchInfo& pp : m.patches())
+        if (roots.parallel)
         {
-            if (pp.type == "processor" && pp.size > 0)
-            {
-                throw std::runtime_error("processor patch '" + pp.name + "' needs the multi-GPU coupling, not yet implemented.");
-            }
+            std::printf("%s", cpu::interFoam::processorPatchTable(roots, m.patches()).c_str());
+            std::fflush(stdout);
+            cpu::interFoam::refuseUnderParallel(roots, m.patches());
         }
+        cpu::interFoam::refuseProcessorCoupling(roots, m.patches());
         FvGeometry g;
         g.build(m);
         // mirrorACMI: this loop couples a coincident cyclicACMI pair itself; the device loop, handed the
