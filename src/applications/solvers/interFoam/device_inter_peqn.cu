@@ -588,12 +588,18 @@ void deviceInterAssemblePEqn(
                 "rAU interpolated; there is nothing on the patch to read instead.");
         }
         deviceCyclicAssembleLaplacian(*cyc, *rAUCell, P.diag, /*addToDiag=*/true, corrected || nonOrthCoeffs);
-        if (DeviceProcCtx::active(dm))
+    }
+    if (DeviceProcCtx::active(dm))
+    {
+        if (!rAUCell)
         {
-            DeviceProcCtx& pc = *DeviceProcCtx::current();
-            deviceCyclicAssembleLaplacian(pc.cyc(), *rAUCell, P.diag, /*addToDiag=*/true,
-                                          corrected || nonOrthCoeffs);
+            throw std::runtime_error(
+                "brae interFoam device pEqn: processor faces need rAU on cells to form their laplacian "
+                "coefficient; the caller supplied none.");
         }
+        DeviceProcCtx& pc = *DeviceProcCtx::current();
+        deviceCyclicAssembleLaplacian(pc.cyc(), *rAUCell, P.diag, /*addToDiag=*/true,
+                                      corrected || nonOrthCoeffs);
     }
 
     if (needReference)
