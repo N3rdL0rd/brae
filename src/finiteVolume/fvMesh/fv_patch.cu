@@ -136,6 +136,9 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g, b
         p.inGroups = pi.inGroups;
         p.start    = pi.start;
         p.size     = pi.size;
+        p.myProcNo = pi.myProcNo;
+        p.neighbProcNo = pi.neighbProcNo;
+        p.referPatch = pi.referPatch;
         p.faceCells.resize(pi.size);
         p.deltaCoeffs.resize(pi.size);
         p.nf.resize(pi.size);

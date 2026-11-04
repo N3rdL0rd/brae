@@ -17,6 +17,11 @@ struct FvPatch {
     std::vector<std::string> inGroups;  // groups this patch belongs to (boundaryField group-keyword match)
     label               start = 0;
     label               size  = 0;
+    // processor / processorCyclic patches (decomposePar output): the ranks the patch joins, copied
+    // from PatchInfo. -1 on every other patch type. Reading them does NOT couple the patch.
+    label               myProcNo = -1;
+    label               neighbProcNo = -1;
+    std::string         referPatch;
     std::vector<label>  faceCells;    // owner cell of each boundary face
     std::vector<scalar> deltaCoeffs;  // 1/|Cf - C[faceCell]|
     std::vector<vector> nf;           // unit face normal Sf/|Sf| (for slip/symmetry projection)
