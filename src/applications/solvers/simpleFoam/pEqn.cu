@@ -184,6 +184,7 @@ void pressurePredictor(
             DeviceProcCtx& pc = *DeviceProcCtx::current();
             deviceCyclicAddH(pc.cyc(), *U[k], dm.V, Hk, &UEqn.procIfCoeff);
         }
+        resizeCellBuffer(st.HbyA[k], dm);
         deviceHadamard(st.HbyA[k], st.rAU, Hk);
         if (DeviceProcCtx::active(dm))
         {
