@@ -195,6 +195,9 @@ struct DeviceInterAlphaControls
     DeviceBuffer<scalar>* preSolveAlphaOut = nullptr;
     DeviceBuffer<scalar>* preSolveAlphaPhiIfOut = nullptr;
     std::vector<DeviceBuffer<scalar>>* correctorAlphaOut = nullptr;
+    DeviceBuffer<scalar>* alphaBeforeFinalMixtureOut = nullptr;
+    std::vector<DeviceBuffer<scalar>>* correctorAlphaBndOut = nullptr;
+    DeviceBuffer<scalar>* alpha2BeforeFinalMixtureOut = nullptr;
     // `alphaApplyPrevCorr yes` (alphaEqn.H:133-150, :228-236): the compression flux the correctors
     // ENDED on is cached, and the next pre-solve applies it, limited, before its own correctors run.
     // The cache is talphaPhi1Corr0 and it outlives the call -- it carries across SUB-CYCLES as well as

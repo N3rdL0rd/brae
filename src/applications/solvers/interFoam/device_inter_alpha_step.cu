@@ -482,6 +482,12 @@ void deviceInterAlphaStep(
                 deviceAlphaCorrector(dm, alpha, subOld, li, db, mulesCtl, nHatfInt,
                                      alphaPhiInt, alphaPhiBnd);
             }
+            if (ctl.correctorAlphaBndOut)
+            {
+                if (ctl.correctorAlphaBndOut->size() < static_cast<std::size_t>(aCorr + 1))
+                    ctl.correctorAlphaBndOut->resize(static_cast<std::size_t>(aCorr + 1));
+                deviceCopy((*ctl.correctorAlphaBndOut)[static_cast<std::size_t>(aCorr)], alpha1Bnd);
+            }
             if (ctl.correctorAlphaOut)
             {
                 if (ctl.correctorAlphaOut->size() < static_cast<std::size_t>(aCorr + 1))
@@ -609,6 +615,9 @@ void deviceInterAlphaStep(
     {
         deviceCopy(*ctl.rhoPhiIf, rhoPhiIfSum);
     }
+    if (ctl.alphaBeforeFinalMixtureOut) deviceCopy(*ctl.alphaBeforeFinalMixtureOut, alpha1Bnd);
+    if (ctl.alpha2BeforeFinalMixtureOut && ctl.alpha2BndOut)
+        deviceCopy(*ctl.alpha2BeforeFinalMixtureOut, *ctl.alpha2BndOut);
 
     // ...and mixture.correct() ONCE MORE after the whole sub-cycle (interFoam.C, after alphaEqnSubCycle.H).
     // The momentum equation must be built on the NEW density -- a mixture of the alpha the step started with

@@ -272,6 +272,7 @@
         }
 
         alpha2 = 1.0 - alpha1;
+        if (getenv("BRAE_STAGE_ALPHA")) volScalarField("sAlphaBeforeMixture" + Foam::name(aCorr) + ".dump", alpha1).write();
 
         mixture.correct();
     }
