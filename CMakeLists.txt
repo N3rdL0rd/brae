@@ -3476,6 +3476,18 @@ add_test(NAME mgpu_proc_geometry
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_proc_geometry.sh $<TARGET_FILE:brae_interFoam>
                  $<TARGET_FILE:test_proc_geometry_loopback>)
 set_tests_properties(mgpu_proc_geometry PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# The OpenFOAM oracle gate as a registered test: it MUST run wherever the oracle build exists, and SKIP with the
+# exact reason otherwise (a silent skip of the numerical oracle is how a common-formula error would survive).
+add_test(NAME mgpu_proc_geometry_oracle
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/mgpu_oracle/proc_geometry_gate.sh $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(mgpu_proc_geometry_oracle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# Negative control of the comparator itself: perturbed weight / delta / halo slot and a truncated face list must
+# each FAIL the comparison. Registered as a test; it SKIPs (77) until an oracle case directory is supplied with
+# -DBRAE_PROC_GEOMETRY_CASE=<decomposed case with both dump sets>.
+set(BRAE_PROC_GEOMETRY_CASE "" CACHE PATH "Decomposed case with procGeometry.dump and brae_procGeometry.dump (comparator negative control)")
+add_test(NAME mgpu_proc_geometry_comparator_control
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/mgpu_oracle/compare_proc_geometry_negative_control.py ${BRAE_PROC_GEOMETRY_CASE})
+set_tests_properties(mgpu_proc_geometry_comparator_control PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
 # Multi-GPU interFoam, I/O half: the frozen-state harness (hidden globals, function objects, per-rank writer
 # on N virtual ranks of the ProcComm loopback backend; tools/mgpu_oracle/FROZEN.md). The driver and the

@@ -90,6 +90,12 @@ def main():
         for qo, qb in zip(po, pb):
             slot_of = {}
             slots = set()
+            # zip() truncates silently: a dump with FEWER faces than the oracle would compare clean. The face
+            # lists must have the same length before any per-face comparison (review finding 11).
+            if len(qo[5]) != len(qb[5]):
+                bad.append("rank %d patch %s: face-list length differs (OF %d, brae %d)"
+                           % (r, qo[0], len(qo[5]), len(qb[5])))
+                continue
             for i, (fo_, fb_) in enumerate(zip(qo[5], qb[5])):
                 nfaces += 1
                 if fo_[0] != fb_[0] or fo_[1] != fb_[1]:
@@ -100,6 +106,10 @@ def main():
                     bad.append("rank %d patch %s face %d: neighbour cell %d has slots %d and %d" % (r, qo[0], i, fb_[1], slot_of[fb_[1]], s))
                     break
                 slots.add(s)
+                if len(fo_[3]) != len(fb_[3]) or len(fo_[3]) != len(COLS):
+                    bad.append("rank %d patch %s face %d: value-list length differs (OF %d, brae %d, expected %d)"
+                               % (r, qo[0], i, len(fo_[3]), len(fb_[3]), len(COLS)))
+                    break
                 for c, vo, vb in zip(COLS, fo_[3], fb_[3]):
                     u = ulp(vo, vb)
                     mx[c] = max(mx[c], u)

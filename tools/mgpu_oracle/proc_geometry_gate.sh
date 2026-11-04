@@ -22,7 +22,7 @@ METHODS=${4:-"scotch simple hier"}
 ORACLE_ROOT=${ORACLE_ROOT:-/mnt/storage/brae-scratch/oracle}
 OUT_ROOT=${OUT_ROOT:-/mnt/storage/brae-scratch/oracle_geometry}
 [ -x "$BRAE" ] || { echo "no brae binary at $BRAE" >&2; exit 1; }
-[ -x "$ORACLE_ROOT/bin/dumpInterFoam" ] || { echo "no $ORACLE_ROOT/bin/dumpInterFoam (run setup.sh)" >&2; exit 1; }
+[ -x "$ORACLE_ROOT/bin/dumpInterFoam" ] || { echo "SKIP: no $ORACLE_ROOT/bin/dumpInterFoam (tools/mgpu_oracle/setup.sh builds the OpenFOAM oracle)"; exit 77; }
 source "$ORACLE_ROOT/of_env.sh"
 export OMP_NUM_THREADS=1 OMPI_MCA_rmaps_base_oversubscribe=1 OMPI_MCA_btl_vader_single_copy_mechanism=none
 export LD_LIBRARY_PATH=/usr/lib64/openmpi/lib:${LD_LIBRARY_PATH:-}

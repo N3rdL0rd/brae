@@ -497,6 +497,47 @@ std::unique_ptr<HaloPlan> ProcComm::makePlan(HaloPlanDesc desc, int maxComps)
 
 std::unique_ptr<HaloPlan> ProcComm::buildPlanFromPatches(int nCells, std::vector<ProcessorPatchDesc> patches, int maxComps)
 {
+    // Participation and sizes are agreed BEFORE any point-to-point exchange, empty patches included: a zero-face
+    // patch on one side with a nonzero one on the other is a decomposePar/input error, and it must abort every
+    // rank with the same message instead of letting a peer wait for a message that will never be sent (finding 9).
+    if (size_ > 1)
+    {
+        std::vector<int> part(static_cast<std::size_t>(size_)*size_, 0);
+        for (const ProcessorPatchDesc& p : patches)
+        {
+            if (p.nbrRank < 0 || p.nbrRank >= size_)
+                collectiveAbort("ProcComm::buildPlanFromPatches: neighbour rank out of range");
+            part[static_cast<std::size_t>(rank_)*size_ + p.nbrRank] = static_cast<int>(p.faceCells.size()) + 1;
+            // +1 distinguishes "no patch" from "a patch with zero faces"
+        }
+        std::vector<int> all(part.size());
+        MPI_Allreduce(part.data(), all.data(), static_cast<int>(part.size()), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+        // all[] holds, per ordered pair, this rank's announced size; compare with the transpose by allgathering
+        // the rows instead: one allgather of the full matrix is the simplest symmetric form.
+        std::vector<int> matrix(static_cast<std::size_t>(size_)*part.size());
+        MPI_Allgather(part.data(), static_cast<int>(part.size()), MPI_INT, matrix.data(), static_cast<int>(part.size()), MPI_INT, MPI_COMM_WORLD);
+        std::string bad;
+        for (int a = 0; a < size_ && bad.empty(); ++a)
+            for (int b = 0; b < size_; ++b)
+            {
+                const int ab = matrix[static_cast<std::size_t>(a)*part.size() + static_cast<std::size_t>(a)*size_ + b];
+                const int ba = matrix[static_cast<std::size_t>(b)*part.size() + static_cast<std::size_t>(b)*size_ + a];
+                if ((ab == 0) != (ba == 0))
+                {
+                    bad = "one-sided processor patch between ranks " + std::to_string(a) + " and " + std::to_string(b)
+                          + ": one side announces " + std::to_string(ab) + ", the other " + std::to_string(ba);
+                    break;
+                }
+                if (ab > 0 && ba > 0 && ab != ba)
+                {
+                    bad = "processor patch size mismatch between ranks " + std::to_string(a) + " and " + std::to_string(b)
+                          + ": " + std::to_string(ab - 1) + " faces on one side, " + std::to_string(ba - 1) + " on the other";
+                    break;
+                }
+            }
+        if (!bad.empty()) collectiveAbort("ProcComm::buildPlanFromPatches: " + bad);
+        (void)all;
+    }
     std::vector<int> nbr;
     std::vector<std::vector<int>> send;
     for (const ProcessorPatchDesc& p : patches) { nbr.push_back(p.nbrRank); send.push_back(p.faceCells); }
@@ -1291,32 +1332,69 @@ protected:
     {
         if (sideOn_ || size_ == 1) return;
         sideOn_ = true;
-        sideRecv_.resize(size_);
+        side_ = std::make_shared<SideChannel>();
+        side_->recv.resize(size_);
         mpiCheck(MPI_Comm_dup(MPI_COMM_WORLD, &sideComm_), "Comm_dup");
         mpiCheck(MPI_Comm_dup(MPI_COMM_WORLD, &statusComm_), "Comm_dup");
         int provided = MPI_THREAD_SINGLE;
         MPI_Query_thread(&provided);
         sideThreadOk_ = provided >= MPI_THREAD_MULTIPLE;
         if (sideThreadOk_)
-            sideThread_ = std::thread([this, st = abortState_] { sideLoop(st); });
+        {
+            auto sc = side_;
+            auto st = abortState_;
+            sideThread_ = std::thread([this, sc, st] { sideLoop(sc, st); });
+        }
     }
 
     void stopSideChannel()
     {
         if (!sideOn_) return;
         abortState_->stop.store(true, std::memory_order_release);
-        if (sideThread_.joinable()) sideThread_.join();
-        if (!sideThreadOk_ && sideActive_) { dropCollective(sideReq_); sideActive_ = false; }
-        MPI_Comm_free(&sideComm_);
-        MPI_Comm_free(&statusComm_);
+        if (sideThread_.joinable())
+        {
+            // A healthy shutdown joins within one poll period. After a collective abort the peer processes may
+            // already be inside MPI_Finalize, whose progress machinery can block a concurrent MPI_Test: do not
+            // wait for ever. The thread owns a shared copy of the channel state and the backend stops touching
+            // it, so detaching is safe (no use-after-free); the communicator is NOT freed here in that case and
+            // MPI_Finalize reaps it.
+            auto sc = side_;
+            auto st = abortState_;
+            std::atomic<bool> left{false};
+            std::thread waiter([&] {
+                const auto t0 = std::chrono::steady_clock::now();
+                while (!left.load() && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
+                {
+                    if (sc->done.load()) { left.store(true); break; }
+                    usleep(1000);
+                }
+            });
+            waiter.join();
+            if (side_->done.load()) sideThread_.join();
+            else sideThread_.detach();   // never block the process teardown on an uncooperative MPI progress
+        }
+        if (side_->done.load() || !sideThreadOk_)
+        {
+            MPI_Comm_free(&sideComm_);
+            MPI_Comm_free(&statusComm_);
+        }
         sideOn_ = false;
     }
+
+    struct SideChannel
+    {
+        std::vector<AbortRec> recv;
+        MPI_Request req = MPI_REQUEST_NULL;
+        bool active = false;
+        std::atomic<bool> done{false};   // the thread has left its loop: the comms may be freed
+    };
+    std::shared_ptr<SideChannel> side_;
 
     // Main-thread driver when the MPI thread level does not allow the background thread.
     void pollSide()
     {
         if (!sideOn_ || sideThreadOk_) return;
-        sideRound();
+        sideRound(*side_);
         if (abortState_->pending.load(std::memory_order_acquire)) onSideAbort();
     }
 
@@ -1333,16 +1411,14 @@ protected:
 
     MPI_Comm sideComm_ = MPI_COMM_NULL;
     MPI_Comm statusComm_ = MPI_COMM_NULL;
-    bool sideOn_ = false, sideThreadOk_ = false, sideActive_ = false;
-    MPI_Request sideReq_ = MPI_REQUEST_NULL;
-    std::vector<AbortRec> sideRecv_;
+    bool sideOn_ = false, sideThreadOk_ = false;
     std::thread sideThread_;
 
 private:
-    void sideRound()
+    void sideRound(SideChannel& sc)
     {
         if (!sideOn_) return;
-        if (!sideActive_)
+        if (!sc.active)
         {
             AbortRec mine;
             std::memset(&mine, 0, sizeof(mine));
@@ -1352,32 +1428,32 @@ private:
                 mine.flag = 1;
                 std::strncpy(mine.msg, got.second.c_str(), sizeof(mine.msg) - 1);
             }
-            const int rc = MPI_Iallgather(&mine, sizeof(AbortRec), MPI_BYTE, sideRecv_.data(), sizeof(AbortRec), MPI_BYTE, sideComm_, &sideReq_);
-            if (std::getenv("BRAE_DEBUG_SIDE")) std::fprintf(stderr, "[side %d] Iallgather rc=%d\n", rank_, rc);
+            const int rc = MPI_Iallgather(&mine, sizeof(AbortRec), MPI_BYTE, sc.recv.data(), sizeof(AbortRec), MPI_BYTE, sideComm_, &sc.req);
             if (rc != MPI_SUCCESS) return;
-            sideActive_ = true;
+            sc.active = true;
             return;
         }
         int done = 0;
-        if (std::getenv("BRAE_DEBUG_SIDE")) std::fprintf(stderr, "[side %d] test %p\n", rank_, (void*)sideReq_);
-        if (MPI_Test(&sideReq_, &done, MPI_STATUS_IGNORE) != MPI_SUCCESS) { sideActive_ = false; return; }
+        if (MPI_Test(&sc.req, &done, MPI_STATUS_IGNORE) != MPI_SUCCESS) { sc.active = false; return; }
         if (!done) return;
-        sideActive_ = false;
+        sc.active = false;
         for (int r = 0; r < size_; ++r)
-            if (sideRecv_[r].flag) abortState_->publishRemote(r, sideRecv_[r].msg);
+            if (sc.recv[r].flag) abortState_->publishRemote(r, sc.recv[r].msg);
     }
 
-    void sideLoop(const std::shared_ptr<AbortState>& st)
+    void sideLoop(const std::shared_ptr<SideChannel>& sc, const std::shared_ptr<AbortState>& st)
     {
-        if (std::getenv("BRAE_DEBUG_SIDE")) std::fprintf(stderr, "[side %d] thread started (multiple=%d)\n", rank_, (int)sideThreadOk_);
         while (!st->stop.load(std::memory_order_acquire))
         {
-            sideRound();
-            if (std::getenv("BRAE_DEBUG_SIDE")) std::fprintf(stderr, "[side %d] round active=%d\n", rank_, (int)sideActive_);
+            sideRound(*sc);
             // A remote abort releases this rank's NCCL kernels even while the main thread is synchronising.
             if (st->pending.load(std::memory_order_acquire)) onSideAbort();
             usleep(1000);
         }
+        // Shutdown: abandon the outstanding round (a collective request is not cancellable; the handle is dropped
+        // and the operation finishes on the duplicated communicator, which MPI_Finalize reaps).
+        if (sc->active) { sc->req = MPI_REQUEST_NULL; sc->active = false; }
+        sc->done.store(true, std::memory_order_release);
     }
 
 protected:
