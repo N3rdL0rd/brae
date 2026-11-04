@@ -4,6 +4,7 @@
 #include "inter_phase_time.cuh"
 #include "device_blas.cuh"
 #include "proc_comm.cuh"       // ProcComm::current(): the rank in the hierarchy cache file name
+#include "proc_hooks.cuh"      // procGraphUnregister / the captured-graph registry
 #include "device_ldu.cuh"
 #include "device_halo.cuh"      // DeviceHalo + its DeviceReducer (on-stream NVSHMEM reduce)
 #include "device_amg_detail.cuh"  // shared inline primitives: safeDiag/warpReduceSum/blockDot + env-flag readers + AMG constants
@@ -44,8 +45,18 @@ AMGGraphCache::~AMGGraphCache()
 
 PCGGraphCache::~PCGGraphCache()
 {
+    if (registeredComm) procGraphUnregister(static_cast<const ProcComm*>(registeredComm), this);
     if (exec) cudaGraphExecDestroy(exec);
     if (graph) cudaGraphDestroy(graph);
+}
+
+// proc_hooks.cuh's registry: the comm destructor destroys a still-registered cache's graphs (its owner AMGData may
+// outlive the comm, e.g. a leaked solver cache), which must happen before ncclCommDestroy.
+void destroyPcgGraphs(PCGGraphCache* c)
+{
+    if (!c) return;
+    if (c->exec) { cudaGraphExecDestroy(c->exec); c->exec = nullptr; }
+    if (c->graph) { cudaGraphDestroy(c->graph); c->graph = nullptr; }
 }
 
 namespace {

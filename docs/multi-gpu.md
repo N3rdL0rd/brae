@@ -46,6 +46,7 @@ Run-time environment:
 | `BRAE_COMM` (or `BRAE_COMM_BACKEND`) | `loopback`, `mpi`, `nccl` or `auto` (default: NCCL when built, more than one rank, and the ranks of a node fit its GPUs; else MPI-host). `BRAE_COMM_NP` sets the loopback rank count |
 | `BRAE_GPU_MAP="g0,g1,..."` | node-local rank `i` uses GPU `gi` (from the placement tool); applied before any CUDA context exists; an invalid map aborts the job |
 | `BRAE_NCCL_ALLOW_SHARED_GPU=1` | let several NCCL ranks share one GPU (testing on a single-GPU machine; needs CUDA MPS for np = 8) |
+| `BRAE_PROC_GRAPH=0` | run the distributed AMG-PCG / symGaussSeidel loops host-driven on the NCCL backend too (default there is the whole-loop CUDA graph; the other backends are always host-driven) |
 | `BRAE_MGPU_GEOMETRY_ONLY=1` | test gate: steps the processor-patch refusals aside, couples the patches, writes a geometry dump and stops |
 
 Build:
@@ -56,8 +57,14 @@ Build:
 | `BRAE_NCCL_TEST_NP` | process counts of the NCCL tests, for example `"1;2;4;8"` (needs that many GPUs) |
 | `BRAE_WITH_NVSHMEM` | no longer used by the multi-GPU code; configure `OFF` on a DGX-1 |
 
-CUDA graphs: the np > 1 AMG-PCG and Gauss-Seidel loops are host-driven for now; the graph versions on NCCL's graph-only
-communicator are being added.
+CUDA graphs: on the NCCL backend the np > 1 AMG-PCG and symGaussSeidel loops run as ONE conditional-WHILE graph per rank
+(the halo exchange and the deterministic allgather-based reductions inside the body on the graph-only communicator, the
+stop decided on the device from the globally reduced residual, so every rank runs the same count). They are bit-identical
+to the host-driven loops — same iteration counts, residual histories and solutions — which the MPI-host backend runs and
+`BRAE_PROC_GRAPH=0` selects on NCCL; `BRAE_PCG_DEVICE=0` and `BRAE_GS_HOST_LOOP` also force the host loops. The decomposed
+solve's graph cache is keyed on the same identity as the single-GPU one plus the processor interface and the halo plan.
+`tests/test_dist_solvers.cu` compares the two arms under `BRAE_COMM=nccl` (7 PCG and 7 Gauss-Seidel configurations per
+problem/decomposition, including maxIter caps, relTol, minIter and an already-converged start).
 
 ## Tools and tests
 

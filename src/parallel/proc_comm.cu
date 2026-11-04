@@ -1,6 +1,7 @@
 // brae::ProcComm: backends (loopback, MPI-host, NCCL), halo plans, synthetic partitioner.
 // The contract is documented in proc_comm.cuh.
 #include "proc_comm.cuh"
+#include "proc_hooks.cuh"   // procGraphDestroyAll: captured solver graphs die before the communicators
 
 #include <mpi.h>
 #include <unistd.h>
@@ -450,6 +451,7 @@ HaloPlan::~HaloPlan()
 ProcComm::ProcComm(Backend b, int rank, int size) : rank_(rank), size_(size), backend_(b) {}
 ProcComm::~ProcComm()
 {
+    procGraphDestroyAll(this);          // graphs captured on this comm's graph channel die BEFORE its communicators
     if (g_current == this) g_current = nullptr;
     if (t_current == this) t_current = nullptr;
 }
@@ -1624,11 +1626,18 @@ public:
         if (size_ == 1) return;
         stopSideChannel();    // joins the watchdog before the communicators it polls are destroyed
         cudaStreamSynchronize(wst_);
-        for (int c = 0; c < 2; ++c) if (comm_[c]) ncclCommDestroy(comm_[c]);
-        for (int c = 0; c < 2; ++c) cudaFree(gath_[c]);
-        cudaFree(scratch_);
-        cudaStreamDestroy(wst_);
+        // The two communicators are PROCESS-LIFETIME. They are deliberately NOT destroyed here: once conditional-WHILE
+        // solver graphs have run on the graph communicator, ncclCommFinalize/Destroy/Abort all funnel into NCCL's
+        // commDestroySync, which waits for a GLOBAL quiescence that never arrives (measured at np=2 on one shared GPU:
+        // both ranks stuck in commDestroySync with every graph already destroyed and the device synchronised; the
+        // results were correct and complete). Destroying them would hang the job at exit. The OS reclaims the device
+        // and host resources when the process ends. Abort/re-create uses initComms() directly and is unaffected.
+        // gath_/scratch_/wst_ are likewise left to the process teardown: freeing them while NCCL still references them
+        // is the same hazard.
+        comm_[0] = nullptr;
+        comm_[1] = nullptr;
     }
+
 
     bool graphCapturable() const override { return true; }
 

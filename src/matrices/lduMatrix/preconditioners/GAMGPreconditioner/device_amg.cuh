@@ -115,8 +115,10 @@ struct PCGGraphCache {
     const void* keyProcComm = nullptr; const void* keyProcPlan = nullptr;
     const void* keyProcFaceCell = nullptr; const void* keyProcNbrIdx = nullptr; const void* keyProcRank = nullptr;
     int keyProcFaces = -1; int keyHistCap = -1; const void* keyPA = nullptr;
+    const void* registeredComm = nullptr;   // proc_hooks.cuh registry: the comm whose graph channel this captured on
     ~PCGGraphCache();
 };
+void destroyPcgGraphs(PCGGraphCache* c);   // the registry's destroy closure (device_amg.cu)
 
 // One agglomeration level: maps grid k (nFine cells) -> grid k+1 (nCoarse cells), and holds grid k+1's matrix.
 struct AMGLevel {

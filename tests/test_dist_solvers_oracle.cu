@@ -171,9 +171,10 @@ std::unique_ptr<System> build(RankData d, ProcComm* comm)
 
 struct Result { DeviceSolverPerf perf; std::vector<scalar> x; };
 
-Result solvePcg(System& s, const std::vector<double>& x0, scalar tol)
+Result solvePcg(System& s, const std::vector<double>& x0, scalar tol, bool graph = false)
 {
     DeviceBuffer<scalar> x(static_cast<std::size_t>(s.nC), static_cast<std::size_t>(s.nHalo));
+    setenv("BRAE_PROC_GRAPH", graph ? "1" : "0", 1);
     x.copyFrom(x0);
     const scalar nf = deviceNormFactor(s.view, x, s.b, deviceOnes(s.nC));
     Result r;
@@ -182,10 +183,11 @@ Result solvePcg(System& s, const std::vector<double>& x0, scalar tol)
     return r;
 }
 
-Result solveGs(System& s, const std::vector<double>& x0, scalar tol)
+Result solveGs(System& s, const std::vector<double>& x0, scalar tol, bool graph = false)
 {
     DeviceBuffer<scalar> x(static_cast<std::size_t>(s.nC), static_cast<std::size_t>(s.nHalo));
     x.copyFrom(x0);
+    setenv("BRAE_PROC_GRAPH", graph ? "1" : "0", 1);
     const scalar nf = deviceNormFactor(s.view, x, s.b, deviceOnes(s.nC));
     Result r;
     deviceSymGaussSeidel(s.view, s.b, x, nf, tol, 0.0, 200000, &r.perf);
@@ -211,7 +213,8 @@ int main(int argc, char** argv)
     try
     {
         Pstream::init(argc, argv);
-        std::unique_ptr<ProcComm> comm = ProcComm::createMpiHost();
+        std::vector<std::unique_ptr<ProcComm>> comms = ProcComm::create();        // BRAE_COMM = mpi (default) | nccl | auto
+        std::unique_ptr<ProcComm> comm = std::move(comms.at(0));
         g_comm = comm.get();
         ProcComm::setCurrent(comm.get());
         if (argc < 2) { if (comm->isMaster()) std::printf("usage: test_dist_solvers_oracle <dump dir> [<monolithic dump dir>]\n"); Pstream::finalize(); return 77; }
@@ -248,6 +251,26 @@ int main(int argc, char** argv)
         const Result gs = solveGs(*sys, x0, 1e-10);
         const double gdiff = gmax(maxRel(gs.x, xRef));
         check(gs.perf.finalResidual < 1e-10, "symGaussSeidel reached the tolerance");
+        // the CUDA-graph loops on the NCCL backend against the host-driven ones on the OpenFOAM-dumped matrices
+        if (np > 1 && comm->backend() == ProcComm::Backend::Nccl)
+        {
+            const Result pg = solvePcg(*sys, x0, tol, true);
+            check(pg.perf.nIterations == pcg.perf.nIterations
+                  && std::memcmp(&pg.perf.finalResidual, &pcg.perf.finalResidual, sizeof(scalar)) == 0
+                  && std::memcmp(&pg.perf.initialResidual, &pcg.perf.initialResidual, sizeof(scalar)) == 0
+                  && pg.x.size() == pcg.x.size()
+                  && std::memcmp(pg.x.data(), pcg.x.data(), pg.x.size()*sizeof(scalar)) == 0,
+                  "graph AMG-PCG is bit-identical to the host-driven loop on the OpenFOAM matrix");
+            const Result gg = solveGs(*sys, x0, 1e-10, true);
+            check(gg.perf.nIterations == gs.perf.nIterations
+                  && std::memcmp(&gg.perf.finalResidual, &gs.perf.finalResidual, sizeof(scalar)) == 0
+                  && gg.x.size() == gs.x.size()
+                  && std::memcmp(gg.x.data(), gs.x.data(), gg.x.size()*sizeof(scalar)) == 0,
+                  "graph symGaussSeidel is bit-identical to the host-driven loop on the OpenFOAM matrix");
+            if (comm->isMaster())
+                std::printf("  graph vs host-driven on the OpenFOAM matrix: PCG %d iterations, symGS %d sweeps, bit-identical\n",
+                            pg.perf.nIterations, gg.perf.nIterations);
+        }
         check(gdiff < 1e-4, "symGaussSeidel solution against OpenFOAM's " + std::to_string(gdiff));
 
         // the same system, monolithic (serial dump): iteration growth with np

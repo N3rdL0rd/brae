@@ -96,6 +96,23 @@ void gsSetCondK(
     const bool stop = converged || (it >= maxIter);
     cudaGraphSetConditional(h, stop ? 0u : 1u);
 }
+// The decomposed graph's START: the host loop's entry test `initRes < tol && minIter <= 0`, on the device. Seeds the
+// sweep count and the final residual so a solve that runs no sweep reports its initial residual as the final one.
+__global__
+void gsStartCondK(
+    cudaGraphConditionalHandle h,
+    const scalar* init,
+    scalar tol,
+    int minIter,
+    int* iter,
+    scalar* res)
+{
+    if (threadIdx.x || blockIdx.x) return;
+    *iter = 0;
+    const scalar ir = *init;
+    *res = ir;
+    cudaGraphSetConditional(h, (ir < tol && minIter <= 0) ? 0u : 1u);
+}
 struct GSGraphCache
 {
     cudaGraphExec_t exec = nullptr;
@@ -122,6 +139,7 @@ struct GSGraphCache
     DeviceBuffer<scalar> bEff, gProcCoeff;
     const void* procComm = nullptr; const void* procPlan = nullptr;
     const void* procFaceCell = nullptr; const void* procNbrIdx = nullptr; const void* procRank = nullptr;
+    const void* registeredComm = nullptr;   // proc_hooks.cuh registry: comm this cache's graph was captured on
     int procFaces = -1;
     ~GSGraphCache()
     {
@@ -298,9 +316,14 @@ static void deviceSymGaussSeidelProcGraph(
     bool symmetric,
     DeviceSolverPerf& perf)
 {
+    // Leaked like the single-GPU cache (no static dtor after the CUDA context is torn down); a graph captured on the
+    // graph communicator is registered with proc_hooks.cuh, so the COMMUNICATOR's destructor destroys it first --
+    // ncclCommDestroy waits for the graph's work to be globally quiescent and hangs otherwise.
+    using ProcGsCache = std::map<const void*, GSGraphCache>;
+    static auto& owned = *new ProcGsCache();
+    ProcGsCache& cache = owned;
     const DeviceLduView Ablock = deviceBlockLocal(A);
     const DeviceGaussSeidelLevels& lv = gsLevelsFor(Ablock);
-    static auto& cache = *new std::map<const void*, GSGraphCache>();
     GSGraphCache& c = cache[psi.data()];
     cacheStat("gs-graph-proc", cache.size());
     const int nC = A.nCells, nF = A.nInternalFaces;
@@ -346,22 +369,15 @@ static void deviceSymGaussSeidelProcGraph(
         std::printf("  smoothSolver: decomposed-mesh device loop (NCCL graph communicator), %s gather\n",
                     gsLevelGatherEnabled(lv) ? "level-ordered" : "index");
     }
-    // initial residual, global: eager halo + reduction (collectives every rank issues, whatever it decides to capture)
-    deviceAmul(sA, psi, c.Ax);
-    deviceCopy(c.r, c.gsB);
-    deviceAxpy(-1.0, c.Ax, c.r);
-    deviceSumMagInto(c.r, c.gInit.data());
-    gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.gInit.data(), c.gNormF.data());
-    scalar initRes;
-    const DeviceReadValue initV[1] =
+    // The initial residual is IN THE GRAPH's prologue, not eager: an eager collective on this stream between
+    // graph-captured ones is what NCCL_GRAPH_MIXING_SUPPORT=0 forbids (two communicators, one stream), and it
+    // deadlocked the communicator teardown. Pre-size the operands and the reduction scratch rank-locally instead.
     {
-        {c.gInit.data(), &initRes, false}
-    };
-    deviceReadValues(initV, 1);
-    if (initRes < tol && minIter <= 0)
-    {
-        perf = {initRes, initRes, 0};
-        return;
+        LocalReductions localOnly;
+        deviceAmul(Ablock, psi, c.Ax);
+        deviceCopy(c.r, c.gsB);
+        deviceAxpy(-1.0, c.Ax, c.r);
+        deviceSumMagInto(c.r, c.gInit.data());
     }
     cudaMemsetAsync(c.gIter.data(), 0, sizeof(int), cudaStreamPerThread);
     const int epoch = deviceReductionScratchEpoch();
@@ -386,14 +402,32 @@ static void deviceSymGaussSeidelProcGraph(
             c.graph = nullptr;
         }
         cudaCheck(cudaGraphCreate(&c.graph, 0), "gs proc graph create");
-        cudaCheck(cudaGraphConditionalHandleCreate(&c.handle, c.graph, 1, cudaGraphCondAssignDefault), "gs proc cond handle");
+        cudaCheck(cudaGraphConditionalHandleCreate(&c.handle, c.graph, 0, cudaGraphCondAssignDefault), "gs proc cond handle");
+        cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, c.graph, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "gs proc prologue capture");
+        {
+            ProcChannelScope onGraph(CommChannel::Graph);
+            // the prologue: r = b - A psi (halo of psi), the global initial residual, the loop's start decision
+            deviceAmul(sA, psi, c.Ax);
+            deviceCopy(c.r, c.gsB);
+            deviceAxpy(-1.0, c.Ax, c.r);
+            deviceSumMagInto(c.r, c.gInit.data());
+            gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.gInit.data(), c.gNormF.data());
+            gsStartCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.gInit.data(), tol, minIter, c.gIter.data(), c.gRes.data());
+        }
+        cudaStreamCaptureStatus st;
+        const cudaGraphNode_t* deps = nullptr;
+        std::size_t nDeps = 0;
+        cudaCheck(braeStreamGetCaptureInfo(cudaStreamPerThread, &st, &deps, &nDeps), "gs proc capture info");
+        std::vector<cudaGraphNode_t> depv(deps, deps + nDeps);
+        cudaGraph_t tmp;
+        cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "gs proc prologue capture end");
         cudaGraphNodeParams cp = {};
         cp.type = cudaGraphNodeTypeConditional;
         cp.conditional.handle = c.handle;
         cp.conditional.type = cudaGraphCondTypeWhile;
         cp.conditional.size = 1;
         cudaGraphNode_t cnode;
-        cudaCheck(braeGraphAddNode(&cnode, c.graph, nullptr, 0, &cp), "gs proc cond node");
+        cudaCheck(braeGraphAddNode(&cnode, c.graph, depv.data(), depv.size(), &cp), "gs proc cond node");
         cudaGraph_t body = cp.conditional.phGraph_out[0];
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "gs proc capture begin");
         {
@@ -410,7 +444,6 @@ static void deviceSymGaussSeidelProcGraph(
             gsSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.gRes.data(), tol, c.gInit.data(), relTol,
                                                       c.gIter.data(), maxIter, minIter, sweepsPer);
         }
-        cudaGraph_t tmp;
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "gs proc capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "gs proc graph instantiate");
         c.key = psi.data(); c.scratchEpoch = epoch;
@@ -419,16 +452,28 @@ static void deviceSymGaussSeidelProcGraph(
         c.sweepsPer = sweepsPer; c.symmetric = symmetric;
         c.procComm = A.proc.comm; c.procPlan = A.proc.plan; c.procFaceCell = A.proc.faceCell;
         c.procNbrIdx = A.proc.nbrIdx; c.procRank = A.proc.rank; c.procFaces = A.proc.nFaces;
+        if (c.registeredComm != (const void*)A.proc.comm)
+        {
+            if (c.registeredComm) procGraphUnregister(static_cast<const ProcComm*>(c.registeredComm), &c);
+            procGraphRegister(A.proc.comm, [](void* p)
+            {
+                GSGraphCache& g = *static_cast<GSGraphCache*>(p);
+                if (g.exec) { cudaGraphExecDestroy(g.exec); g.exec = nullptr; }
+                if (g.graph) { cudaGraphDestroy(g.graph); g.graph = nullptr; }
+            }, &c);
+            c.registeredComm = A.proc.comm;
+        }
     }
     cudaCheck(cudaGraphLaunch(c.exec, cudaStreamPerThread), "gs proc graph launch");
-    scalar finalRes;
+    scalar initRes, finalRes;
     int nIter;
-    const DeviceReadValue repV[2] =
+    const DeviceReadValue repV[3] =
     {
+        {c.gInit.data(), &initRes, false},
         {c.gRes.data(), &finalRes, false},
         {c.gIter.data(), &nIter, true}
     };
-    deviceReadValues(repV, 2);
+    deviceReadValues(repV, 3);
     perf = {initRes, finalRes, nIter};
 }
 

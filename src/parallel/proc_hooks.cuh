@@ -39,4 +39,12 @@ inline bool procGraphLoops(const ProcComm& c)
     return c.backend() == ProcComm::Backend::Nccl && c.graphCapturable();
 }
 
+// REGISTRY of the CUDA graphs captured on a communicator's graph channel. A communicator's destructor destroys these
+// BEFORE it destroys its NCCL communicators: a graph that outlives them makes ncclCommDestroy wait forever for the
+// graph's work to be globally quiescent (measured: np=2, both ranks in commDestroySync after the solver WHILE graphs).
+// Each captured cache registers a small closure (destroy its graphs) keyed by the communicator it captured on.
+void procGraphRegister(const ProcComm* c, void (*destroy)(void*), void* arg);
+void procGraphDestroyAll(const ProcComm* c);   // ProcComm's destructor; idempotent, safe with no graphs
+void procGraphUnregister(const ProcComm* c, void* arg);   // a cache that dies before its communicator
+
 } // namespace brae

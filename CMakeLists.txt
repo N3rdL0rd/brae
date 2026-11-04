@@ -80,6 +80,7 @@ add_library(brae_core STATIC
     src/parallel/pstream/device_halo.cu
     src/parallel/pstream/device_reduce.cu
     src/parallel/proc_comm.cu
+    src/parallel/proc_hooks.cu
     src/parallel/processor_coupling.cu
     src/parallel/proc_topology.cu
     src/OpenFOAM/meshes/interface/processor_interface.cu

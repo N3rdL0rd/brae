@@ -823,6 +823,12 @@ static DeviceSolverPerf deviceAMGPCGProcGraph(
         c.keyProcFaces = A.proc.nFaces;
         c.keyPA = c.pA.data();
         c.keyHistCap = static_cast<int>(histCap);
+        if (c.registeredComm != (const void*)A.proc.comm)
+        {
+            if (c.registeredComm) procGraphUnregister(static_cast<const ProcComm*>(c.registeredComm), &c);
+            procGraphRegister(A.proc.comm, [](void* p){ destroyPcgGraphs(static_cast<PCGGraphCache*>(p)); }, &c);
+            c.registeredComm = A.proc.comm;
+        }
     }
     cudaCheck(cudaGraphLaunch(c.exec, cudaStreamPerThread), "pcg proc graph launch");
     scalar hRes[2];
