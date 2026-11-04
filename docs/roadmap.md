@@ -33,11 +33,17 @@ Ordered by value against cost, not by ambition.
 - **`eval_scoped`** — `#eval{ 2*$R }` cannot resolve `$variable` references. Refuses rather than guessing.
 - **`linear_solver_setup`** — the refusal is correct; the test does not catch it, so the binary aborts.
 
+## In progress
+
+- **Multi-GPU `interFoam`.** One case across up to 8 GPUs of one node, with OpenFOAM's own `-parallel` semantics
+  (`decomposePar` output, processor patches, per-rank preconditioners, global reductions), validated against OpenFOAM
+  `-parallel`. The reader, processor-patch geometry (bit-identical to OpenFOAM), the communication layer (loopback,
+  MPI and NCCL backends), the distributed solvers, the per-rank writer and the function-object reductions are in; the
+  operators, MULES and the pressure/momentum assembly across a processor face are not, so a run with processor faces
+  still stops by name. Status, options and tools: [Multi-GPU](multi-gpu.md).
+
 ## Not scheduled
 
-- **Multi-GPU.** The distributed solvers moved to `legacy/` and are out of scope (`legacy/README.md`).
-  `brae ... -parallel` refuses at start-up. Single-device residency is what removes the domain-decomposition
-  approximation OpenFOAM pays in parallel.
 - **Overset** (`overRhoSimpleFoam`, `overPimpleDyMFoam`, `overInterDyMFoam`). Belongs on its own branch — it is not
   a boundary condition, it changes the matrix itself:
   - `cellCellStencil` — donor/acceptor search across disconnected meshes, in four flavours. Geometric search across

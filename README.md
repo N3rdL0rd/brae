@@ -147,7 +147,7 @@ Anything outside that list **stops at start-up, named**. Anything brae does diff
 curl -fsSL https://brae.sh/install.sh | sh
 ```
 
-NVIDIA GPU (Ampere or newer), CUDA 12.4+ (13.x recommended), C++17.
+NVIDIA GPU (Ampere or newer; Volta/V100 builds with CUDA 12.x, see [compatibility](docs/getting-started.md#gpu-and-toolchain-compatibility)), CUDA 12.4+ (13.x recommended), C++17.
 
 <details>
 <summary>Build from source</summary>
@@ -168,6 +168,7 @@ cmake --build build -j --target brae brae_pimpleFoam brae_rhoSimpleFoam brae_int
 | RTX 50-series | 120 | RTX 40-series / L40 | 89 |
 | GB300 / B300 | 103 | RTX 30-series | 86 |
 | B200 / GB200 | 100 | A100 | 80 |
+| V100 (Volta, CUDA 12.x only) | 70 | several GPUs, one binary | `"70;90;120"` |
 
 </details>
 
