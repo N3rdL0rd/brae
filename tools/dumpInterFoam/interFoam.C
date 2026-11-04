@@ -332,8 +332,11 @@ int main(int argc, char *argv[])
                     << runTime.timeIndex() << endl;
             }
 
+            if (getenv("BRAE_STAGE_ALPHA")) volScalarField("sAlphaBeforeFinalMixture.dump", alpha1).write();
+            if (getenv("BRAE_STAGE_ALPHA")) volScalarField("sAlpha2BeforeFinalMixture.dump", alpha2).write();
             mixture.correct();
 
+            if (getenv("BRAE_STAGE_ALPHA")) volScalarField("sAlpha2AfterFinalMixture.dump", alpha2).write();
             // ---- ORACLE INSTRUMENTATION (tools/mgpu_oracle): what the alpha step hands to momentum/pressure
             if (braeOracleStep())
             {
