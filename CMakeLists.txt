@@ -77,8 +77,6 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(brae_core STATIC
     src/parallel/pstream/cf_pstream.cu
-    src/parallel/pstream/device_halo.cu
-    src/parallel/pstream/device_reduce.cu
     src/parallel/proc_comm.cu
     src/parallel/proc_hooks.cu
     src/parallel/processor_coupling.cu
@@ -291,36 +289,6 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(brae_core PUBLIC ${OpenMP_CXX_LIBRARIES})
 endif()
 
-# ---------------------------------------------------------------------------
-# NVSHMEM device transport (multi-GPU, Phase 1+). Phase 1a is host-side only: the bootstrap
-# (nvshmemx_init_attr off MPI) and the symmetric heap (nvshmem_malloc) link against libnvshmem_host and need
-# NO relocatable device code. Phase 1b's device-initiated put adds -rdc + device-link on its own TU only.
-# Default ON; if NVSHMEM is not found the build falls back to the MPI backend (single-GPU still compiles).
-# Override the location with -DNVSHMEM_HOME=... or the NVSHMEM_HOME env var.
-# ---------------------------------------------------------------------------
-option(BRAE_WITH_NVSHMEM "Build the NVSHMEM device transport for multi-GPU" ON)
-if(BRAE_WITH_NVSHMEM)
-    find_path(NVSHMEM_INCLUDE_DIR NAMES nvshmem.h
-        HINTS $ENV{NVSHMEM_HOME} ${NVSHMEM_HOME}
-        PATHS /opt/nvidia/hpc_sdk/Linux_aarch64/26.5/comm_libs/13.2/nvshmem
-        PATH_SUFFIXES include)
-    find_library(NVSHMEM_HOST_LIB NAMES nvshmem_host
-        HINTS $ENV{NVSHMEM_HOME} ${NVSHMEM_HOME}
-        PATHS /opt/nvidia/hpc_sdk/Linux_aarch64/26.5/comm_libs/13.2/nvshmem
-        PATH_SUFFIXES lib)
-    if(NVSHMEM_INCLUDE_DIR AND NVSHMEM_HOST_LIB)
-        get_filename_component(NVSHMEM_LIB_DIR ${NVSHMEM_HOST_LIB} DIRECTORY)
-        message(STATUS "cf NVSHMEM: ${NVSHMEM_HOST_LIB} (hdr ${NVSHMEM_INCLUDE_DIR})")
-        target_include_directories(brae_core PUBLIC ${NVSHMEM_INCLUDE_DIR})
-        target_link_libraries(brae_core PUBLIC ${NVSHMEM_HOST_LIB})
-        target_compile_definitions(brae_core PUBLIC BRAE_WITH_NVSHMEM)
-        # Find libnvshmem_host.so.3 and the dlopen'd MPI bootstrap plugin at runtime.
-        list(APPEND CMAKE_BUILD_RPATH ${NVSHMEM_LIB_DIR})
-    else()
-        message(WARNING "cf NVSHMEM requested but not found; building the MPI backend only (single-GPU)")
-        set(BRAE_WITH_NVSHMEM OFF)
-    endif()
-endif()
 
 # ---------------------------------------------------------------------------
 # NCCL transport of ProcComm (multi-GPU interFoam, one process per GPU; src/parallel/proc_comm.cu). Default OFF:
@@ -405,6 +373,14 @@ foreach(_np 2 4 8)
     add_test(NAME loopback_reduction_threads_np${_np} COMMAND test_loopback_reduction_threads ${_np})
     set_tests_properties(loopback_reduction_threads_np${_np} PROPERTIES TIMEOUT 300)
 endforeach()
+
+# Processor faces are stably grouped by pass at interface construction (finding 13): grouped contiguous-range
+# launches must be bit-identical to the old full-face/filter launches (A/B inside the test).
+add_executable(test_proc_pass_grouping tests/test_proc_pass_grouping.cu)
+target_include_directories(test_proc_pass_grouping PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_pass_grouping PRIVATE brae_core)
+add_test(NAME proc_pass_grouping COMMAND test_proc_pass_grouping)
+set_tests_properties(proc_pass_grouping PROPERTIES TIMEOUT 120)
 
 # Global Courant numbers / time steps and zero-cell-rank collective participation (findings 4 and 6).
 add_executable(test_courant_global tests/test_courant_global.cu)

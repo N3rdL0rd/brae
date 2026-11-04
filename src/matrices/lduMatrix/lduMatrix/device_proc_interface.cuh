@@ -29,6 +29,7 @@ private:
     const HaloPlan* plan_;
     DeviceBuffer<scalar> coeff_;
     DeviceBuffer<label> rank_;
+    DeviceBuffer<label> passStart_, faceCell_, nbrIdx_, perm_;
     int nRanks_ = 1;
     long long nGlobalCells_ = 0;
 };

@@ -263,6 +263,19 @@ template <class Kernel>
 inline void launchProcFaces(Kernel k, const DeviceProcView& p, const scalar* x, scalar* y)
 {
     if (p.nFaces <= 0) return;
+    if (p.passStart && !std::getenv("BRAE_PROC_FULL_FACE_LAUNCH"))
+    {
+        // Stable pass-grouped arrays: the same faces in the same per-cell order as the filtered launch, but the
+        // grid covers only the pass's contiguous range. Empty passes issue no launch.
+        for (int pass = 0; pass < p.nRanks; ++pass)
+        {
+            const int first = p.passFirst[pass], count = p.passFirst[pass + 1] - first;
+            if (count > 0)
+                k<<<(count + TPB - 1)/TPB, TPB>>>(count, p.faceCell + first, p.nbrIdx + first,
+                                                  p.coeff + first, nullptr, 0, x, y);
+        }
+        return;
+    }
     for (int pass = 0; pass < p.nRanks; ++pass)
     {
         k<<<(p.nFaces + TPB - 1) / TPB, TPB>>>(p.nFaces, p.faceCell, p.nbrIdx, p.coeff,
