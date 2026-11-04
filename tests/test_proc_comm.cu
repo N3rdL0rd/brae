@@ -593,6 +593,14 @@ int mpiSuite(int argc, char** argv)
                 run(name.c_str(), [&] { runCase(*c, np, pc.second, s); });
                 run((name + " plan from processor patches").c_str(), [&] { testBuildFromPatches(*c, pc.second, s); });
             }
+            const SyntheticPartition& ap = parts.front().second;
+            for (int late = 0; late < 2; ++late)
+                for (int inEx = 0; inEx < 2; ++inEx)
+                {
+                    const std::string an = std::string("mpi collectiveAbort (") + (late ? "late" : "early") + " failing rank, in "
+                                           + (inEx ? "exchangeCells" : "allReduce") + ")";
+                    run(an.c_str(), [&] { testAbort(*c, np, ap, s, late, inEx); });
+                }
         }
     }
     Pstream::finalize();

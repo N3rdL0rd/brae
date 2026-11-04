@@ -350,6 +350,13 @@ target_include_directories(test_proc_comm PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_proc_comm PRIVATE brae_core)
 add_test(NAME proc_comm_loopback COMMAND test_proc_comm)
 set_tests_properties(proc_comm_loopback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+# the same tests on the MPI-host backend: one process per rank, np > GPUs is fine
+foreach(_np 1 2 3 4 8)
+    add_test(NAME proc_comm_mpi_np${_np}
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                     $<TARGET_FILE:test_proc_comm> mpi)
+    set_tests_properties(proc_comm_mpi_np${_np} PROPERTIES TIMEOUT 300)
+endforeach()
 
 # Multi-GPU Phase 0b: per-rank DeviceMesh upload + device-path reconstruction
 add_executable(test_gpu_decompose tests/test_gpu_decompose.cu)

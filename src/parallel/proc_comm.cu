@@ -748,10 +748,266 @@ std::vector<std::unique_ptr<ProcComm>> ProcComm::createLoopback(int np, std::siz
     return v;
 }
 
-// MPI-HOST backend: added in the next commit.
+// ------------------------------------------------------------------------------------------------------------
+// MPI-HOST backend
+// ------------------------------------------------------------------------------------------------------------
+namespace {
+
+constexpr int kTagCells = 7001, kTagFaces = 7002, kTagInts = 7003;
+
+struct AbortRec { int flag; int pad; char msg[248]; };
+
+struct MpiPlan : StagePlan
+{
+    double* hSend = nullptr;     // pinned
+    double* hRecv = nullptr;     // pinned
+    cudaEvent_t lastUse = nullptr;
+    ~MpiPlan() override
+    {
+        if (lastUse) cudaEventDestroy(lastUse);
+        cudaFreeHost(hSend);
+        cudaFreeHost(hRecv);
+    }
+};
+
+double* hostAlloc(std::size_t n)
+{
+    if (n == 0) return nullptr;
+    double* p = nullptr;
+    ck(cudaMallocHost(&p, n*sizeof(double)), "cudaMallocHost");
+    ++g_allocs;
+    return p;
+}
+
+void mpiCheck(int rc, const char* what)
+{
+    if (rc != MPI_SUCCESS) throw std::runtime_error(std::string("ProcComm MPI: ") + what + " failed");
+}
+
+class MpiHostComm final : public ProcComm
+{
+public:
+    MpiHostComm() : ProcComm(Backend::MpiHost, Pstream::myProcNo(), Pstream::nProcs())
+    {
+        device_ = Pstream::deviceId();
+    }
+    bool graphCapturable() const override { return false; }
+
+protected:
+    std::unique_ptr<HaloPlan> doMakePlan(HaloPlanDesc desc, int maxComps) override
+    {
+        status(nullptr);
+        std::unique_ptr<HaloPlan> plan = newPlan(std::move(desc));
+        auto st = std::make_unique<MpiPlan>();
+        MpiPlan* sp = st.get();
+        const HaloPlanDesc& d = detail::PlanAccess::desc(*plan);
+        sp->init(d, maxComps, true);
+        sp->hSend = hostAlloc(sp->sendCap);
+        sp->hRecv = hostAlloc(sp->recvCap);
+        ck(cudaEventCreateWithFlags(&sp->lastUse, cudaEventDisableTiming), "cudaEventCreate");
+        std::vector<RecvEntry> rt(d.nbrs.size());
+        std::vector<FaceEntry> ft(d.nbrs.size());
+        for (std::size_t k = 0; k < d.nbrs.size(); ++k)
+        {
+            const HaloNeighbour& n = d.nbrs[k];
+            rt[k] = {sp->dRecv, n.recvStart, n.recvCount, n.recvStart};
+            ft[k] = {sp->dRecv, n.faceStart, n.faceCount, n.faceStart};
+        }
+        sp->setTables(rt, ft);
+        setPlanState(*plan, std::move(st));
+        // the neighbours must agree on the message sizes
+        std::vector<int> nbr;
+        std::vector<std::vector<int>> mine;
+        for (const HaloNeighbour& n : d.nbrs) { nbr.push_back(n.rank); mine.push_back({n.sendCount, n.recvCount, n.faceCount}); }
+        const auto theirs = exchangeInts(nbr, mine);
+        double bad = 0;
+        for (std::size_t k = 0; k < nbr.size(); ++k)
+            if (theirs[k].size() != 3 || theirs[k][0] != d.nbrs[k].recvCount || theirs[k][1] != d.nbrs[k].sendCount
+                || theirs[k][2] != d.nbrs[k].faceCount)
+                bad = 1;
+        mpiCheck(MPI_Allreduce(MPI_IN_PLACE, &bad, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD), "Allreduce");
+        if (bad != 0)
+            throw ProcCommAbort("ProcComm::makePlan: the ranks' halo plans do not match (send/recv/face counts)", 0);
+        return plan;
+    }
+
+    void doExchangeCells(const HaloPlan& plan, const HaloField* fields, int nFields, cudaStream_t s, CommChannel) override
+    {
+        noCapture(s);
+        FlatComps fc;
+        flatten(fields, nFields, fc);
+        status(nullptr);
+        if (fc.n == 0) return;
+        auto* st = static_cast<MpiPlan*>(planState(plan));
+        checkCapacity(*st, fc.n);
+        const HaloPlanDesc& d = *st->desc;
+        const int C = fc.n;
+        ck(cudaEventSynchronize(st->lastUse), "wait last use");
+        st->pack(plan, fc, s);
+        const std::size_t nSend = static_cast<std::size_t>(C)*d.sendCells.size();
+        if (nSend) ck(cudaMemcpyAsync(st->hSend, st->dSend, nSend*sizeof(double), cudaMemcpyDeviceToHost, s), "D2H");
+        ck(cudaStreamSynchronize(s), "stream sync");
+        std::vector<MPI_Request> req;
+        req.reserve(2*d.nbrs.size());
+        for (const HaloNeighbour& n : d.nbrs)
+        {
+            MPI_Request r;
+            if (n.recvCount)
+            {
+                mpiCheck(MPI_Irecv(st->hRecv + static_cast<std::size_t>(C)*n.recvStart, C*n.recvCount, MPI_DOUBLE, n.rank, kTagCells, MPI_COMM_WORLD, &r), "Irecv");
+                req.push_back(r);
+            }
+            if (n.sendCount)
+            {
+                mpiCheck(MPI_Isend(st->hSend + static_cast<std::size_t>(C)*n.sendOffset, C*n.sendCount, MPI_DOUBLE, n.rank, kTagCells, MPI_COMM_WORLD, &r), "Isend");
+                req.push_back(r);
+            }
+        }
+        mpiCheck(MPI_Waitall(static_cast<int>(req.size()), req.data(), MPI_STATUSES_IGNORE), "Waitall");
+        const std::size_t nRecv = static_cast<std::size_t>(C)*d.nHalo;
+        if (nRecv) ck(cudaMemcpyAsync(st->dRecv, st->hRecv, nRecv*sizeof(double), cudaMemcpyHostToDevice, s), "H2D");
+        st->unpack(plan, fc, s);
+        ck(cudaEventRecord(st->lastUse, s), "record lastUse");
+    }
+
+    void doExchangeFaces(const HaloPlan& plan, double* arr, FaceOp op, cudaStream_t s, CommChannel) override
+    {
+        noCapture(s);
+        status(nullptr);
+        auto* st = static_cast<MpiPlan*>(planState(plan));
+        const HaloPlanDesc& d = *st->desc;
+        const std::size_t nf = static_cast<std::size_t>(d.nProcFaces);
+        ck(cudaEventSynchronize(st->lastUse), "wait last use");
+        if (nf) ck(cudaMemcpyAsync(st->hSend, arr, nf*sizeof(double), cudaMemcpyDeviceToHost, s), "D2H");
+        ck(cudaStreamSynchronize(s), "stream sync");
+        std::vector<MPI_Request> req;
+        for (const HaloNeighbour& n : d.nbrs)
+        {
+            MPI_Request r;
+            if (!n.faceCount) continue;
+            mpiCheck(MPI_Irecv(st->hRecv + n.faceStart, n.faceCount, MPI_DOUBLE, n.rank, kTagFaces, MPI_COMM_WORLD, &r), "Irecv");
+            req.push_back(r);
+            mpiCheck(MPI_Isend(st->hSend + n.faceStart, n.faceCount, MPI_DOUBLE, n.rank, kTagFaces, MPI_COMM_WORLD, &r), "Isend");
+            req.push_back(r);
+        }
+        mpiCheck(MPI_Waitall(static_cast<int>(req.size()), req.data(), MPI_STATUSES_IGNORE), "Waitall");
+        if (nf) ck(cudaMemcpyAsync(st->dRecv, st->hRecv, nf*sizeof(double), cudaMemcpyHostToDevice, s), "H2D");
+        st->combineFaces(arr, op, s);
+        ck(cudaEventRecord(st->lastUse, s), "record lastUse");
+    }
+
+    void doAllReduceDevice(double* d, int n, ReduceOp op, cudaStream_t s, CommChannel) override { deviceColl(d, n, opCode(op), 0, s); }
+    void doBcastDevice(double* d, int n, int root, cudaStream_t s, CommChannel) override
+    {
+        if (root < 0 || root >= size_) throw std::invalid_argument("ProcComm::bcast: root out of range");
+        deviceColl(d, n, 3, root, s);
+    }
+    void doAllReduceHost(double* h, int n, ReduceOp op) override { hostColl(h, n, opCode(op), 0); }
+    void doBcastHost(double* h, int n, int root) override
+    {
+        if (root < 0 || root >= size_) throw std::invalid_argument("ProcComm::bcast: root out of range");
+        hostColl(h, n, 3, root);
+    }
+
+    void doBarrier() override
+    {
+        status(nullptr);
+        mpiCheck(MPI_Barrier(MPI_COMM_WORLD), "Barrier");
+    }
+
+    std::vector<std::vector<int>> doExchangeInts(const std::vector<int>& nbr, const std::vector<std::vector<int>>& send) override
+    {
+        status(nullptr);
+        return exchangeInts(nbr, send);
+    }
+
+    [[noreturn]] void doAbort(const std::string& msg) override
+    {
+        status(&msg);   // joins the status phase of the collective the other ranks are in; always throws
+        throw ProcCommAbort(msg, rank_);
+    }
+
+private:
+    // The status phase opens every collective: all ranks allgather their abort flag (+ message). A raised
+    // abort is thrown, with the message of the lowest raising rank, by every rank including the raiser.
+    void status(const std::string* raise)
+    {
+        AbortRec mine;
+        std::memset(&mine, 0, sizeof(mine));
+        if (raise)
+        {
+            mine.flag = 1;
+            std::strncpy(mine.msg, raise->c_str(), sizeof(mine.msg) - 1);
+        }
+        std::vector<AbortRec> all(size_);
+        mpiCheck(MPI_Allgather(&mine, sizeof(AbortRec), MPI_BYTE, all.data(), sizeof(AbortRec), MPI_BYTE, MPI_COMM_WORLD), "Allgather");
+        for (int r = 0; r < size_; ++r)
+            if (all[r].flag) throw ProcCommAbort(std::string(all[r].msg), r);
+    }
+
+    static void noCapture(cudaStream_t s)
+    {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        ck(cudaStreamIsCapturing(s, &cs), "cudaStreamIsCapturing");
+        if (cs != cudaStreamCaptureStatusNone)
+            throw std::logic_error("ProcComm MPI-host backend is host-synchronous and cannot be captured in a CUDA graph");
+    }
+
+    std::vector<std::vector<int>> exchangeInts(const std::vector<int>& nbr, const std::vector<std::vector<int>>& send)
+    {
+        std::vector<MPI_Request> req(nbr.size());
+        for (std::size_t k = 0; k < nbr.size(); ++k)
+            mpiCheck(MPI_Isend(send[k].data(), static_cast<int>(send[k].size()), MPI_INT, nbr[k], kTagInts, MPI_COMM_WORLD, &req[k]), "Isend");
+        std::vector<std::vector<int>> recv(nbr.size());
+        for (std::size_t k = 0; k < nbr.size(); ++k)
+        {
+            MPI_Status stt;
+            mpiCheck(MPI_Probe(nbr[k], kTagInts, MPI_COMM_WORLD, &stt), "Probe");
+            int cnt = 0;
+            mpiCheck(MPI_Get_count(&stt, MPI_INT, &cnt), "Get_count");
+            recv[k].resize(cnt);
+            mpiCheck(MPI_Recv(recv[k].data(), cnt, MPI_INT, nbr[k], kTagInts, MPI_COMM_WORLD, MPI_STATUS_IGNORE), "Recv");
+        }
+        mpiCheck(MPI_Waitall(static_cast<int>(req.size()), req.data(), MPI_STATUSES_IGNORE), "Waitall");
+        return recv;
+    }
+
+    // allgather of the n partials, then the fixed-rank-order fold on every rank
+    void gatherFold(double* h, int n, int op, int root)
+    {
+        std::vector<double> all(static_cast<std::size_t>(size_)*n);
+        mpiCheck(MPI_Allgather(h, n, MPI_DOUBLE, all.data(), n, MPI_DOUBLE, MPI_COMM_WORLD), "Allgather");
+        std::vector<const double*> s(size_);
+        for (int r = 0; r < size_; ++r) s[r] = all.data() + static_cast<std::size_t>(r)*n;
+        foldHost(h, s, n, op, root);
+    }
+
+    void hostColl(double* h, int n, int op, int root)
+    {
+        status(nullptr);
+        if (n == 0) return;
+        gatherFold(h, n, op, root);
+    }
+
+    void deviceColl(double* d, int n, int op, int root, cudaStream_t s)
+    {
+        noCapture(s);
+        status(nullptr);
+        if (n == 0) return;
+        std::vector<double> h(n);
+        ck(cudaMemcpyAsync(h.data(), d, static_cast<std::size_t>(n)*sizeof(double), cudaMemcpyDeviceToHost, s), "D2H");
+        ck(cudaStreamSynchronize(s), "stream sync");
+        gatherFold(h.data(), n, op, root);
+        ck(cudaMemcpyAsync(d, h.data(), static_cast<std::size_t>(n)*sizeof(double), cudaMemcpyHostToDevice, s), "H2D");
+    }
+};
+
+} // namespace
+
 std::unique_ptr<ProcComm> ProcComm::createMpiHost()
 {
-    throw std::runtime_error("ProcComm MPI-host backend: not implemented yet");
+    if (!Pstream::initialized()) throw std::logic_error("ProcComm::createMpiHost: Pstream::init() has not been called");
+    return std::unique_ptr<ProcComm>(new MpiHostComm());
 }
 
 // ------------------------------------------------------------------------------------------------------------
