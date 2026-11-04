@@ -344,6 +344,13 @@ foreach(_np 1 2 4 8)
                      $<TARGET_FILE:test_gpu_bind>)
 endforeach()
 
+# Multi-GPU WP2: ProcComm (operator-side communication shim); loopback backend = N virtual ranks on one GPU
+add_executable(test_proc_comm tests/test_proc_comm.cu)
+target_include_directories(test_proc_comm PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_comm PRIVATE brae_core)
+add_test(NAME proc_comm_loopback COMMAND test_proc_comm)
+set_tests_properties(proc_comm_loopback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
 # Multi-GPU Phase 0b: per-rank DeviceMesh upload + device-path reconstruction
 add_executable(test_gpu_decompose tests/test_gpu_decompose.cu)
 target_include_directories(test_gpu_decompose PRIVATE ${BRAE_HEADER_DIRS})
