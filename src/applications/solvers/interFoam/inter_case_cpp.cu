@@ -5,6 +5,7 @@
 #include "time_instances.cuh"
 #include "inter_amr_cpp.cuh"
 #include "frozen_bc_guard.cuh"
+#include "proc_globals.cuh"
 #include <sstream>
 #include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
@@ -754,6 +755,10 @@ InterFields::PressureReference readPressureReference(
             break;
         }
     }
+    // GeometricField::needReference ends in returnReduceAnd (GeometricField.C:1145): ONE patch that fixes the
+    // value on ONE rank means no rank needs a reference. The sealed-looking rank that does not see the open
+    // patch must not pin its pressure. (No communicator: the identity.)
+    r.needReference = pg::andAll(r.needReference);
     if (!r.needReference) return r;
 
     const FoamDict* pim = fvSolution.subDict("PIMPLE");
@@ -764,12 +769,21 @@ InterFields::PressureReference readPressureReference(
     if (pim->found("pRefCell"))
     {
         r.pRefCell = static_cast<label>(pim->scalarOr("pRefCell", scalar(-1)));
-        if (r.pRefCell < 0 || r.pRefCell >= m.nCells())
+        // findRefCell.C:44-60: under -parallel only the MASTER reads pRefCell (a cell of ITS mesh, checked
+        // against ITS cell count) and every other rank's reference cell is -1
+        if (pg::parallel() && !pg::isMaster())
         {
-            throw std::runtime_error(
-                "brae interFoam: PIMPLE's pRefCell " + std::to_string(r.pRefCell) + " is outside the mesh's "
-                + std::to_string(m.nCells()) + " cells. OpenFOAM stops on the same condition.");
+            r.pRefCell = -1;
         }
+        else if (r.pRefCell < 0 || r.pRefCell >= m.nCells())
+        {
+            const std::string msg =
+                "brae interFoam: PIMPLE's pRefCell " + std::to_string(r.pRefCell) + " is outside the mesh's "
+                + std::to_string(m.nCells()) + " cells. OpenFOAM stops on the same condition.";
+            if (pg::parallel()) pg::fail("Illegal master cellID. " + msg);
+            throw std::runtime_error(msg);
+        }
+        pg::barrier();   // the master's refusal reaches every rank here
     }
     else if (pim->found("pRefPoint"))
     {
@@ -803,9 +817,10 @@ InterFields::PressureReference readPressureReference(
             }
             return true;
         };
-        // primitiveMesh::findNearestCell: the first of the nearest centres
+        // primitiveMesh::findNearestCell: the first of the nearest centres. A rank with no cells holds no
+        // candidate (its search answers -1, as polyMesh::findCell does on an empty mesh).
         label nearest = 0;
-        scalar minProximity = magSqr(g.C()[0] - refPoint);
+        scalar minProximity = m.nCells() > 0 ? magSqr(g.C()[0] - refPoint) : scalar(0);
         for (label celli = 1; celli < m.nCells(); ++celli)
         {
             const scalar proximity = magSqr(g.C()[celli] - refPoint);
@@ -816,7 +831,7 @@ InterFields::PressureReference readPressureReference(
             }
         }
         r.pRefCell = -1;
-        if (pointInCell(nearest))
+        if (m.nCells() > 0 && pointInCell(nearest))
         {
             r.pRefCell = nearest;
         }
@@ -831,8 +846,18 @@ InterFields::PressureReference readPressureReference(
                 }
             }
         }
-        if (r.pRefCell < 0)
+        // findRefCell.C:68-90: every rank searches its own cells; the point must be found on EXACTLY ONE
+        // rank (`sumHasRef`), and only that rank keeps its cell, the others hold -1
+        const long long sumHasRef = pg::sumCount(r.pRefCell >= 0 ? 1 : 0);
+        if (sumHasRef != 1)
         {
+            if (pg::parallel())
+            {
+                throw std::runtime_error(
+                    "brae interFoam: PIMPLE's pRefPoint is found on " + std::to_string(sumHasRef)
+                    + " domains by the face-plane test (it should be one). OpenFOAM then searches again with an "
+                    "octree over the cells' tet decomposition (polyMesh::findCell, CELL_TETS), which is not ported.");
+            }
             throw std::runtime_error(
                 "brae interFoam: PIMPLE's pRefPoint lies in no cell by the face-plane test. OpenFOAM then "
                 "searches again with an octree over the cells' tet decomposition (polyMesh::findCell, "

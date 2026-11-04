@@ -1,6 +1,7 @@
 // interFoam's pressure corrector -- see inter_peqn_cpp.cuh for the provenance and for the four things
 // in it that are interFoam's own.
 #include "inter_peqn_cpp.cuh"
+#include "proc_globals.cuh"
 #include "fvc_reconstruct_cpp.cuh"
 #include "inter_set_rdeltat_cpp.cuh"   // interpolateRDeltaT: localEuler's face rDeltaT
 #include <cmath>
@@ -189,11 +190,16 @@ void applyPressureReference(std::vector<scalar>&       p,
                             label                      pRefCell,
                             scalar                     pRefValue)
 {
-    if (pRefCell < 0 || static_cast<std::size_t>(pRefCell) >= p.size())
+    // Under -parallel only the rank that holds the reference cell has one (pRefCell >= 0); getRefCellValue
+    // (findRefCell.C:148-153) is that rank's value summed with the others' zeros, so every rank shifts by the
+    // same number. -1 is legal there and nowhere else.
+    if ((pRefCell < 0 && !pg::parallel()) || (pRefCell >= 0 && static_cast<std::size_t>(pRefCell) >= p.size()))
         throw std::runtime_error(
             "brae interFoam pEqn: pRefCell is outside the mesh. A p_rgh with no value-fixing patch "
             "needs a reference cell, and pEqn.H:74-83 reads p there.");
-    const scalar shift = pRefValue - p[static_cast<std::size_t>(pRefCell)];
+    const scalar shift = pg::parallel()
+        ? pRefValue - static_cast<scalar>(pg::sum(pRefCell >= 0 ? static_cast<double>(p[static_cast<std::size_t>(pRefCell)]) : 0.0))
+        : pRefValue - p[static_cast<std::size_t>(pRefCell)];
     for (scalar& v : p) v += shift;
     // ...AND p_rgh IS REBUILT FROM THE SHIFTED p. It does not keep what the solve gave it -- note 4.
     for (std::size_t c = 0; c < p.size(); ++c) p_rgh[c] = p[c] - rho[c]*gh[c];
@@ -998,11 +1004,16 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             // is pinned at ITS CURRENT p_rgh, not at pRefValue -- pRefValue is p's level, applied
             // below after the solve. fvMatrix::setReference: source += diag*value, diag += diag.
             // This used pRefValue here, on a path no gated case had ever taken.
-            if (sc.pRefCell < 0 || sc.pRefCell >= nC)
+            // (fvMatrix::setReference acts only where celli >= 0: the rank that holds the reference cell;
+            // the others hold -1 under -parallel)
+            if ((sc.pRefCell < 0 && !pg::parallel()) || sc.pRefCell >= nC)
                 throw std::runtime_error("brae interFoam pEqn: pRefCell is outside the mesh.");
-            const scalar refValue = p_rgh.internal[sc.pRefCell];
-            pe.source[sc.pRefCell] += pe.diag[sc.pRefCell] * refValue;
-            pe.diag[sc.pRefCell]   += pe.diag[sc.pRefCell];
+            if (sc.pRefCell >= 0)
+            {
+                const scalar refValue = p_rgh.internal[sc.pRefCell];
+                pe.source[sc.pRefCell] += pe.diag[sc.pRefCell] * refValue;
+                pe.diag[sc.pRefCell]   += pe.diag[sc.pRefCell];
+            }
         }
 
         // the assembled system, at the device arm's tap point: after the source, before the solve,

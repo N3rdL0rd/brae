@@ -4,6 +4,7 @@
 #include "device_mesh.cuh"
 #include "device_ldu.cuh"
 #include "device_simple.cuh"
+#include "proc_globals.cuh"
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -254,7 +255,9 @@ __global__ void setReferenceKernel(int cell, const scalar* __restrict__ pRgh,
 __global__ void refShiftKernel(int cell, scalar pRefValue,
                               const scalar* __restrict__ p, scalar* __restrict__ shift)
 {
-    if (blockIdx.x == 0 && threadIdx.x == 0) shift[0] = pRefValue - p[cell];
+    // cell < 0: another rank holds the reference cell (-parallel); this rank contributes the zero that
+    // getRefCellValue's sum (findRefCell.C:148-153) adds for it
+    if (blockIdx.x == 0 && threadIdx.x == 0) shift[0] = cell >= 0 ? pRefValue - p[cell] : scalar(0);
 }
 
 __global__ void applyRefShiftKernel(int nC, const scalar* __restrict__ shift,
@@ -588,16 +591,22 @@ void deviceInterAssemblePEqn(
 
     if (needReference)
     {
-        if (pRefCell < 0 || pRefCell >= nC)
-            throw std::runtime_error(
-                "brae interFoam device pEqn: pRefCell is outside the mesh. A case whose p_rgh has no "
-                "value-fixing patch is singular without it, so this cannot be defaulted away.");
-        if (!pRghForRef)
-            throw std::runtime_error(
-                "brae interFoam device pEqn: setReference pins the reference cell at p_rgh's CURRENT value "
-                "there (pEqn.H:47), and the field was not handed over.");
-        setReferenceKernel<<<1, 1>>>(pRefCell, pRghForRef->data(), P.diag.data(), P.source.data());
-        ckP(cudaGetLastError(), "setReference");
+        // fvMatrix::setReference acts where celli >= 0 only: under -parallel the one rank holding the
+        // reference cell pins it, the others hold -1 (findRefCell.C) and leave their matrix alone
+        const bool otherRankHoldsIt = pRefCell < 0 && pg::parallel();
+        if (!otherRankHoldsIt)
+        {
+            if (pRefCell < 0 || pRefCell >= nC)
+                throw std::runtime_error(
+                    "brae interFoam device pEqn: pRefCell is outside the mesh. A case whose p_rgh has no "
+                    "value-fixing patch is singular without it, so this cannot be defaulted away.");
+            if (!pRghForRef)
+                throw std::runtime_error(
+                    "brae interFoam device pEqn: setReference pins the reference cell at p_rgh's CURRENT value "
+                    "there (pEqn.H:47), and the field was not handed over.");
+            setReferenceKernel<<<1, 1>>>(pRefCell, pRghForRef->data(), P.diag.data(), P.source.data());
+            ckP(cudaGetLastError(), "setReference");
+        }
     }
 }
 
@@ -611,13 +620,21 @@ void deviceInterPressureReference(
     DeviceBuffer<scalar>&       p,
     DeviceBuffer<scalar>&       p_rgh)
 {
-    if (nC <= 0) return;
-    if (pRefCell < 0 || pRefCell >= nC)
+    // Under -parallel EVERY rank takes part, a rank with no cells included: the shift is a collective sum of
+    // the owner's `pRefValue - p[pRefCell]` and the others' zeros (getRefCellValue, findRefCell.C:148-153)
+    ProcComm* comm = pg::comm();
+    if (nC <= 0 && !comm) return;
+    if (!comm && (pRefCell < 0 || pRefCell >= nC))
+        throw std::runtime_error(
+            "brae interFoam device pEqn: pRefCell is outside the mesh, and pEqn.H:74-83 reads p there.");
+    if (comm && pRefCell >= nC)
         throw std::runtime_error(
             "brae interFoam device pEqn: pRefCell is outside the mesh, and pEqn.H:74-83 reads p there.");
     DeviceBuffer<scalar> shift(1);
     refShiftKernel<<<1, 1>>>(pRefCell, pRefValue, p.data(), shift.data());
     ckP(cudaGetLastError(), "the reference shift");
+    if (comm) comm->allReduce(shift.data(), 1, ReduceOp::Sum, cudaStreamPerThread);
+    if (nC <= 0) return;
     applyRefShiftKernel<<<nBlocks(nC), TPB>>>(nC, shift.data(), rho.data(), gh.data(),
                                               p.data(), p_rgh.data());
     ckP(cudaGetLastError(), "p += shift; p_rgh = p - rho*gh");

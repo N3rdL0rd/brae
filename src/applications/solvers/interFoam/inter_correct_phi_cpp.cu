@@ -1,6 +1,7 @@
 // interFoam's correctPhi -- see inter_correct_phi_cpp.cuh for the provenance and the order.
 #include "inter_phase_time.cuh"
 #include "inter_correct_phi_cpp.cuh"
+#include "proc_globals.cuh"
 #include "fv_matrix_ops.cuh"
 #include "fv_patch_field.cuh"
 #include "fvm.cuh"
@@ -190,6 +191,8 @@ void correctPhi(
             break;
         }
     }
+    // pcorr.needReference() is the AND over the ranks too (GeometricField.C:1145)
+    needReference = pg::andAll(needReference);
 
     if (needReference)
     {
