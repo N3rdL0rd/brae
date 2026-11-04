@@ -537,7 +537,7 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
 #endif // BRAE_HAS_GS_DEVICE
 
 #ifndef BRAE_HAS_GS_DEVICE
-// CUDA < 13: WHILE-node conditional graphs are unavailable, so the whole-loop graph cannot be built. Return a
+// CUDA < 12.4: WHILE-node conditional graphs are unavailable, so the whole-loop graph cannot be built. Return a
 // sentinel (nIterations < 0); the caller falls back to the direct (non-graph) distributed AMG-PCG.
 DeviceSolverPerf deviceParallelAMGPCGGraph(
     const DeviceLduView& A, AMGData&, DeviceHalo&,
@@ -836,12 +836,11 @@ DeviceSolverPerf deviceAMGPCG(
 {
     announceNormFactorMode();
 #ifdef BRAE_HAS_GS_DEVICE
-    // deviceAMGPCGGraph is DEFINED inside this guard (it needs CUDA 13's conditional graph nodes), so the
-    // call has to sit inside it too. Without the guard this translation unit does not compile on a CUDA 12
-    // toolchain -- `identifier "deviceAMGPCGGraph" is undefined` -- which is the same defect as the
-    // `neumannPrecon` one the GH200 found on 2026-09-13, in a different file. Found the same way, by
-    // building on a second machine: the GH200's apt nvcc is 12.8 and won over the CUDA 13 installed
-    // beside it. The sibling call at :472 was already guarded; this one was not.
+    // deviceAMGPCGGraph is DEFINED inside this guard (it needs conditional graph nodes, CUDA 12.4 and newer), so
+    // the call has to sit inside it too. Without the guard this translation unit does not compile on a toolkit
+    // older than 12.4 -- `identifier "deviceAMGPCGGraph" is undefined` -- which is the same defect as the
+    // `neumannPrecon` one the GH200 found on 2026-09-13, in a different file. The sibling call at :472 was
+    // guarded already.
     {
         static const bool pcgDev = std::getenv("BRAE_PCG_DEVICE") == nullptr || std::string(std::getenv("BRAE_PCG_DEVICE")) != "0";
         if (pcgDev && !corrScaling && !normFactorOnHost() && !amgSplit::wanted())

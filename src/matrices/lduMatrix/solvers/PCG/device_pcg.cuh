@@ -186,7 +186,7 @@ DeviceSolverPerf deviceParallelJacobiBiCGStab(
 // Whole-loop conditional-graph momentum BiCGStab (BRAE_PARALLEL_GRAPH=3): the entire steady-state BiCGStab WHILE
 // body -- interface-coupled matvec + on-stream NVSHMEM reductions + the recurrence -- captured once into a
 // cudaGraphCondTypeWhile graph and replayed on-device, removing the ~15 host kernel launches/Krylov-iter that the
-// direct device-resident path still pays. Mirrors deviceParallelAMGPCGGraph. Requires CUDA >= 13 (WHILE nodes) and
+// direct device-resident path still pays. Mirrors deviceParallelAMGPCGGraph. Requires CUDA >= 12.4 (WHILE nodes) and
 // 1 PE/GPU (the on-stream reduce must be capturable); returns nIterations = -1 otherwise so the caller falls back.
 DeviceSolverPerf deviceParallelJacobiBiCGStabGraph(
     const DeviceLduView& A,

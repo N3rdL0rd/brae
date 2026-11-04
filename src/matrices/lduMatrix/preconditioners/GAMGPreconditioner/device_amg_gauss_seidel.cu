@@ -71,8 +71,8 @@ static const GridColoring& gsColoringFor(const DeviceLduView& A)
 // incoming (diag,upper,lower,b) pointers move; the graph instead references stable cache-owned buffers and the current
 // matrix is copied in (async D2D) before each replay. The cache is keyed on psi (a persistent field buffer), so k and
 // epsilon get independent graph instances. normFactor is a device-resident scalar; tol/relTol/maxIter are baked in at
-// capture. WHILE nodes require CUDA >= 13; on older toolkits this path compiles out and the host loop below is used.
-#if CUDART_VERSION >= 13000
+// capture. WHILE nodes require CUDA >= 12.4; on older toolkits this path compiles out and the host loop below is used.
+#ifdef BRAE_HAS_GS_DEVICE
 // The host loop's stop test, run on the device: `sweeps += nSweeps` (smoothSolver.C:205 counts sweeps,
 // not evaluations), then `(finalRes < tol || finalRes < relTol*initRes) && sweeps >= minIter`, or the
 // cap. One thread; the handle is the WHILE node's condition.
@@ -501,7 +501,7 @@ static void deviceSymGaussSeidelGraphFused(
     for (int k = 0; k < nComp; ++k)
         if (activeH[k]) perf[k] = {initH[k], finH[k], iterH[k]};
 }
-#endif // CUDART_VERSION >= 13000
+#endif // BRAE_HAS_GS_DEVICE
 
 // ---------------------------------------------------------------------------------------------------
 // THE HOST SMOOTHER (item 68). OpenFOAM's sweep is a recurrence; on the device it is level-scheduled and

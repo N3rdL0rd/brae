@@ -14,10 +14,11 @@
 #include <cstdlib>          // std::getenv / std::atoi (env-flag readers)
 #include "cuda_graph_compat.cuh"  // braeGraphAddNode / braeStreamGetCaptureInfo (CUDA 12 vs 13 signatures)
 
-// Device-resident (conditional-graph WHILE) solver variants require CUDA 13's stream-capture-to-graph + conditional
-// nodes. Defined here (not inline in device_amg.cu) so it gates BOTH the device-resident GS solver and the
-// device-resident AMG-PCG driver consistently across the (to-be-split) AMG-core translation units.
-#if CUDART_VERSION >= 13000
+// Device-resident (conditional-graph WHILE) solver variants require stream-capture-to-graph + conditional nodes
+// (CUDA 12.4 and newer; the 12 vs 13 signature differences are absorbed by cuda_graph_compat.cuh). Defined here
+// (not inline in device_amg.cu) so it gates BOTH the device-resident GS solver and the device-resident AMG-PCG
+// driver consistently across the (to-be-split) AMG-core translation units.
+#if CUDART_VERSION >= 12040
 #define BRAE_HAS_GS_DEVICE 1
 #endif
 
