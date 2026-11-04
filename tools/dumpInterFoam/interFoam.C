@@ -93,6 +93,11 @@ int main(int argc, char *argv[])
     }
 
     #include "initCorrectPhi.H"
+    if (getenv("BRAE_STAGE_STATE"))
+    {
+        runTime.writeNow();
+        return 0;
+    }
     #include "createUfIfPresent.H"
 
     if (!LTS)
@@ -339,6 +344,14 @@ int main(int argc, char *argv[])
                 surfaceScalarField("oRhoPhi.dump", rhoPhi).write();
                 volScalarField("oRhoEnd.dump", rho).write();
                 surfaceScalarField("oPhiEntry.dump", phi).write();
+            }
+            if (getenv("BRAE_STAGE_ALPHA"))
+            {
+                volScalarField("sAlphaAfter.dump", alpha1).write();
+                surfaceScalarField("sAlphaPhi.dump", alphaPhi10).write();
+                volScalarField("sRhoAfter.dump", rho).write();
+                Info<< "[brae] alpha stage dump written at time " << runTime.timeName() << endl;
+                return 0;
             }
 
             if (pimple.frozenFlow())

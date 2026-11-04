@@ -1494,7 +1494,8 @@ RunReport runInterFoamDevice(
             // shifts every patch after the pair onto the wrong faces.
             if (isCyclicFamilyType(fvp[pi].type)) continue;
             const int fx = f.alpha1.boundary[pi]->fixesValue() ? 1 : 0;
-            const int fl = (fvp[pi].type == "empty") ? 1 : ((fvp[pi].type == "wedge") ? 2 : 0);
+            const int fl = (fvp[pi].type == "empty") ? 1 : ((fvp[pi].type == "wedge") ? 2
+                          : ((fvp[pi].type == "processor") ? 3 : 0));
             for (label i = 0; i < fvp[pi].size; ++i)
             {
                 aFixes.push_back(fx);
@@ -6395,6 +6396,71 @@ RunReport runInterFoamDevice(
         tap.phicInt.copyTo(hi); tap.phicBnd.copyTo(hb); dump.surface("sPhic", hi, hb, false);
         tap.phirInt.copyTo(hi); tap.phirBnd.copyTo(hb); dump.surface("sPhir", hi, hb);
         tap.unInt.copyTo(hi); tap.unBnd.copyTo(hb); dump.surface("sAlphaPhiUn", hi, hb);
+        if (std::getenv("BRAE_STAGE_ALPHA"))
+        {
+            const DeviceProcCommCounts commBefore = deviceProcCommCountsRef();
+            const ProcHookCounts solverBefore = procHookCounts();
+            if (!f.lts && f.timeCtl.base.adjustTimeStep)
+            {
+                const DeviceCourantNumbers co = deviceAlphaCourantNo(dm, dPhiI, dPhiB, nullptr, rep.deltaT,
+                    dCyc.n > 0 ? &dCyc : nullptr, nullptr);
+                const DeviceCourantNumbers coBand = deviceAlphaCourantNo(dm, dPhiI, dPhiB, &dA, rep.deltaT,
+                    dCyc.n > 0 ? &dCyc : nullptr, nullptr);
+                rep.CoNum = co.CoNum; rep.alphaCoNum = coBand.CoNum;
+                rep.deltaT = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
+                                          rep.time - startTime, &f.writeCadence);
+                std::printf("brae interFoam: alpha stage deltaT %.17g\n", (double)rep.deltaT);
+            }
+            DeviceAlphaStepInput ai = C.alphaInput;
+            ai.phiInt = &dPhiI;
+            ai.phiBnd = &dPhiB;
+            ai.phiCNInt = &dPhiI;
+            ai.phiCNBnd = &dPhiB;
+            ai.deltaT = rep.deltaT;
+            ai.cyc = C.cyc;
+            ai.phiCNIf = C.cyc ? &C.cyc->phi : nullptr;
+            ai.alphaPhiIf = C.alphaPhiIf;
+            ai.rho1 = props.rho1;
+            ai.rho2 = props.rho2;
+            DeviceInterAlphaControls ac = C.alpha;
+            ac.alpha2BndOut = &dAlpha2Stored;
+            DeviceBuffer<scalar> preSolveStage;
+            ac.preSolveAlphaOut = &preSolveStage;
+            std::vector<DeviceBuffer<scalar>> correctorStages;
+            ac.correctorAlphaOut = &correctorStages;
+            ac.rhoPhiIf = C.rhoPhiIf;
+            ac.nHatfIf = C.nHatfIf;
+            ac.alphaPhiWriteInt = &dAlphaPhiWriteI;
+            ac.alphaPhiWriteBnd = &dAlphaPhiWriteB;
+            ac.alphaPhiWriteIf = &dAlphaPhiWriteIf;
+            DeviceBuffer<scalar> alpha2Stage = makeCellBuffer<scalar>(dm);
+            deviceInterAlphaStep(dm, dA, dAOld, rep.deltaT, ai, C.mules, ac, props, H.alpha,
+                                 dABnd, dNHB, dAFixes, dAFlag, dNH, dK, dRpI, dRpB,
+                                 alpha2Stage, dRho, dMu, dNu);
+            for (const DeviceSolverPerf& p : aLog)
+                std::printf("brae interFoam: alpha pre-solve residual %.17g -> %.17g, iterations %d\n",
+                            (double)p.initialResidual, (double)p.finalResidual, p.nIterations);
+            dAlphaPhiWriteI.copyTo(hi);
+            dAlphaPhiWriteB.copyTo(hb);
+            dump.surface("sAlphaPhi", hi, hb);
+            const std::vector<scalar> finalAB = dABnd.host();
+            dump.vol("sAlphaAfter", dA.host(), &finalAB);
+            const std::vector<scalar> finalRB = contactAngleDevice ? dContactRhoB.host()
+                : flattenPatches(f.rhoBnd, fvp);
+            dump.vol("sRhoAfter", dRho.host(), &finalRB);
+            if (preSolveStage.size()) dump.vol("sAlphaPredictor", preSolveStage.host());
+            for (std::size_t k = 0; k < correctorStages.size(); ++k)
+                dump.vol("sAlphaCorr" + std::to_string(k), correctorStages[k].host());
+            std::printf("brae interFoam: alpha stage dump rank %d: %s\n", roots.rank, dump.dir().c_str());
+            const DeviceProcCommCounts commAfter = deviceProcCommCountsRef();
+            const ProcHookCounts solverAfter = procHookCounts();
+            std::printf("brae interFoam: alpha communication: operator cell exchanges %lld, face exchanges %lld; "
+                        "solver halo exchanges %lld, reductions %lld\n",
+                        commAfter.cellExchanges - commBefore.cellExchanges,
+                        commAfter.faceExchanges - commBefore.faceExchanges,
+                        solverAfter.exchanges - solverBefore.exchanges,
+                        solverAfter.reductions - solverBefore.reductions);
+        }
         std::printf("brae interFoam: stage dump rank %d: %s (sNHatf sSigmaK sStf sRho sSnGradRho sPhic sPhir sAlphaPhiUn)\n",
                     roots.rank, dump.dir().c_str());
         std::fflush(stdout);

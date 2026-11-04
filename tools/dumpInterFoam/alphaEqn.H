@@ -154,6 +154,7 @@
         {
             surfaceScalarField("oAlphaPhiUD.dump", talphaPhi1Corr0()).write();
             volScalarField("oAlphaPredictor.dump", alpha1).write();
+            if (getenv("BRAE_STAGE_ALPHA")) volScalarField("sAlphaPredictor.dump", alpha1).write();
         }
         // ------------------------------------------------------------------------------------
 
@@ -221,6 +222,7 @@
                 const Foam::word sfxM = "a" + Foam::name(aCorr);
                 surfaceScalarField("oAlphaPhiCorrLim" + sfxM + ".dump", talphaPhi1Corr()).write();
                 volScalarField("oAlphaCorr" + sfxM + ".dump", alpha1).write();
+                if (getenv("BRAE_STAGE_ALPHA")) volScalarField("sAlphaCorr" + sfxM + ".dump", alpha1).write();
             }
             // ---------------------------------------------------------------------------------------------
 

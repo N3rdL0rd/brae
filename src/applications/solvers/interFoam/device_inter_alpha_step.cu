@@ -2,6 +2,7 @@
 // placements and for what stays on the host.
 #include "device_inter_alpha_step.cuh"
 #include "device_alpha_subcycle.cuh"
+#include "device_processor_ops.cuh"
 #include "device_alpha_flux.cuh"
 #include "device_interface_properties.cuh"
 #include "device_blas.cuh"
@@ -298,10 +299,14 @@ void deviceInterAlphaStep(
             }
             {
                 interPhase::Nested timedPre("alpha: the implicit pre-solve, whole (MULESCorr)");
+                DeviceBuffer<scalar> procPhiCN;
+                DeviceProcCtx* proc = DeviceProcCtx::active(dm) ? DeviceProcCtx::current() : nullptr;
+                if (proc) procGather(*proc, *li.phiCNBnd, procPhiCN);
+                const DeviceBuffer<scalar>* prePhiIf = proc ? &procPhiCN
+                    : ((preRawPhi && pairHere) ? &li.cyc->phi : li.phiCNIf);
                 deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
                                     alphaPhiInt, alphaPhiBnd, &pre, li.cyc, li.alphaPhiIf,
-                                    li.Vsc, li.Vsc0, li.rDeltaT,
-                                    (preRawPhi && pairHere) ? &li.cyc->phi : li.phiCNIf);
+                                    li.Vsc, li.Vsc0, li.rDeltaT, prePhiIf);
             }
             if (ctl.preSolveLog)
             {
@@ -476,6 +481,12 @@ void deviceInterAlphaStep(
                 interPhase::Nested timedCorrector("alpha: a corrector, whole");
                 deviceAlphaCorrector(dm, alpha, subOld, li, db, mulesCtl, nHatfInt,
                                      alphaPhiInt, alphaPhiBnd);
+            }
+            if (ctl.correctorAlphaOut)
+            {
+                if (ctl.correctorAlphaOut->size() < static_cast<std::size_t>(aCorr + 1))
+                    ctl.correctorAlphaOut->resize(static_cast<std::size_t>(aCorr + 1));
+                deviceCopy((*ctl.correctorAlphaOut)[static_cast<std::size_t>(aCorr)], alpha);
             }
             if (relaxes)
             {
