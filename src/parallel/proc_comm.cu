@@ -1191,6 +1191,8 @@ protected:
     void allgatherInts(const std::vector<int>& send, std::vector<int>& recv) override
     {
         recv.resize(static_cast<std::size_t>(size_)*send.size());
+        if (statusComm_ == MPI_COMM_NULL)
+            throw std::runtime_error("ProcComm::allgatherInts: the status communicator was not initialized");
         MPI_Request req = MPI_REQUEST_NULL;
         mpiCheck(MPI_Iallgather(send.data(), static_cast<int>(send.size()), MPI_INT, recv.data(),
                                 static_cast<int>(send.size()), MPI_INT, statusComm_, &req), "Iallgather");
