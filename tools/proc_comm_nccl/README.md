@@ -118,6 +118,10 @@ G7    SYS SYS SYS NV1 NV2 NV1 NV2  X
 | `BRAE_NCCL_ALLOW_SHARED_GPU=1` | bring-up/CI only: allow several ranks per GPU (sets `NCCL_MULTI_RANK_GPU_ENABLE=1`, NCCL >= 2.3x); slow |
 
 ## What was run (honest status) and what is open
-See `/tmp/ProcCommNccl/REPORT.md` of the producing agent for the exact commands and numbers. Not run anywhere: any
-multi-GPU NCCL run with peers on distinct physical GPUs (NVLink P2P / SHM transport), sm_70 execution, np = 8 across
-two sockets, the placement against a real `nvidia-smi topo -m`.
+Run on ONE GPU (RTX 5090 laptop, sm_120, CUDA 13.2, NCCL 2.32.3 cu12, OpenMPI): the NCCL backend with np = 1, 2, 3, 4, 8 ranks
+sharing that GPU (`BRAE_NCCL_ALLOW_SHARED_GPU=1`; for np = 8 under CUDA MPS, otherwise time-slicing of the spinning NCCL
+kernels makes it too slow), all of test_proc_comm and test_proc_comm_graph PASS (halo/face exchange, rank-ordered reductions,
+collective aborts incl. communicator re-creation, capture + 1000 replays, WHILE-body graph with varying loop counts).
+Compile-checked for sm_70 with CUDA 12.9 + gcc 14 (NCCL on and off). NOT run anywhere: peers on distinct physical GPUs
+(NVLink P2P / SHM transport, the 3 host-staged DGX-1 pairs), sm_70 execution, np = 8 across two sockets, the placement
+against a real `nvidia-smi topo -m`, NCCL older than 2.32 (no `ncclCommRevoke`: the abort path falls back to `ncclCommAbort`).

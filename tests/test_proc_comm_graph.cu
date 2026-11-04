@@ -493,6 +493,7 @@ int main(int argc, char** argv)
         if (argc > 1 && (std::string(argv[1]) == "nccl" || std::string(argv[1]) == "auto")) return ncclSuite(argc, argv, argv[1]);
         int nDev = 0;
         if (cudaGetDeviceCount(&nDev) != cudaSuccess || nDev <= 0) { std::printf("SKIP: no CUDA device\n"); return 77; }
+        std::printf("backend: loopback (joint graph over np = 2,3,4,8 virtual ranks on one GPU)\n");
         int fails = 0;
         for (int np : {2, 3, 4, 8})
         {

@@ -628,6 +628,7 @@ int main(int argc, char** argv)
             return mpiSuite(argc, argv, argv[1]) == 0 ? 0 : 1;
         int nDev = 0;
         if (cudaGetDeviceCount(&nDev) != cudaSuccess || nDev <= 0) { std::printf("SKIP: no CUDA device\n"); return 77; }
+        std::printf("backend: loopback (np = 1,2,3,4,8 virtual ranks on one GPU)\n");
         const int fails = loopbackSuite();
         std::printf("test_proc_comm loopback: %s (%d failing rank runs)\n", fails ? "FAIL" : "PASS", fails);
         return fails ? 1 : 0;
