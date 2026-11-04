@@ -411,6 +411,24 @@ void runCase(const Problem& p, const std::string& partName, const std::vector<in
             std::printf("  %-34s symGS sweeps %4d (monolithic %4d)  growth %.2fx  x diff %.2e\n", tag.c_str(), g.perf.nIterations,
                         mono.gsSweeps, double(g.perf.nIterations)/mono.gsSweeps, diff);
     }
+    // (e) the other Krylov loops inherit the hooks: Jacobi-PCG, and BiCGStab with the block-local AMG V-cycle
+    {
+        DeviceBuffer<scalar> x(static_cast<std::size_t>(s.nC), static_cast<std::size_t>(s.nHalo));
+        x.copyFrom(std::vector<scalar>(s.nC, 0.0));
+        const scalar nf = normFactorOf(S, x, s.nC);
+        const DeviceSolverPerf pj = deviceJacobiPCG(S.view, S.b, x, nf, 1e-10, 0.0, 20000);
+        const double dj = maxRelDiff(gatherToGlobal(s, x.host(), N), mono.x);
+        check(pj.finalResidual < 1e-10 && dj < 1e-5, tag + ": Jacobi-PCG on the decomposed matrix, diff " + std::to_string(dj));
+        check(sameOnAllRanks(double(pj.nIterations)), tag + ": Jacobi-PCG: the same iteration count on every rank");
+        DeviceBuffer<scalar> xb(static_cast<std::size_t>(s.nC), static_cast<std::size_t>(s.nHalo));
+        xb.copyFrom(std::vector<scalar>(s.nC, 0.0));
+        const DeviceSolverPerf pb = deviceJacobiBiCGStab(S.view, S.b, xb, nf, 1e-10, 0.0, 5000, 1, 0, nullptr, &S.amg, 1);
+        const double db = maxRelDiff(gatherToGlobal(s, xb.host(), N), mono.x);
+        check(pb.finalResidual < 1e-10 && db < 1e-5, tag + ": BiCGStab (AMG) on the decomposed matrix, diff " + std::to_string(db));
+        check(sameOnAllRanks(double(pb.nIterations)), tag + ": BiCGStab: the same iteration count on every rank");
+        if (verbose && rank == 0)
+            std::printf("  %-34s Jacobi-PCG %d iters, BiCGStab(AMG) %d iters\n", tag.c_str(), pj.nIterations, pb.nIterations);
+    }
     g_comm->barrier();
 }
 

@@ -1,10 +1,8 @@
 // cf GPU offload (G1): the device lduMatrix SpMV kernel (Amul). One thread per cell gathers the diagonal and
 // then its faces in increasing face order -- OpenFOAM's face loop's order per cell -- race-free, deterministic.
 #include "device_ldu.cuh"
-#include "device_halo.cuh"
 #include "device_blas.cuh"        // the hooks' counters
 #include "proc_hooks.cuh"        // ProcComm + the hooks' channel (processor-interface coupling of a decomposed mesh)
-#include "distributed_ami.cuh"   // DistributedAMI + distributedAmiAmul: optional cyclicAMI coupling in the matvec
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -422,24 +420,6 @@ void deviceProcFrozenRhs(const DeviceLduView& A, const DeviceBuffer<scalar>& x, 
         cudaCheck(cudaMemcpyAsync(bEff.data(), b.data(), (std::size_t)A.nCells*sizeof(scalar), cudaMemcpyDeviceToDevice,
                                   cudaStreamPerThread), "proc rhs copy");
     if (A.proc.active()) launchProcFaces(procRhsKernel, A.proc, x.data(), bEff.data());
-}
-
-// Distributed product: overlap the halo transfer with the local product, then apply the interface coupling.
-// Same ordering as host parallelAmul (post -> local -> wait -> update), all on the per-thread default stream.
-void deviceParallelAmul(
-    const DeviceLduView& A,
-    DeviceHalo& halo,
-    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
-    const DeviceBuffer<scalar>& psi,
-    DeviceBuffer<scalar>& Apsi,
-    const DistributedAMI* ami)
-{
-    halo.postExchange(psi.data());          // pack + put (async)
-    deviceAmul(A, psi, Apsi);               // local diag + upper/lower gather, overlaps the transfer
-    halo.waitExchange();                    // barrier: neighbour values now in the recv buffers
-    for (int i = 0; i < halo.nInterfaces(); ++i)
-        halo.updateInterfaceMatrix(i, Apsi.data(), ifaceCoeffs[i].data());   // Apsi[fc] -= coeff * psiNbr
-    if (ami) distributedAmiAmul(*ami, psi, Apsi);   // + cyclicAMI: gather remote target cells (NVSHMEM) then amul
 }
 
 } // namespace brae

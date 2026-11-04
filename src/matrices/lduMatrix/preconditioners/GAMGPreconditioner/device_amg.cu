@@ -4,7 +4,7 @@
 #include "inter_phase_time.cuh"
 #include "device_blas.cuh"
 #include "proc_comm.cuh"       // ProcComm::current(): the rank in the hierarchy cache file name
-#include "device_ldu.cuh"       // deviceParallelAmul (halo-coupled matvec) for the distributed whole-loop graph PCG
+#include "device_ldu.cuh"
 #include "device_halo.cuh"      // DeviceHalo + its DeviceReducer (on-stream NVSHMEM reduce)
 #include "device_amg_detail.cuh"  // shared inline primitives: safeDiag/warpReduceSum/blockDot + env-flag readers + AMG constants
 #include "device_amg_coarse.cuh"  // deviceCoarsePCG/JacobiSingleBlock (internal coarse solvers, defined in device_amg_coarse.cu)

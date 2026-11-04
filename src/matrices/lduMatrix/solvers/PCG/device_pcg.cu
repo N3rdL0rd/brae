@@ -34,7 +34,7 @@ DeviceSolverPerf deviceJacobiPCG(
     const DevicePreconApply* apply)
 {
     const int nC = A.nCells;
-    DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC);
+    DeviceBuffer<scalar> wA(nC), rA(nC), pA(static_cast<std::size_t>(nC), deviceProcHalo(A.proc)), Ax(nC);   // pA: halo tail on a decomposed mesh
 
     deviceAmul(A, psi, Ax, /*onField=*/true);                // rA = b - A*psi, the field's own product
     deviceCopy(rA, b);
