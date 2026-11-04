@@ -320,6 +320,40 @@ if(BRAE_WITH_NVSHMEM)
 endif()
 
 # ---------------------------------------------------------------------------
+# NCCL transport of ProcComm (multi-GPU interFoam, one process per GPU; src/parallel/proc_comm.cu). Default OFF:
+# the ProcComm NCCL backend is then a stub that throws. ON finds NCCL under -DNCCL_ROOT=... / -DNCCL_HOME=...,
+# the NCCL_ROOT / NCCL_HOME environment variables or CMAKE_PREFIX_PATH (a dir holding include/nccl.h and
+# lib/libnccl.so; the pip wheel nvidia-nccl-cu12 unpacked works after `ln -s libnccl.so.2 lib/libnccl.so`).
+# Only proc_comm.cu sees the NCCL define and include path; every executable linking brae_core also links libnccl.
+# ---------------------------------------------------------------------------
+option(BRAE_WITH_NCCL "Build the NCCL backend of ProcComm (multi-GPU, one process per GPU)" OFF)
+if(BRAE_WITH_NCCL)
+    find_path(NCCL_INCLUDE_DIR NAMES nccl.h
+        HINTS ${NCCL_ROOT} $ENV{NCCL_ROOT} ${NCCL_HOME} $ENV{NCCL_HOME}
+        PATH_SUFFIXES include)
+    find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2
+        HINTS ${NCCL_ROOT} $ENV{NCCL_ROOT} ${NCCL_HOME} $ENV{NCCL_HOME}
+        PATH_SUFFIXES lib lib64)
+    if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+        message(FATAL_ERROR "BRAE_WITH_NCCL=ON but NCCL was not found: set -DNCCL_ROOT=<dir with include/nccl.h and lib/libnccl.so> "
+                            "(or NCCL_HOME / CMAKE_PREFIX_PATH)")
+    endif()
+    get_filename_component(NCCL_LIB_DIR ${NCCL_LIBRARY} DIRECTORY)
+    file(READ ${NCCL_INCLUDE_DIR}/nccl.h _nccl_h)
+    set(_nccl_defs BRAE_WITH_NCCL)
+    if(_nccl_h MATCHES "graphUsageMode")
+        list(APPEND _nccl_defs BRAE_NCCL_HAVE_GRAPH_USAGE_MODE)
+    else()
+        message(WARNING "cf NCCL: this nccl.h has no ncclConfig.graphUsageMode; the graph communicator relies on NCCL_GRAPH_MIXING_SUPPORT=0 (set by ProcComm)")
+    endif()
+    message(STATUS "cf NCCL: ${NCCL_LIBRARY} (hdr ${NCCL_INCLUDE_DIR})")
+    set_source_files_properties(src/parallel/proc_comm.cu PROPERTIES
+        COMPILE_DEFINITIONS "${_nccl_defs}" INCLUDE_DIRECTORIES "${NCCL_INCLUDE_DIR}")
+    target_link_libraries(brae_core PUBLIC ${NCCL_LIBRARY})
+    list(APPEND CMAKE_BUILD_RPATH ${NCCL_LIB_DIR})
+endif()
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 enable_testing()
