@@ -199,28 +199,34 @@ scalar normFactorOf(DeviceSystem& S, const DeviceBuffer<scalar>& psi, int nC)
     return deviceNormFactor(S.view, psi, S.b, deviceOnes(nC));
 }
 
-Solve pcgSolve(DeviceSystem& S, const LocalSystem& s, scalar tol, scalar relTol, int maxIter, bool unfused)
+// graph = true: the whole-loop CUDA graph (NCCL backend only: BRAE_PROC_GRAPH=1); false: the host-driven loop, the
+// oracle every other section of this test was written against
+Solve pcgSolve(DeviceSystem& S, const LocalSystem& s, scalar tol, scalar relTol, int maxIter, bool unfused,
+               int minIter = 0, bool graph = false)
 {
     DeviceBuffer<scalar> x(static_cast<std::size_t>(s.nC), static_cast<std::size_t>(s.nHalo));
     x.copyFrom(std::vector<scalar>(s.nC, 0.0));
     const scalar nf = normFactorOf(S, x, s.nC);
     if (unfused) setenv("BRAE_PROC_PCG_UNFUSED", "1", 1); else unsetenv("BRAE_PROC_PCG_UNFUSED");
+    setenv("BRAE_PROC_GRAPH", graph ? "1" : "0", 1);
     Solve r;
     amgPcgSetHistory(&r.hist);
-    r.perf = deviceAMGPCG(S.view, S.amg, S.b, x, nf, tol, relTol, maxIter);
+    r.perf = deviceAMGPCG(S.view, S.amg, S.b, x, nf, tol, relTol, maxIter, false, 1, false, minIter);
     amgPcgSetHistory(nullptr);
     unsetenv("BRAE_PROC_PCG_UNFUSED");
     r.x = x.host();
     return r;
 }
 
-Solve gsSolve(DeviceSystem& S, const LocalSystem& s, scalar tol, int maxIter)
+Solve gsSolve(DeviceSystem& S, const LocalSystem& s, scalar tol, int maxIter, scalar relTol = 0.0, int minIter = 0,
+              int nSweeps = 1, bool graph = false)
 {
     DeviceBuffer<scalar> x(static_cast<std::size_t>(s.nC), static_cast<std::size_t>(s.nHalo));
     x.copyFrom(std::vector<scalar>(s.nC, 0.0));
     const scalar nf = normFactorOf(S, x, s.nC);
+    setenv("BRAE_PROC_GRAPH", graph ? "1" : "0", 1);
     Solve r;
-    deviceSymGaussSeidel(S.view, S.b, x, nf, tol, 0.0, maxIter, &r.perf);
+    deviceSymGaussSeidel(S.view, S.b, x, nf, tol, relTol, maxIter, &r.perf, minIter, nSweeps);
     r.x = x.host();
     return r;
 }
@@ -411,6 +417,78 @@ void runCase(const Problem& p, const std::string& partName, const std::vector<in
             std::printf("  %-34s symGS sweeps %4d (monolithic %4d)  growth %.2fx  x diff %.2e\n", tag.c_str(), g.perf.nIterations,
                         mono.gsSweeps, double(g.perf.nIterations)/mono.gsSweeps, diff);
     }
+    // (f) the CUDA-graph loops on the NCCL backend (every rank captures its own graph, the collectives are in the WHILE
+    // body) against the host-driven loops: the same iteration/sweep count, residuals, history and solution, bit for bit
+    if (np > 1 && g_comm->backend() == ProcComm::Backend::Nccl)
+    {
+        auto bitsEq = [](const std::vector<scalar>& a, const std::vector<scalar>& b)
+        { return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size()*sizeof(scalar)) == 0); };
+        auto sameBits = [&](const Solve& a, const Solve& b)
+        {
+            return a.perf.nIterations == b.perf.nIterations
+                && std::memcmp(&a.perf.initialResidual, &b.perf.initialResidual, sizeof(scalar)) == 0
+                && std::memcmp(&a.perf.finalResidual, &b.perf.finalResidual, sizeof(scalar)) == 0
+                && bitsEq(a.x, b.x) && bitsEq(a.hist, b.hist);
+        };
+        struct PcgCfg { const char* name; scalar tol, rel; int maxIter, minIter; };
+        const PcgCfg pcgCfgs[] =
+        {
+            {"tol 1e-10",                       1e-10, 0.0,  2000, 0},
+            {"tol 1e-10 (graph replayed)",      1e-10, 0.0,  2000, 0},
+            {"relTol 0.05",                     1e-30, 0.05, 2000, 0},
+            {"maxIter cap 7",                   1e-30, 0.0,  7,    0},
+            {"converged at the start",          1e10,  0.0,  2000, 0},
+            {"minIter 4 on a converged start",  1e10,  0.0,  2000, 4},
+            {"tol 1e-10 after the others",      1e-10, 0.0,  2000, 0},
+        };
+        for (const PcgCfg& cfg : pcgCfgs)
+        {
+            const Solve host = pcgSolve(S, s, cfg.tol, cfg.rel, cfg.maxIter, false, cfg.minIter, false);
+            const Solve gr = pcgSolve(S, s, cfg.tol, cfg.rel, cfg.maxIter, false, cfg.minIter, true);
+            check(sameBits(host, gr), tag + ": graph AMG-PCG [" + cfg.name + "] is bit-identical to the host-driven loop (iters "
+                  + std::to_string(gr.perf.nIterations) + "/" + std::to_string(host.perf.nIterations) + ", final "
+                  + std::to_string(gr.perf.finalResidual) + "/" + std::to_string(host.perf.finalResidual) + ")");
+            std::vector<double> h(gr.hist.begin(), gr.hist.end());
+            check(sameOnAllRanks(h) && sameOnAllRanks(double(gr.perf.nIterations)),
+                  tag + ": graph AMG-PCG [" + cfg.name + "]: every rank, same iteration count and history");
+            if (verbose && rank == 0 && cfg.maxIter == 2000 && cfg.minIter == 0 && cfg.rel == 0.0 && cfg.tol == 1e-10)
+                std::printf("  %-34s graph PCG %d iterations == host-driven %d, history of %zu residuals identical\n", tag.c_str(),
+                            gr.perf.nIterations, host.perf.nIterations, gr.hist.size());
+        }
+        {   // the collectives are INSIDE the graph: extra iterations add no host-issued collective or exchange
+            const ProcHookCounts c0 = procHookCounts();
+            pcgSolve(S, s, 1e-30, 0.0, 12, false, 0, true);
+            const ProcHookCounts c1 = procHookCounts();
+            pcgSolve(S, s, 1e-30, 0.0, 24, false, 0, true);
+            const ProcHookCounts c2 = procHookCounts();
+            check((c2.reductions - c1.reductions) == (c1.reductions - c0.reductions)
+                  && (c2.exchanges - c1.exchanges) == (c1.exchanges - c0.exchanges),
+                  tag + ": graph AMG-PCG: 12 more iterations add no host-issued collective or halo exchange");
+        }
+        struct GsCfg { const char* name; scalar tol, rel; int maxIter, minIter, nSweeps; };
+        const GsCfg gsCfgs[] =
+        {
+            {"tol 1e-10",                    gsTol, 0.0,  20000, 0, 1},
+            {"tol 1e-10 (graph replayed)",   gsTol, 0.0,  20000, 0, 1},
+            {"relTol 0.1",                   1e-30, 0.1,  2000,  0, 1},
+            {"maxIter cap 5",                1e-30, 0.0,  5,     0, 1},
+            {"nSweeps 2",                    1e-8,  0.0,  5000,  0, 2},
+            {"converged at the start",       1e10,  0.0,  100,   0, 1},
+            {"minIter 4 on a converged start", 1e10, 0.0, 100,   4, 1},
+        };
+        for (const GsCfg& cfg : gsCfgs)
+        {
+            const Solve host = gsSolve(S, s, cfg.tol, cfg.maxIter, cfg.rel, cfg.minIter, cfg.nSweeps, false);
+            const Solve gr = gsSolve(S, s, cfg.tol, cfg.maxIter, cfg.rel, cfg.minIter, cfg.nSweeps, true);
+            check(sameBits(host, gr), tag + ": graph symGaussSeidel [" + cfg.name + "] is bit-identical to the host-driven loop (sweeps "
+                  + std::to_string(gr.perf.nIterations) + "/" + std::to_string(host.perf.nIterations) + ", final "
+                  + std::to_string(gr.perf.finalResidual) + "/" + std::to_string(host.perf.finalResidual) + ")");
+            check(sameOnAllRanks({double(gr.perf.nIterations), gr.perf.finalResidual, gr.perf.initialResidual}),
+                  tag + ": graph symGaussSeidel [" + cfg.name + "]: every rank, same sweep count and residuals");
+            if (verbose && rank == 0 && cfg.name == gsCfgs[0].name)
+                std::printf("  %-34s graph symGS %d sweeps == host-driven %d\n", tag.c_str(), gr.perf.nIterations, host.perf.nIterations);
+        }
+    }
     // (e) the other Krylov loops inherit the hooks: Jacobi-PCG, and BiCGStab with the block-local AMG V-cycle
     {
         DeviceBuffer<scalar> x(static_cast<std::size_t>(s.nC), static_cast<std::size_t>(s.nHalo));
@@ -446,20 +524,39 @@ void bench()
     const LocalSystem s = assemble(p, P, rank);
     std::unique_ptr<HaloPlan> plan = g_comm->makePlan(P.descs[rank]);
     DeviceSystem S(s, g_comm, plan.get(), p);
-    for (int fused = 1; fused >= 0; --fused)
+    // host-driven loops (fused, plain) and, on the NCCL backend, the whole-loop graph; the timed region is the solve
+    // alone (no history hook, no host copy of the solution); best of 3 solves of 60 iterations after a warm-up solve
+    struct Mode { const char* name; bool unfused; bool graph; };
+    std::vector<Mode> modes = {{"host fused ", false, false}, {"host plain ", true, false}};
+    if (g_comm->backend() == ProcComm::Backend::Nccl && np > 1) modes.push_back({"graph fused", false, true});
+    for (const Mode& m : modes)
     {
-        pcgSolve(S, s, 1e-30, 0.0, 5, !fused);                           // warm up
-        g_comm->barrier();
+        DeviceBuffer<scalar> x(static_cast<std::size_t>(s.nC), static_cast<std::size_t>(s.nHalo));
+        x.copyFrom(std::vector<scalar>(s.nC, 0.0));
+        const scalar nf = normFactorOf(S, x, s.nC);
+        if (m.unfused) setenv("BRAE_PROC_PCG_UNFUSED", "1", 1); else unsetenv("BRAE_PROC_PCG_UNFUSED");
+        setenv("BRAE_PROC_GRAPH", m.graph ? "1" : "0", 1);
         const int iters = 60;
-        const auto t0 = std::chrono::steady_clock::now();
-        const Solve r = pcgSolve(S, s, 1e-30, 0.0, iters, !fused);
+        double best = 1e300;
+        int n = 0;
+        for (int rep = 0; rep < 4; ++rep)                                // rep 0: warm-up (graph capture, caches)
+        {
+            x.copyFrom(std::vector<scalar>(s.nC, 0.0));
+            g_comm->barrier();
+            const auto t0 = std::chrono::steady_clock::now();
+            const DeviceSolverPerf pf = deviceAMGPCG(S.view, S.amg, S.b, x, nf, 1e-30, 0.0, iters);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            n = pf.nIterations;
+            if (rep > 0) best = std::min(best, ms);
+        }
+        unsetenv("BRAE_PROC_PCG_UNFUSED");
         g_comm->barrier();
-        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        double worst = ms;
+        double worst = best;
         g_comm->allReduceHost(&worst, 1, ReduceOp::Max);
         if (rank == 0)
-            std::printf("bench np=%d %s: %d cells/rank, %d PCG iterations: %.3f ms/iteration (slowest rank, host-staged MPI backend, "
-                        "all ranks sharing ONE GPU)\n", np, fused ? "fused " : "plain ", s.nC, r.perf.nIterations, worst/r.perf.nIterations);
+            std::printf("bench np=%d backend=%s %s: %d cells/rank, %d PCG iterations: %.3f ms/iteration (slowest rank; all ranks "
+                        "sharing ONE GPU, relative numbers only)\n", np, ProcComm::backendName(g_comm->backend()), m.name, s.nC, n,
+                        worst/n);
     }
 }
 
@@ -471,7 +568,8 @@ int main(int argc, char** argv)
     try
     {
         Pstream::init(argc, argv);
-        std::unique_ptr<ProcComm> comm = ProcComm::createMpiHost();
+        std::vector<std::unique_ptr<ProcComm>> comms = ProcComm::create();          // BRAE_COMM = mpi (default here) | nccl | auto
+        std::unique_ptr<ProcComm> comm = std::move(comms.at(0));
         g_comm = comm.get();
         ProcComm::setCurrent(comm.get());
         const int np = comm->size();
