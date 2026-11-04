@@ -3328,6 +3328,24 @@ target_include_directories(test_processor_patch_reader PRIVATE ${BRAE_HEADER_DIR
 target_link_libraries(test_processor_patch_reader PRIVATE brae_core)
 add_test(NAME processor_patch_reader COMMAND test_processor_patch_reader ${CMAKE_CURRENT_SOURCE_DIR})
 
+# WP1 second half: the processor patches coupled over ProcComm (OpenFOAM's processorFvPatch formulas from ONE setup
+# exchange) and the device interface with halo slots, on decomposePar meshes with a rank per thread on one GPU.
+# The fixture is the 2-domain mesh of tests/data; mgpu_proc_geometry (below) runs it on real decompositions.
+add_executable(test_proc_geometry_loopback tests/test_proc_geometry_loopback.cu)
+target_include_directories(test_proc_geometry_loopback PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_proc_geometry_loopback PRIVATE brae_core)
+add_test(NAME proc_geometry_loopback_fixture
+         COMMAND test_proc_geometry_loopback ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/processor_mesh_np2)
+set_tests_properties(proc_geometry_loopback_fixture PROPERTIES TIMEOUT 300)
+# ...and against OpenFOAM v2606 -parallel on the oracle cases: decomposePar (scotch/simple/hierarchical), the
+# OpenFOAM dump tool and brae_interFoam under BRAE_MGPU_GEOMETRY_ONLY=1 side by side, then the loopback harness on the
+# same directories. Skips (77) without the oracle build (tools/mgpu_oracle/setup.sh) or OpenFOAM v2606.
+add_test(NAME mgpu_proc_geometry
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_proc_geometry.sh $<TARGET_FILE:brae_interFoam>
+                 $<TARGET_FILE:test_proc_geometry_loopback>)
+set_tests_properties(mgpu_proc_geometry PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 # ...and MULES. Two kinds of arm: the PROPERTY (alpha stays in [0,1]) asserted exactly, because that is
 # what MULES is for and needs no host to compare against; and lambda itself within a measured
 # tolerance, because each cell's five gathers run in a different ORDER from the host's face loop and
