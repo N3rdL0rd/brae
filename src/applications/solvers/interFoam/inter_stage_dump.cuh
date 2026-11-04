@@ -68,10 +68,13 @@ public:
     }
 
     // internal: nInternalFaces values; bnd: the nBndFaces values of every patch in patch order (processor faces last)
-    void surface(const std::string& name, const std::vector<scalar>& internal, const std::vector<scalar>& bnd)
+    // `oriented`: a flux-like field whose sign follows the face's orientation (OpenFOAM's `oriented oriented`); a
+    // magnitude such as phic is not
+    void surface(const std::string& name, const std::vector<scalar>& internal, const std::vector<scalar>& bnd,
+                 bool oriented = true)
     {
         std::ofstream o = open(name, "surfaceScalarField");
-        o << "dimensions      [0 0 0 0 0 0 0];\noriented        oriented;\n\n";
+        o << "dimensions      [0 0 0 0 0 0 0];\n" << (oriented ? "oriented        oriented;\n" : "") << "\n";
         list(o, "internalField   nonuniform List<scalar> ", internal.data(), internal.size());
         o << ";\n\nboundaryField\n{\n";
         std::size_t at = 0;

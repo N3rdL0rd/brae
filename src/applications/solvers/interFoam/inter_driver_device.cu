@@ -2693,6 +2693,24 @@ RunReport runInterFoamDevice(
         procExchange(*procCtx, {const_cast<DeviceBuffer<scalar>*>(&cells)}, "alpha1");
         procFaceValue(*procCtx, cells, bnd);
     };
+    // ...and the HOST hooks' form: the same values put into the host field's processor patches too, which the host's
+    // boundary-normal stencil (finishNHatBoundary) sums after the physical patches, as OpenFOAM does
+    const auto procAlphaToHost = [&](const DeviceBuffer<scalar>& cells, DeviceBuffer<scalar>& aBnd)
+    {
+        if (!procCtx) return;
+        procAlphaTail(cells, aBnd);
+        std::vector<scalar> tail(static_cast<std::size_t>(procCtx->nFaces()));
+        cudaCheck(cudaMemcpy(tail.data(), aBnd.data() + procCtx->bndStart(), tail.size()*sizeof(scalar),
+                             cudaMemcpyDeviceToHost), "the processor faces' alpha down");
+        std::size_t at = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (!isProcessorType(fvp[pi].type)) continue;
+            const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+            f.alpha1.boundary[pi]->setValue(std::vector<scalar>(tail.begin() + at, tail.begin() + at + n));
+            at += n;
+        }
+    };
     // the hooks: every one is per-patch host work, and nothing else
     DeviceInterStepHooks H;
     H.alpha.updateBoundary =
@@ -2718,6 +2736,7 @@ RunReport runInterFoamDevice(
         a.copyTo(f.alpha1.internal);
         const HooksEmptyPlan ep = hooksEmptyPlan();
         alphaBoundaryUp(ep, AlphaUp::evaluated, &a, aBnd);
+        procAlphaToHost(a, aBnd);
         part.emplace("alpha hook: the mixture's boundary and alpha's fixes");
         // The boundary viscosity from alpha's patch values as they stand HERE, before the curvature
         // pass below rewrites the contact-angle gradient: mixture.correct() is calcNu() and THEN
@@ -2746,6 +2765,7 @@ RunReport runInterFoamDevice(
         pushFlux();
         a.copyTo(f.alpha1.internal);
         alphaBoundaryUp(hooksEmptyPlan(), AlphaUp::evaluated, &a, aBnd);
+        procAlphaToHost(a, aBnd);
     };
     // ...and the top of the alpha step, which evaluates nothing: the host field's patch values as the
     // last evaluate left them (every evaluate of this loop goes through f.alpha1, so they are current)
@@ -2829,6 +2849,7 @@ RunReport runInterFoamDevice(
         a.copyTo(f.alpha1.internal);
         const HooksEmptyPlan ep = hooksEmptyPlan();
         alphaBoundaryUp(ep, AlphaUp::stored, nullptr, aBnd);
+        procAlphaToHost(a, aBnd);
         mixtureBoundary(ep);
         refreshAlphaFixes();
         SurfaceScalarField nHb;
@@ -2926,6 +2947,7 @@ RunReport runInterFoamDevice(
                                                       f.alphaCtl.nAlphaSubCycles, subCycle);
             updateWaveAlpha(f.waves, f.alpha1, f.U, clock.t, clock.timeIndex, m, g, fvp);
             alphaBoundaryUp(hooksEmptyPlan(), AlphaUp::evaluated, &a, aBnd);
+            procAlphaToHost(a, aBnd);
         };
     }
     if (dyn)
@@ -6301,7 +6323,15 @@ RunReport runInterFoamDevice(
                                f.interface.nHatGrad.cellLimitK, dNH, dK, nullptr, nullptr);
         // alpha's patch values AFTER the pass (the contact angle evaluates its wall: what createFields' rho reads)
         DeviceBuffer<scalar> aBndAfter;
-        deviceCopy(aBndAfter, contactAngleDevice ? dContact.stored : dABnd);
+        if (contactAngleDevice)
+        {
+            deviceCopy(aBndAfter, dContact.stored);
+        }
+        else
+        {
+            aBndAfter.copyFrom(patchValues(f.alpha1, fvp));   // the host hooks' field, contact angle evaluated
+            procAlphaTail(dA, aBndAfter);
+        }
         // the mixture on the owned cells AND the halo (alpha's halo is current), and on the boundary faces
         DeviceBuffer<scalar> rdS = makeCellBuffer<scalar>(dm), rhoBdS(static_cast<std::size_t>(dm.nBndFaces));
         deviceMixtureCorrect(dA.data(), dm.nCellsExt, props, nullptr, rdS.data(), nullptr, nullptr);
@@ -6360,7 +6390,7 @@ RunReport runInterFoamDevice(
         }
         split(snRhoS, hi, hb);
         dump.surface("sSnGradRho", hi, hb);
-        tap.phicInt.copyTo(hi); tap.phicBnd.copyTo(hb); dump.surface("sPhic", hi, hb);
+        tap.phicInt.copyTo(hi); tap.phicBnd.copyTo(hb); dump.surface("sPhic", hi, hb, false);
         tap.phirInt.copyTo(hi); tap.phirBnd.copyTo(hb); dump.surface("sPhir", hi, hb);
         tap.unInt.copyTo(hi); tap.unBnd.copyTo(hb); dump.surface("sAlphaPhiUn", hi, hb);
         std::printf("brae interFoam: stage dump rank %d: %s (sNHatf sSigmaK sStf sRho sSnGradRho sPhic sPhir sAlphaPhiUn)\n",
