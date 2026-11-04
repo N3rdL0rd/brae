@@ -74,3 +74,40 @@ the output makes every consumer correct without its own change:
 | device_inter_alpha_step.cu | the mixture's `alpha2`, `rho`, `mu`, `nu` |
 | device_inter_peqn.cu | the corrected velocity `UX/UY/UZ` (read by the next `H`) |
 | blas1.cu | `deviceCopy` |
+
+## Neighbour-list operators across a processor face (the explicit stages)
+
+`DeviceProcCtx` (src/cuda/device_processor_ops.cuh) is the driver's processor interface, published thread-locally
+once `dm` and `DeviceProcInterface` exist; an operator asks `DeviceProcCtx::active(dm)` (false without processor
+faces, so the single-GPU and np = 1 runs execute their old instructions). Across a processor face an operator:
+
+1. refreshes the halo tail of every cell array the neighbour kernels read (`procExchange`, one batched
+   `ProcComm::exchangeCells`; it refuses an array without halo capacity, the tripwire for a missed WP3 site);
+2. lets the cyclic interface kernel form the face value on `ctx.cyc()` (neighbour = halo slot);
+3. scatters the result into the processor segment of the boundary-face array (`procScatter`; `procGather` the
+   other way for kernels reading the pair's own `phi`), so the sum-class operators (Gauss gradient, divergence)
+   take it through the boundary gather in OpenFOAM's face order -- the cyclic `Add*` kernels are NOT called for a
+   processor face (the face would count twice).
+
+The host never sees a coupled processor patch: the factory builds an inert zero-gradient placeholder for it, the
+driver couples a COPY of the patch list after the host fields are built and hands that copy to `buildDeviceMesh` /
+`buildDeviceProcInterface` only; every host operator and boundary flatten keeps the uncoupled list.
+
+| operator (call site) | processor faces |
+|---|---|
+| alpha's boundary-value slot (alpha hooks, `procAlphaTail`) | exchange alpha, w*own + (1-w)*nbr into the boundary array (and the contact-angle `stored` tail) |
+| contact-angle device path | `stored` sized to the whole boundary (physical prefix, processor tail), `nHatfBnd` likewise; the stencil cells' gradient sums the processor faces after the physical ones (OpenFOAM's order); processor patches are skipped as contact faces (no longer a host fallback) |
+| `deviceInterfaceCorrect` (nHatf, K) | Gauss grad with the processor bval, grad halo, nHatf from both sides' gradients into the processor segment, K = -div through the gather, K halo; leastSquares / cellLimited nHat refused by name |
+| `deviceAlphaCorrector` high-order flux | alpha halo, phic compressed on the processor faces (coupled), alpha2 on the halo cells, vanLeer / linear fluxes (advection, inner, outer) by `deviceAlphaCyclicFlux[With]` with exchanged gradients; limited / leastSquares alpha gradients refused by name. MULES (limiter, lambda `exchangeFaces`, correction) is NOT ported |
+| interfaceForces hook | stf = interpolate(sigma K) * snGrad(alpha) and snGrad(rho) on the processor faces (`deviceCyclicFaceValue` / `deviceCyclicSnGrad`, limited corrected included) |
+
+Stage dump: `BRAE_MGPU_STAGE_DUMP=<dir>` (serial or `-parallel`, `-device`) skips initCorrectPhi (a domain-wide solve)
+and keeps alpha's patches as read (the stage pass is interfaceProperties' constructor pass), runs the stages above
+on the start state and writes `s*.dump` per rank, then stops. OpenFOAM's side: `BRAE_STAGE_DUMP=1 dumpInterFoam`
+(tools/dumpInterFoam/stageDump.H, before initCorrectPhi). Gate: `tools/mgpu_oracle/stage_gate.sh <brae> <case> <np>
+[method] [tol]`; control `BRAE_CONTROL_PROC_NO_EXCHANGE=1` (halos never refreshed) fails it on every processor face.
+
+Fast paths with processor faces: contact-angle device path KEPT (processor faces handled as above); forcesFast KEPT
+(its boundary kernels run over all boundary faces, the processor segment is overwritten by the interface result);
+flux-push skip, device p_rgh patches and adjustPhi deferral are not reached by the stage dump (left to the
+momentum/pressure work).
