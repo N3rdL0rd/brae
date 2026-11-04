@@ -3,6 +3,7 @@
 #include "device_amg.cuh"
 #include "inter_phase_time.cuh"
 #include "device_blas.cuh"
+#include "proc_comm.cuh"       // ProcComm::current(): the rank in the hierarchy cache file name
 #include "device_ldu.cuh"       // deviceParallelAmul (halo-coupled matvec) for the distributed whole-loop graph PCG
 #include "device_halo.cuh"      // DeviceHalo + its DeviceReducer (on-stream NVSHMEM reduce)
 #include "device_amg_detail.cuh"  // shared inline primitives: safeDiag/warpReduceSum/blockDot + env-flag readers + AMG constants
@@ -1223,7 +1224,15 @@ std::string amgCachePath(
     const std::string& cacheDir,
     bool               smoothedAggregation)
 {
-    return cacheDir + (smoothedAggregation ? "/.brae_amgcache_sa" : "/.brae_amgcache");
+    std::string path = cacheDir + (smoothedAggregation ? "/.brae_amgcache_sa" : "/.brae_amgcache");
+    // A DECOMPOSED RUN builds each rank's hierarchy from its own local mesh (processorN/constant/polyMesh is the cacheDir
+    // of a per-rank case root already); the rank in the name keeps ranks that share a directory from reading or
+    // overwriting each other's file (the signature would reject a foreign one, not stop a concurrent write).
+    if (const ProcComm* pc = ProcComm::current(); pc && pc->size() > 1)
+    {
+        path += "_r" + std::to_string(pc->rank());
+    }
+    return path;
 }
 
 AMGData buildOrLoadAMG(
