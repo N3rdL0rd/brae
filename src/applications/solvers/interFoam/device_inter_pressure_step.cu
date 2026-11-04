@@ -736,11 +736,9 @@ scalar deviceInterPressureStep(
     DeviceBuffer<scalar> ffProc, rAUfProc;
     if (proc)
     {
-        deviceCyclicPressureFlux(proc->cyc(), p_rgh, ffProc);
-        if (in.correctedLaplacian && ffcIf.size() == static_cast<std::size_t>(proc->nFaces()))
-        {
-            deviceAxpy(scalar(1), ffcIf, ffProc);
-        }
+        // The processor suffix of fluxBnd already holds p_rghEqn.flux(), including the last
+        // non-orthogonal correction. Keep it for the corrector's face reconstruction and taps.
+        procGather(*proc, fluxBnd, ffProc);
         deviceAxpy(scalar(-1), ffProc, procPhig);
         deviceCyclicFaceValue(proc->cyc(), rAU, rAUfProc);
         if (taps)
