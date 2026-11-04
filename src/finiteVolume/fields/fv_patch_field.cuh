@@ -4468,6 +4468,10 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // cellMotionU<Cmpt> field, which a restart reads back.
     if (d.type == "cellMotion")      return std::make_unique<FixedValuePatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     if (d.type == "calculated")      return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
+    // A decomposed case's `processor` entry (type + value): the patch holds the face value the solver last put there
+    // -- w*own + (1-w)*neighbour once the halo is exchanged, which is the multi-rank solver's job, and what the
+    // per-rank writer writes back. Read-and-hold like `calculated`; it takes no part in a matrix as a boundary.
+    if (d.type == "processor")       return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // atmBoundaryLayerInlet{Velocity,K,Epsilon,Omega} (OpenFOAM atmBoundaryLayer.C, v2412): Richards-Hoxey log-law
     // profile evaluated per boundary face from the face-centre height z = Cf.zDir - d, a steady fixedValue. Params come
     // from include/ABLConditions (foam_field_reader parses them). u* = kappa|Uref|/ln((Zref+z0)/z0):

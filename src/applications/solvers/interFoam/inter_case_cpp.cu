@@ -972,6 +972,18 @@ std::vector<ClaimedTangentialVelocity> claimTangentialVelocity(
 }   // namespace
 
 
+// the reference-cell reader of createFields.H:104-124, for the callers that hold only a p_rgh, a dictionary and a
+// mesh (the frozen-state multi-rank harness); buildInterFields calls the same function
+InterFields::PressureReference readPressureReferenceOf(
+    const GeometricField<scalar>& p_rgh,
+    const FoamDict& fvSolution,
+    const PrimitiveMesh& m,
+    const FvGeometry& g)
+{
+    return readPressureReference(p_rgh, fvSolution, m, g);
+}
+
+
 InterFields buildInterFields(const CaseRoots&            roots,
                              const std::string&          startDir,
                              const PrimitiveMesh&        m,

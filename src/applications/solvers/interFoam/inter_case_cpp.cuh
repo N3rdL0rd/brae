@@ -447,6 +447,13 @@ void updateMixtureBoundary(
     const std::vector<FvPatch>& patches,
     MixturePatches which = MixturePatches::all);
 
+// the pressure reference of a closed case, as buildInterFields reads it (findRefCell.C; global under -parallel)
+InterFields::PressureReference readPressureReferenceOf(
+    const GeometricField<scalar>& p_rgh,
+    const FoamDict& fvSolution,
+    const PrimitiveMesh& m,
+    const FvGeometry& g);
+
 InterFields buildInterFields(const CaseRoots&            roots,
                              const std::string&          startDir,
                              const PrimitiveMesh&        m,

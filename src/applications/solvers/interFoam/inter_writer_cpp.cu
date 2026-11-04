@@ -883,9 +883,13 @@ void volPatch(
     }
     // calculatedFvPatchField.C:212-216, fixedValueFvPatchField.C:154-158, kqRWallFunctionFvPatchField.C:
     // 103-107 (zeroGradient's write, then the value), movingWallVelocityFvPatchVectorField.C:150-154 (the
-    // base's write and the value -- the Uwall its updateCoeffs assigned, :128-146)
+    // base's write and the value -- the Uwall its updateCoeffs assigned, :128-146).
+    // `processor` (a decomposed case's rank boundary): coupledFvPatchField::write is fvPatchField::write and
+    // the value entry -- `type processor; value <the coupled face values>`, nothing else (v2606's decomposePar
+    // and a -parallel run write exactly that; no myProcNo/neighbProcNo, which are the POLY patch's). The value
+    // is what the solver left on the face: w*own + (1-w)*neighbour of the halo-exchanged cells.
     else if (type == "calculated" || type == "fixedValue" || type == "kqRWallFunction"
-          || type == "movingWallVelocity")
+          || type == "movingWallVelocity" || type == "processor")
     {
         wordEntry(os, 8, "type", type);
         listEntry(os, 8, "value", value, precision);
@@ -2244,7 +2248,8 @@ std::string surfaceFieldText(
         else
         {
             const bool constraint = (p.type == "wedge" || p.type == "symmetryPlane" || p.type == "symmetry"
-                                  || p.type == "cyclic" || p.type == "cyclicAMI" || p.type == "cyclicACMI");
+                                  || p.type == "cyclic" || p.type == "cyclicAMI" || p.type == "cyclicACMI"
+                                  || p.type == "processor");
             wordEntry(os, 8, "type", constraint ? p.type : std::string("calculated"));
             const std::vector<typename std::decay<decltype(f.internal[0])>::type> none;
             listEntry(os, 8, "value", pi < f.boundary.size() ? f.boundary[pi] : none, precision);

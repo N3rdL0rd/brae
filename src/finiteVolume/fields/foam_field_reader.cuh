@@ -354,6 +354,13 @@ inline void readUniformOrList(
         uniform = false;
         ts.next();                 // List<scalar> / List<vector>
         const label n = ts.nextLabel();
+        // OpenFOAM writes an EMPTY list as `List<scalar> 0;` -- no parentheses (a patch with no faces on one rank of
+        // a decomposed case: `value nonuniform List<scalar> 0;`)
+        if (n == 0 && ts.peek() == ";")
+        {
+            vals.clear();
+            return;
+        }
         ts.expect("(");
         vals.resize(n);
         for (label i = 0; i < n; ++i)
