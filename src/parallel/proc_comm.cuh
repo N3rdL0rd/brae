@@ -297,6 +297,10 @@ public:
     // Host rendezvous of all ranks (also an abort checkpoint). No device effect.
     void barrier() { if (size_ == 1) return; doBarrier(); }
 
+    // Allgather of one integer vector per rank (host, blocking, bounded): agrees on processor-patch
+    // participation before any point-to-point exchange. Loopback/np==1: recv = send.
+    virtual void allgatherInts(const std::vector<int>& send, std::vector<int>& recv) { recv = send; }
+
     // Neighbour exchange of integer lists (host, blocking): recv[k] = list sent by nbrRanks[k]. Used to learn the
     // neighbour's face order (ProcessorPatchDesc::nbrFaceCells).
     std::vector<std::vector<int>> exchangeIntLists(const std::vector<int>& nbrRanks,

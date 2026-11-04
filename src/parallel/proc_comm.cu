@@ -1173,6 +1173,30 @@ protected:
 
     ~MpiHostComm() override;                    // defined below: cancels live requests, stops the side channel
 
+    void allgatherInts(const std::vector<int>& send, std::vector<int>& recv) override
+    {
+        MPI_Request req = MPI_REQUEST_NULL;
+        mpiCheck(MPI_Iallgather(send.data(), static_cast<int>(send.size()), MPI_INT, recv.data(),
+                                static_cast<int>(send.size()), MPI_INT, statusComm_, &req), "Iallgather");
+        const auto t0 = std::chrono::steady_clock::now();
+        for (;;)
+        {
+            int done = 0;
+            mpiCheck(MPI_Test(&req, &done, MPI_STATUS_IGNORE), "Test");
+            if (done) return;
+            std::string msg;
+            int origin = -1;
+            if (sideAborted(msg, origin)) { dropCollective(req); abortSeen(); throw ProcCommAbort(msg, origin); }
+            if (watchdogMs_ > 0
+                && std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() > watchdogMs_)
+            {
+                dropCollective(req);
+                collectiveAbort("ProcComm: patch participation allgather timed out (a rank left the sequence)");
+            }
+            usleep(200);
+        }
+    }
+
     // A collective that must NEVER hang the abort recovery: the status allgather already uses a bounded
     // nonblocking wait, and the recovery's allreduce/barrier need the same property because a peer may have left
     // the sequence after its own ProcCommAbort. The result is the MAX of the local flags when the collective
@@ -1629,8 +1653,15 @@ protected:
         sp->setTables(rt, ft);
         setPlanState(*plan, std::move(st));
         verifyPlanSizes(d);
-        // Warm-up: the lazy peer-to-peer connections of BOTH communicators are set up here with the largest messages
-        // this plan will send, so that no first-use latency/allocation happens in a timed region or a capture.
+        // Warm-up: the lazy peer-to-peer connections of BOTH communicators are set up here with the largest
+        // messages this plan will send, so that no first-use latency/allocation happens in a timed region or a
+        // capture. A rank whose peers already aborted must NOT enter it: NCCL work against a rank that left
+        // would hang the stream, and the abort is already on its way through the side channel.
+        {
+            std::string msg;
+            int origin = -1;
+            if (sideAborted(msg, origin)) { onSideAbort(); throw ProcCommAbort(msg, origin); }
+        }
         for (int c = 0; c < 2; ++c)
         {
             sendRecvGroup(c, wst_, d, sp->dSend, sp->dRecv, maxComps, true);
