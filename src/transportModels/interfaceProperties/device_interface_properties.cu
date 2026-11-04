@@ -1,5 +1,6 @@
 // Interface normal and curvature on the device -- see the header for what is here and what is not.
 #include "device_interface_properties.cuh"
+#include "device_processor_ops.cuh"
 #include "device_glibc_math.cuh"
 #include <algorithm>
 #include <cstdio>
@@ -431,7 +432,7 @@ void deviceInterfaceCorrect(
     const DeviceMesh&           dm,
     const DeviceBuffer<scalar>& alpha1,
     const DeviceBuffer<scalar>& alpha1Bnd,
-    const DeviceBuffer<scalar>& nHatfBnd,
+    DeviceBuffer<scalar>&       nHatfBnd,
     scalar                      deltaN,
     bool                        gradLeastSquares,
     scalar                      gradCellLimitK,
@@ -447,10 +448,17 @@ void deviceInterfaceCorrect(
             "brae interfaceProperties (device): fvSchemes names a cellLimited nHat gradient on a mesh "
             "with a periodic pair. The limiter would not see the pair's faces. Refused rather than "
             "limit a gradient without them.");
+    DeviceProcCtx* const proc = DeviceProcCtx::active(dm) ? DeviceProcCtx::current() : nullptr;
+    if (proc && (gradLeastSquares || gradCellLimitK > scalar(0)))
+        throw std::runtime_error(
+            "brae interfaceProperties (device): a leastSquares or cellLimited nHat gradient across processor faces. "
+            "Only `Gauss linear` is ported under -parallel.");
     DeviceBuffer<scalar> gx, gy, gz;
     // fvc::grad(alpha1_, "nHat") by the case's own entry: a leastSquares fit takes the pair inside it
     deviceGradOf(dm, alpha1, alpha1Bnd, gradLeastSquares, gradCellLimitK, gx, gy, gz,
                  (gradLeastSquares && pair) ? cyc : nullptr);
+    // the gradient's halo, for the neighbour's side of nHatf on the processor faces
+    if (proc) procExchange(*proc, {&gx, &gy, &gz}, "grad(alpha1)");
     // THE PAIR's own contribution to a Gauss grad(alpha) first: nHatf is built from that gradient, and
     // a gradient without the pair is the gradient of a mesh with a wall there.
     if (!gradLeastSquares && pair)
@@ -469,7 +477,14 @@ void deviceInterfaceCorrect(
         }
         deviceInterfaceNormalFluxCyclic(*cyc, gx, gy, gz, deltaN, *nHatfIf);
     }
+    if (proc)
+    {
+        DeviceBuffer<scalar> nHatfProc;
+        deviceInterfaceNormalFluxCyclic(proc->cyc(), gx, gy, gz, deltaN, nHatfProc);
+        procScatter(*proc, nHatfProc, nHatfBnd);
+    }
     deviceInterfaceCurvature(dm, nHatfInt, nHatfBnd, K);
+    if (proc) procExchange(*proc, {&K}, "K");
     // ...and the pair's own face in -div(nHatf): K is a divergence, and fvc::div sums a coupled patch's
     // face into its cell like any patch's (fvc.cu:548-550). The negate above has already run, so this
     // subtracts what that sum would have added.
@@ -521,7 +536,9 @@ void deviceContactAngleNHat(const DeviceMesh& dm, DeviceContactAngleState& s,
             s.gx.data(), s.gy.data(), s.gz.data());
         ckIP(cudaGetLastError(), "contact angle: the boundary cells' gradient");
     }
-    nHatfBnd.resize(static_cast<std::size_t>(s.n));
+    // the physical faces are the prefix [0, s.n); a rank with processor faces holds them after it, in the same array
+    // (the interface kernel writes that segment: deviceInterfaceCorrect)
+    nHatfBnd.resize(dm.nHalo > 0 ? static_cast<std::size_t>(dm.nBndFaces) : static_cast<std::size_t>(s.n));
     if (s.n <= 0) return;
     const std::size_t n = static_cast<std::size_t>(s.n);
     s.hx.resize(n); s.hy.resize(n); s.hz.resize(n); s.mag.resize(n); s.a12.resize(n); s.b2.resize(n);

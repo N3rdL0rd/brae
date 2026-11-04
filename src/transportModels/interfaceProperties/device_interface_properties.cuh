@@ -80,11 +80,20 @@ void deviceInterfaceCurvature(
 // into deviceAlphaCorrector meant it read the pre-solve boundary; MEASURED on a rotating blob, that put
 // nHatf 2.885e-04 out on a field of scale 1.7e-03, which is 17%, and carried 3.2e-09 into alpha by the
 // end of the step. The caller evaluates the boundary between the two calls, which is what OpenFOAM does.
+//
+// ACROSS PROCESSOR FACES (a DeviceProcCtx is current and the mesh has a halo): the Gauss gradient takes the processor
+// faces from the boundary-value slot (alpha1Bnd's processor segment, in OpenFOAM's face order), the gradient's halo is
+// refreshed, the interface kernel forms nHatf there from both sides' gradients into nHatfBnd's processor segment, the
+// curvature sums it through the boundary gather like any boundary face, and K's halo is refreshed for the readers
+// of sigma*K. The cyclic pair's own terms (cyc/nHatfIf) are not used for a processor face.
 void deviceInterfaceCorrect(
     const DeviceMesh&           dm,
     const DeviceBuffer<scalar>& alpha1,
     const DeviceBuffer<scalar>& alpha1Bnd,      // the patch values the host has just evaluated
-    const DeviceBuffer<scalar>& nHatfBnd,       // contact angle already applied, where there is one
+    // contact angle already applied, where there is one. NOT const: across processor faces (DeviceProcCtx) the
+    // call writes the interface faces' normal into the processor segment of this array before it takes the
+    // divergence -- and alpha1Bnd's processor segment must hold w*own + (1-w)*neighbour of `alpha1` (the alpha hooks)
+    DeviceBuffer<scalar>&       nHatfBnd,
     scalar                      deltaN,
     // the gradSchemes entry NAMED nHat (interfaceProperties.C:117), as a GradChoice's two numbers
     bool                        gradLeastSquares,

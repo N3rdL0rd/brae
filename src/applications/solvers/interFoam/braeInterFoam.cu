@@ -197,11 +197,13 @@
 #include "case_roots.cuh"
 #include "inter_parallel.cuh"
 #include "inter_proc_geometry.cuh"
+#include "inter_proc_comm.cuh"
 #include "time_instances.cuh"
 #include "foam_dict.cuh"
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -436,6 +438,20 @@ int main(int argc, char** argv)
 
         // the time directories, at OpenFOAM's write times (inter_writer_cpp.cuh)
         cpu::interFoam::InterWriter writer(roots, startDir, patches, phase1);
+
+        // THE MULTI-GPU COMMUNICATOR (under -parallel on the device loop): ProcComm::current() for the run, which the
+        // driver couples its processor patches over. BRAE_MGPU_STAGE_DUMP=<dir> is the only way past the by-name
+        // refusal of a processor patch for now: the driver runs the first step's explicit stages with the
+        // processor-face operators, writes them and stops (inter_stage_dump.cuh).
+        if (!mgpuStageDumpDir().empty() && !onDevice)
+        {
+            throw std::runtime_error("BRAE_MGPU_STAGE_DUMP needs `-device` (serial for the np = 1 floor, or -parallel).");
+        }
+        std::unique_ptr<InterProcComm> procComm;
+        if (roots.parallel && onDevice)
+        {
+            procComm = std::make_unique<InterProcComm>(argc, argv, roots);
+        }
 
         // ONE case translation and ONE time loop per path, both the ones the gates call. A private
         // copy here would be the defect this file's header names.

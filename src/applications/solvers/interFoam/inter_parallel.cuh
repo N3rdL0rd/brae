@@ -42,6 +42,23 @@ inline bool mgpuGeometryOnly()
     return on;
 }
 
+// THE STAGE-DUMP GATE (BRAE_MGPU_STAGE_DUMP=<dir>): the driver couples the processor patches over ProcComm, builds the
+// halo-extended device state and the processor interface, runs the FIRST step's explicit stages (interface normal and
+// curvature, the surface-tension force, the high-order alpha flux) with the processor face operators, writes them per
+// rank in the OpenFOAM dump format under <dir>/processor<rank>/<time>/ and stops (inter_stage_dump.cuh). The solver
+// path past that point (limiter, momentum, pressure, collectives) is not ported, so nothing else may run: the same
+// by-name refusals step aside for a `processor` patch as for BRAE_MGPU_GEOMETRY_ONLY, and only for this run.
+inline std::string mgpuStageDumpDir()
+{
+    const char* e = std::getenv("BRAE_MGPU_STAGE_DUMP");
+    return (e != nullptr && e[0] != '\0') ? std::string(e) : std::string();
+}
+// either gate steps the by-name refusals of a processor patch aside
+inline bool mgpuProcessorGate()
+{
+    return mgpuGeometryOnly() || !mgpuStageDumpDir().empty();
+}
+
 // One line per patch: kind, size and, for a processor patch, the ranks it joins. Printed for every rank so a
 // decomposition can be read off the log of any of them.
 inline std::string processorPatchTable(const CaseRoots& roots, const std::vector<PatchInfo>& patches)
@@ -158,7 +175,7 @@ inline void refuseProcessorCoupling(const CaseRoots& roots, const std::vector<Pa
         if (p.type != "processor" || p.size == 0) continue;
         if (roots.parallel)
         {
-            if (mgpuGeometryOnly()) continue;   // the gate: the driver builds the coupling geometry and stops
+            if (mgpuProcessorGate()) continue;   // the gates: the driver builds the coupling and stops after its stage
             throw std::runtime_error(
                 "-parallel: rank " + std::to_string(roots.rank) + " of " + std::to_string(roots.nProcs)
                 + " has the processor patch '" + p.name + "' (" + std::to_string((long)p.size) + " faces, rank "

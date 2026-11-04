@@ -4452,6 +4452,12 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // a cyclicAMI pair the interFoam host loop coupled (cyclic_ami_cpp): coupledFvPatchField's value and
     // snGrad, with patchNeighbourField the AMI interpolate the patch's stencil carries
     if (d.type == "cyclicAMI" && p.coupled)      return std::make_unique<CoupledCyclicPatchField<T>>(p);
+    // processor: another rank's half of the interface. The host mirror of a processor patch is an INERT placeholder
+    // (the same stance as the cyclic's above on the device path): its faces are boundary faces of the device mesh
+    // whose values are made there, by the halo exchange (cuda/device_processor_ops.cuh), and nothing on the host
+    // reads them -- the driver couples the patch AFTER the host fields are built (runInterFoamDevice), so this
+    // patch is uncoupled here and every host operator sees an ordinary zero-gradient boundary.
+    if (d.type == "processor" && !p.coupled)    return std::make_unique<ZeroGradientPatchField<T>>(p);
     if (isCyclicFamilyType(d.type))          return std::make_unique<ZeroGradientPatchField<T>>(p);
     if (d.type == "empty")           return std::make_unique<EmptyPatchField<T>>(p);
     if (d.type == "symmetryPlane" || d.type == "symmetry" || d.type == "slip")

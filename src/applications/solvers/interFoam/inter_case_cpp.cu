@@ -2195,7 +2195,7 @@ InterFields buildInterFields(const CaseRoots&            roots,
             // out of every cyclic-specific refusal below, which name a cyclic and mean its same-mesh pair.
             if (isProcessorType(q.type))
             {
-                if (q.size > 0 && !mgpuGeometryOnly())
+                if (q.size > 0 && !mgpuProcessorGate())
                 {
                     throw std::runtime_error(
                         "brae interFoam: patch `" + q.name + "` is a processor patch (rank "
@@ -2394,7 +2394,30 @@ InterFields buildInterFields(const CaseRoots&            roots,
 
     // interfaceProperties' CONSTRUCTOR calls calculateK (interfaceProperties.C:196-210). That first
     // pass is what leaves alpha's wall gradient non-zero for the second one to build on.
+    // UNDER THE STAGE DUMP (inter_parallel.cuh) alpha's patches stay as READ: the device's stage pass is this
+    // constructor pass (taken there with the processor faces), and a host pass first would make it the second one.
+    const bool stageDump = !mgpuStageDumpDir().empty();
+    std::vector<std::vector<scalar>> stageVal(patches.size()), stageGrad(patches.size());
+    if (stageDump)
+    {
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            stageVal[pi] = f.alpha1.boundary[pi]->value();
+            if (const std::vector<scalar>* gr = f.alpha1.boundary[pi]->refGradPtr()) stageGrad[pi] = *gr;
+        }
+    }
     interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
+    if (stageDump)
+    {
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            f.alpha1.boundary[pi]->setValue(stageVal[pi]);
+            if (auto* fg = dynamic_cast<FixedGradientPatchField<scalar>*>(f.alpha1.boundary[pi].get()))
+            {
+                if (fg->refGradPtr()) fg->setGradient(stageGrad[pi]);
+            }
+        }
+    }
 
     // rhoPhi AS createFields.H:59-71 BUILDS IT: fvc::interpolate(rho)*phi, from the phi as it was read --
     // before initCorrectPhi -- and interpolate(rho) is linear through interpolationSchemes' default,

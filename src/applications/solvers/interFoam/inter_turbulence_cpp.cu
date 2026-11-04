@@ -708,7 +708,7 @@ InterTurbulence readInterTurbulence(
             for (const FvPatch& q : patches)
             {
                 // a processor patch is refused by name too, unless the multi-GPU gate is open (inter_parallel.cuh)
-                if ((isProcessorType(q.type) ? !mgpuGeometryOnly() : q.coupled) || q.type == "cyclic"
+                if ((isProcessorType(q.type) ? !mgpuProcessorGate() : q.coupled) || q.type == "cyclic"
                  || q.type == "cyclicAMI" || q.type == "cyclicACMI")
                     throw std::runtime_error(
                         std::string(WHO) + "kOmegaSST's `Gauss linearUpwind` on a mesh with the coupled patch '"

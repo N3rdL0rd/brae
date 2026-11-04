@@ -146,7 +146,7 @@ void refuseUnportedLocalEuler(
     {
         // a processor patch is refused by name too -- unless the multi-GPU gate is open (inter_parallel.cuh),
         // which stops the driver before any step runs
-        if ((isProcessorType(q.type) ? !mgpuGeometryOnly() : q.coupled) || q.type == "cyclic" || q.type == "cyclicAMI"
+        if ((isProcessorType(q.type) ? !mgpuProcessorGate() : q.coupled) || q.type == "cyclic" || q.type == "cyclicAMI"
          || q.type == "cyclicACMI")
         {
             throw std::runtime_error(
