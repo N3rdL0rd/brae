@@ -84,6 +84,14 @@ int main(int argc, char *argv[])
     #include "createDyMControls.H"
     #include "createFields.H"
     #include "createAlphaFluxes.H"
+    // BRAE_STAGE_DUMP=1: the explicit stages of the first step on THIS state (before initCorrectPhi, which would
+    // re-solve the flux), written, then stop (stageDump.H)
+    if (getenv("BRAE_STAGE_DUMP"))
+    {
+        #include "stageDump.H"
+        return 0;
+    }
+
     #include "initCorrectPhi.H"
     #include "createUfIfPresent.H"
 
