@@ -251,20 +251,26 @@ public:
     DeviceBuffer() = default;
     explicit DeviceBuffer(std::size_t n) { resize(n); }
     explicit DeviceBuffer(const std::vector<T>& h) { resize(h.size()); copyFrom(h); }
-    ~DeviceBuffer() { if (d_) detail::devicePool().give(d_, n_ * sizeof(T)); }
+    // A buffer of n elements with `tail` more elements of storage behind them (a multi-GPU field's halo slots,
+    // indices n..n+tail-1: parallel/proc_comm.cuh). size() stays n, so every reduction and BLAS call sees the
+    // owned elements only; data() addresses n+tail contiguous elements. The tail survives resize().
+    DeviceBuffer(std::size_t n, std::size_t tail) : tail_(tail) { resize(n); }
+    ~DeviceBuffer() { if (d_) detail::devicePool().give(d_, (n_ + tail_) * sizeof(T)); }
 
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-    DeviceBuffer(DeviceBuffer&& o) noexcept : d_(o.d_), n_(o.n_) { o.d_ = nullptr; o.n_ = 0; }
+    DeviceBuffer(DeviceBuffer&& o) noexcept : d_(o.d_), n_(o.n_), tail_(o.tail_) { o.d_ = nullptr; o.n_ = 0; o.tail_ = 0; }
     DeviceBuffer& operator=(DeviceBuffer&& o) noexcept
     {
         if (this != &o)
         {
-            if (d_) detail::devicePool().give(d_, n_ * sizeof(T));
+            if (d_) detail::devicePool().give(d_, (n_ + tail_) * sizeof(T));
             d_ = o.d_;
             n_ = o.n_;
+            tail_ = o.tail_;
             o.d_ = nullptr;
             o.n_ = 0;
+            o.tail_ = 0;
         }
         return *this;
     }
@@ -272,10 +278,21 @@ public:
     void resize(std::size_t n)
     {
         if (n == n_) return;
-        if (d_) detail::devicePool().give(d_, n_ * sizeof(T));            // return OLD block (OLD n_) to the pool
+        if (d_) detail::devicePool().give(d_, (n_ + tail_) * sizeof(T));  // return OLD block (OLD n_) to the pool
         n_ = n;
         d_ = nullptr;
-        if (n_) d_ = static_cast<T*>(detail::devicePool().take(n_ * sizeof(T)));
+        if (n_) d_ = static_cast<T*>(detail::devicePool().take((n_ + tail_) * sizeof(T)));
+    }
+    // Elements of storage behind size(); data()[size() .. size()+tail()) is addressable. Changing it
+    // reallocates (contents are lost), like resize() to a new size.
+    std::size_t tail() const { return tail_; }
+    void setTail(std::size_t tail)
+    {
+        if (tail == tail_) return;
+        if (d_) detail::devicePool().give(d_, (n_ + tail_) * sizeof(T));
+        tail_ = tail;
+        d_ = nullptr;
+        if (n_) d_ = static_cast<T*>(detail::devicePool().take((n_ + tail_) * sizeof(T)));
     }
     void copyFrom(const std::vector<T>& h)                                // H2D
     {
@@ -296,6 +313,7 @@ public:
 private:
     T*          d_ = nullptr;
     std::size_t n_ = 0;
+    std::size_t tail_ = 0;
 };
 
 } // namespace brae

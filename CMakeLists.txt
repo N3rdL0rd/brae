@@ -135,6 +135,7 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/lduMatrix/blas1.cu
     src/matrices/lduMatrix/lduMatrix/reductions.cu
     src/matrices/lduMatrix/lduMatrix/device_spmv.cu
+    src/matrices/lduMatrix/lduMatrix/device_proc_interface.cu
     src/matrices/lduMatrix/preconditioners/DILUPreconditioner/device_dilu.cu
     src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
     src/TurbulenceModels/turbulenceModels/laminar/generalizedNewtonian/generalizedNewtonian_cpp.cu

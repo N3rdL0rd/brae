@@ -863,6 +863,14 @@ void vcycleAt(
     DeviceBuffer<scalar>& xg,
     bool asymmetric)
 {
+    // A DECOMPOSED MESH: the V-cycle is the rank-local block's preconditioner (OpenFOAM's DIC / per-rank GAMG): no
+    // processor coupling, no halo exchange, no global reduction inside it.
+    LocalReductions localOnly;
+    if (Ag.proc.active())
+    {
+        vcycleAt(g, amg, deviceBlockLocal(Ag), bg, xg, asymmetric);
+        return;
+    }
     const int n = Ag.nCells;
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
     // A COUPLED PAIR (AMGPair): on the finest grid deviceAmul applies it from the caller's view; on every coarser
@@ -1258,6 +1266,12 @@ void vcycleAtF(
     float* xg,
     bool asymmetric)
 {
+    LocalReductions localOnly;               // rank-local block, as vcycleAt
+    if (topoG.proc.active())
+    {
+        vcycleAtF(g, amg, deviceBlockLocal(topoG), Ag, bg, xg, asymmetric);
+        return;
+    }
     const int n = Ag.nCells;
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
     // A COUPLED PAIR (AMGPair): this cycle's matrices are the internal faces' on EVERY grid, the finest included,
@@ -1387,6 +1401,11 @@ void amgPrepareFP32(AMGData& amg, const DeviceLduView& A)
 void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
                     const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z, bool captureVcycle)
 {
+    if (A.proc.active())                    // the rank-local block (see vcycleAt)
+    {
+        amgVCycleApply(amg, deviceBlockLocal(A), r, z, captureVcycle);
+        return;
+    }
     ensureSpectrum(amg, A);                // one-time Chebyshev spectrum estimate (no-op unless the Chebyshev smoother is on)
     const bool fp32 = amg.fp32Alloc && amgSinglePrecisionCycle(amg);
     const int nC = A.nCells;

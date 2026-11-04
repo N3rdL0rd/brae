@@ -15,6 +15,40 @@
 
 namespace brae {
 
+class ProcComm;   // forward (parallel/proc_comm.cuh)
+class HaloPlan;   // forward (parallel/proc_comm.cuh)
+
+// THE PROCESSOR-INTERFACE HOOK of a decomposed (multi-GPU) matrix: the coupling of this rank's block to the cells of
+// its neighbour ranks, OpenFOAM's processorFvPatchField::updateInterfaceMatrix. Null (plan == nullptr) on the single
+// GPU path, where nothing below is read or launched.
+//
+// A vector x the product reads has length nC + nHalo (DeviceBuffer with a tail: device_buffer.cuh): the owned cells,
+// then the halo slots of the neighbour cells (parallel/proc_comm.cuh halo storage convention). deviceAmul and
+// deviceResidual first refresh x's halo tail with ProcComm::exchangeCells -- a COLLECTIVE, so every rank must make
+// the same product calls in the same order -- and then add, per processor face i,
+//     Apsi[faceCell[i]] += coeff[i] * x[nbrIdx[i]]
+// (the cyclic interface's convention; coeff = -interfaceBouCoeffs, the neighbour-side boundary coefficient of the
+// face's matrix row, the diagonal part -internalCoeffs already folded into `diag`).
+//
+// Faces of one cell are added in face order (rank[i] = the face's place among its cell's faces, launched one place
+// at a time, as pairRank), the order OpenFOAM's patch-face loop adds them in.
+//
+// THE MULTIGRID V-CYCLE RUNS ON A VIEW WITH THIS STRIPPED (block-local preconditioner, exactly OpenFOAM's DIC/GAMG-per-
+// rank behaviour); vcycleAt does it at its entry.
+struct DeviceProcView
+{
+    ProcComm* comm = nullptr;
+    const HaloPlan* plan = nullptr;     // its halo plan (dFaceCells()/dFaceHaloCell() are faceCell/nbrIdx below)
+    int nFaces = 0;
+    const label*  faceCell = nullptr;   // [nFaces] owned cell of processor face i
+    const label*  nbrIdx = nullptr;     // [nFaces] nC + halo slot of face i's neighbour cell
+    const scalar* coeff = nullptr;      // [nFaces] see above
+    const label*  rank = nullptr;       // [nFaces] place among the cell's processor faces (null: one launch)
+    int nRanks = 1;
+    long long nGlobalCells = 0;         // sum of nCells over all ranks: the divisor of a global average (normFactor)
+    bool active() const { return plan != nullptr; }
+};
+
 // A non-owning view of an lduMatrix on device (raw pointers): lets the G4-assembled coefficients reuse a
 // DeviceMesh's addressing without copying, and lets a self-contained DeviceLduMatrix expose the same shape.
 struct DeviceLduView
@@ -63,7 +97,18 @@ struct DeviceLduView
     // Null and 1: one launch, every face, as before (what a view built without them gets).
     const label* pairRank = nullptr;
     int nPairRanks = 1;
+    // optional processor-interface coupling of a decomposed mesh (DeviceProcView); inactive by default
+    DeviceProcView proc;
 };
+
+// The same matrix WITHOUT its processor-interface coupling: this rank's diagonal block. What the multigrid V-cycle,
+// the smoothers inside it and every other block-local preconditioner run on (they must not exchange halos).
+inline DeviceLduView deviceBlockLocal(const DeviceLduView& A)
+{
+    DeviceLduView v = A;
+    v.proc = DeviceProcView{};
+    return v;
+}
 
 // each entry's place among the entries of the same own cell, in list order, and the most one cell has
 inline std::vector<label> pairOwnerRanks(
@@ -254,6 +299,20 @@ void deviceResidual(
     bool onField = false);
 // ...and the control that puts source - A.psi back (BRAE_CONTROL_DEVICE_GS_RESIDUAL_AMUL)
 bool deviceResidualAsAmul();
+
+// Processor-interface helpers (A.proc.active()). All three are collectives.
+//   deviceProcExchange: refresh x's halo tail (x needs a tail of >= nHalo; throws otherwise).
+//   deviceAmulHaloFresh: deviceAmul for an operand whose halo tail is already current (no exchange): the row sums
+//     A*1 with an all-ones tail, the products of a loop that exchanged its operand itself.
+//   deviceProcFrozenRhs: bEff = b - sum_faces coeff*x[nbr] after refreshing x's halo -- symGaussSeidel's per-sweep
+//     bPrime, the neighbour contribution frozen at the values the sweep starts from.
+void deviceProcExchange(const DeviceProcView& proc, const DeviceBuffer<scalar>& x);
+// halo slots of the view's plan (the tail a vector the product reads needs); 0 when the view is inactive
+std::size_t deviceProcHalo(const DeviceProcView& proc);
+void deviceAmulHaloFresh(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi,
+                         bool onField = false);
+void deviceProcFrozenRhs(const DeviceLduView& A, const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& b,
+                         DeviceBuffer<scalar>& bEff);
 
 class DeviceHalo;      // forward (parallel/pstream/device_halo.cuh)
 struct DistributedAMI; // forward (cuda/distributed_ami.cuh) -- optional cyclicAMI coupling in the matvec
