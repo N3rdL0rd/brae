@@ -67,6 +67,35 @@ struct DeviceMesh
     DeviceBuffer<scalar> nonOrthDc, corrVecX, corrVecY, corrVecZ;   // per internal face
 };
 
+// THE CELL-ARRAY LENGTH POLICY of the multi-GPU storage (docs/multigpu-processor-interface.md, "halo-extended
+// storage"). A cell array that a neighbour-reading kernel (the interface kernels, neighbour index nCells + slot)
+// reads holds nCellsExt = nCells + nHalo entries, the owned cells first and the halo tail after them. Its
+// DeviceBuffer keeps size() == nCells -- every launch, check, copyTo and size comparison sees the owned cells only --
+// and gets capacity() == nCellsExt. With no processor faces nHalo = 0 and every helper below returns what a plain
+// `DeviceBuffer(n)` allocates: same size, same pool class, same pointers.
+inline std::size_t cellArrayLength(const DeviceMesh& dm)
+{
+    return static_cast<std::size_t>(dm.nCellsExt > dm.nCells ? dm.nCellsExt : dm.nCells);
+}
+// a cell buffer from host values of the owned cells
+template <typename T>
+inline DeviceBuffer<T> makeCellBuffer(const DeviceMesh& dm, const std::vector<T>& h)
+{
+    return DeviceBuffer<T>(h, cellArrayLength(dm));
+}
+// an uninitialised cell buffer (owned cells + halo tail)
+template <typename T>
+inline DeviceBuffer<T> makeCellBuffer(const DeviceMesh& dm)
+{
+    return DeviceBuffer<T>(static_cast<std::size_t>(dm.nCells), cellArrayLength(dm));
+}
+// resize an existing buffer to the owned cells with the halo capacity
+template <typename T>
+inline void resizeCellBuffer(DeviceBuffer<T>& b, const DeviceMesh& dm)
+{
+    b.resize(static_cast<std::size_t>(dm.nCells), cellArrayLength(dm));
+}
+
 // cyclic (periodic) patches are SKIPPED in the boundary gather: they are not boundary faces. The periodic
 // coupling is applied as a SEPARATE interface (DeviceCyclic, device_cyclic.cuh) exactly like OpenFOAM's
 // cyclicFvPatchField::updateInterfaceMatrix, it is NOT merged into this owner-sorted internal-face LDU (doing

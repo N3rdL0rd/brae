@@ -143,10 +143,11 @@ void deviceInterAlphaStep(
                                    in.cyc, in.cyc ? &nHatfIfBuf : nullptr);
         }
         interPhase::Nested timedMixture("alpha: the mixture's cell fields (device)");
-        alpha2.resize(static_cast<std::size_t>(nC));
-        rho.resize(static_cast<std::size_t>(nC));
-        mu.resize(static_cast<std::size_t>(nC));
-        nu.resize(static_cast<std::size_t>(nC));
+        // the mixture's cell fields are read across a processor face: halo capacity (cellArrayLength)
+        resizeCellBuffer(alpha2, dm);
+        resizeCellBuffer(rho, dm);
+        resizeCellBuffer(mu, dm);
+        resizeCellBuffer(nu, dm);
         deviceMixtureCorrect(a.data(), nC, props,
                              alpha2.data(), rho.data(), mu.data(), nu.data());
     };

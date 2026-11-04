@@ -45,3 +45,32 @@ Per site group (what a processor patch needs; H = handled now, D = deferred to t
 | simpleFoam / rhoSimpleFoam / pimpleFoam drivers | ~30 | their old global-mesh decomposition path | unchanged (`isCoupledType` folds their `|| == "processor"`) |
 | dynamic mesh (hexRef8, polyTopoChange, removeFaces, MRF, wall distance, LES delta, fvcSmooth, vol point interpolation) | ~12 | refused under -parallel (dynamicMeshDict, MRF, non-laminar) | R |
 | tests/ | ~20 | cyclic-only fixtures | unchanged |
+
+## Halo-extended storage (the cell-array length policy)
+
+A cell array that a neighbour-reading kernel reads (the interface kernels, neighbour index `nC + slot`) must hold
+`nCellsExt = nC + nHalo` entries. The policy is ONE rule in two places:
+
+* `DeviceBuffer<T>` has a LENGTH (`size()`: what every launch, `copyTo`/`copyFrom` and size check sees, always the
+  owned cells) and a CAPACITY (`capacity()`: what the pool block holds). They differ only for a halo-extended cell
+  array: `size() == nC`, `capacity() == nC + nHalo`, tail zeroed at allocation. Moves, pool give-back
+  (`capacity * sizeof`), `resize(n)` (drops the capacity, as before), `resize(n, cap)` (new) follow. So no
+  `size() == nC` check anywhere in the tree changes meaning, and no D2H download returns the tail.
+* `cellArrayLength(dm)` (device_mesh.cuh) = `max(nCells, nCellsExt)`; `makeCellBuffer(dm[, host])` and
+  `resizeCellBuffer(buf, dm)` allocate with it. With `nHalo == 0` they reduce to `DeviceBuffer(n)` / `resize(n)`:
+  same size, same pool class, same pointers, so the single-GPU run (and every graph/cache key) is untouched.
+* `deviceCopy` (blas1.cu) copies the capacity, so an old-time copy of a halo-extended array keeps its tail
+  (an exchange is still needed whenever the owned values changed after the last one).
+
+Sites that allocate with the halo capacity (state in the driver, producers in the operators); a producer allocating
+the output makes every consumer correct without its own change:
+
+| where | what |
+|---|---|
+| inter_driver_device.cu, state | `dA`, `dAOld`, `dUx/y/z`, `dUox/y/z`, `dPrgh`, `dK` (uploaded from the host fields with `makeCellBuffer`) |
+| device_fvc.cu producers | `deviceGaussGrad`, `deviceLeastSquaresGrad`, the fused Gauss / least-squares gradients (gradient outputs are read across a face), `deviceDiv` (K = -div(nHatf)) |
+| device_simple.cu producers | `deviceReciprocalV` (rAU), the `H` component output of `deviceMatrixH`-form (`Hk`) |
+| device_alpha_step.cu | `alpha2` (the corrector's complement, read by the compression flux) |
+| device_inter_alpha_step.cu | the mixture's `alpha2`, `rho`, `mu`, `nu` |
+| device_inter_peqn.cu | the corrected velocity `UX/UY/UZ` (read by the next `H`) |
+| blas1.cu | `deviceCopy` |

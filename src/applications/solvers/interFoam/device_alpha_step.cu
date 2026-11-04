@@ -237,7 +237,7 @@ void deviceAlphaCorrector(
             "sub-cycle and each corrector continues from the last one's answer.");
 
     DeviceBuffer<scalar> phicInt, phicBnd, phirInt, phirBnd;
-    DeviceBuffer<scalar> alpha2(static_cast<std::size_t>(nC)), alpha2Bnd(static_cast<std::size_t>(nBf));
+    DeviceBuffer<scalar> alpha2 = makeCellBuffer<scalar>(dm), alpha2Bnd(static_cast<std::size_t>(nBf));   // alpha2 is read across a processor face
     DeviceBuffer<scalar> advInt, advBnd, negPhirInt, negPhirBnd;
     DeviceBuffer<scalar> innerInt, innerBnd, negInnerInt, negInnerBnd, compInt, compBnd;
     DeviceBuffer<scalar> phiBDInt, phiBDBnd, corrInt, corrBnd, lamInt, lamBnd;

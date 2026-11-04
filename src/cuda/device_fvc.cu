@@ -336,7 +336,7 @@ void deviceInterpolate(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, De
 void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d,
                const DeviceBuffer<scalar>* V)
 {
-    d.resize(dm.nCells);
+    resizeCellBuffer(d, dm);   // a divergence (K = -div(nHatf)) is read across a processor face: halo capacity
     divKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
                                            phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), bval.data(),
                                            V ? V->data() : dm.V.data(), d.data());
@@ -517,7 +517,7 @@ void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vo
 {
     const int nC = dm.nCells;
     const int cycN = (cyc && cyc->n > 0) ? cyc->n : 0;
-    gx.resize(nC); gy.resize(nC); gz.resize(nC);
+    resizeCellBuffer(gx, dm); resizeCellBuffer(gy, dm); resizeCellBuffer(gz, dm);   // gradients are read across a processor face: halo capacity
     // The single-field kernel stays the reference the fused one is held against; it does NOT forward
     // to the fused path (the same reason deviceGaussGrad does not).
     lsqGradKernel<<<nBlocks(nC), TPB>>>(
@@ -604,9 +604,9 @@ void deviceLeastSquaresGradFused(const DeviceMesh& dm, int n,
     scalar* z[3] = {nullptr, nullptr, nullptr};
     for (int i = 0; i < n; ++i)
     {
-        gx[i].resize(dm.nCells);
-        gy[i].resize(dm.nCells);
-        gz[i].resize(dm.nCells);
+        resizeCellBuffer(gx[i], dm);
+        resizeCellBuffer(gy[i], dm);
+        resizeCellBuffer(gz[i], dm);
         v[i] = vol[i]->data();
         b[i] = bval[i]->data();
         x[i] = gx[i].data();
@@ -626,9 +626,9 @@ void deviceGaussGrad(
     DeviceBuffer<scalar>& gz,
     const int* skipIf)
 {
-    gx.resize(dm.nCells);
-    gy.resize(dm.nCells);
-    gz.resize(dm.nCells);
+    resizeCellBuffer(gx, dm);   // gradients are read across a processor face: halo capacity
+    resizeCellBuffer(gy, dm);
+    resizeCellBuffer(gz, dm);
     gradKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.owner.data(), dm.nei.data(), dm.w.data(),
                                             dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), vol.data(),
                                             dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
@@ -815,9 +815,9 @@ void deviceGaussGradFused(
     }
     for (int i = 0; i < n; ++i)
     {
-        gx[i].resize(dm.nCells);
-        gy[i].resize(dm.nCells);
-        gz[i].resize(dm.nCells);
+        resizeCellBuffer(gx[i], dm);
+        resizeCellBuffer(gy[i], dm);
+        resizeCellBuffer(gz[i], dm);
     }
     switch (n)
     {

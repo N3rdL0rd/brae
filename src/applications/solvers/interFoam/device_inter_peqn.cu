@@ -487,9 +487,9 @@ void deviceCorrectVelocity(
     deviceReconstruct(dm, ssfInt, ssfBnd, rx, ry, rz, havePair ? cyc : nullptr,
                       havePair ? &ssfIf : nullptr);
 
-    UX.resize(static_cast<std::size_t>(nC));
-    UY.resize(static_cast<std::size_t>(nC));
-    UZ.resize(static_cast<std::size_t>(nC));
+    resizeCellBuffer(UX, dm);   // the corrected U is read across a processor face by the next H
+    resizeCellBuffer(UY, dm);
+    resizeCellBuffer(UZ, dm);
     addScaledKernel<<<nBlocks(nC), TPB>>>(HbyAX.data(), HbyAY.data(), HbyAZ.data(), rAU.data(),
                                           rx.data(), ry.data(), rz.data(), nC,
                                           UX.data(), UY.data(), UZ.data());

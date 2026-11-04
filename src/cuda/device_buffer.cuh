@@ -255,6 +255,8 @@ public:
     // indices n..n+tail-1: parallel/proc_comm.cuh). size() stays n, so every reduction and BLAS call sees the
     // owned elements only; data() addresses n+tail contiguous elements. The tail survives resize().
     DeviceBuffer(std::size_t n, std::size_t tail) : tail_(tail) { resize(n); }
+    // ...from host values of the owned elements, with `tail` halo slots behind them (cellArrayLength, device_mesh.cuh)
+    DeviceBuffer(const std::vector<T>& h, std::size_t tail) : tail_(tail) { resize(h.size()); copyFrom(h); }
     ~DeviceBuffer() { if (d_) detail::devicePool().give(d_, (n_ + tail_) * sizeof(T)); }
 
     DeviceBuffer(const DeviceBuffer&) = delete;
@@ -282,6 +284,21 @@ public:
         n_ = n;
         d_ = nullptr;
         if (n_) d_ = static_cast<T*>(detail::devicePool().take((n_ + tail_) * sizeof(T)));
+        if (n_ && tail_) cudaCheck(cudaMemset(d_ + n_, 0, tail_ * sizeof(T)), "halo tail memset");   // a defined start
+    }
+    // capacity() = size() + tail(): what the block holds. resize(n, cap): length n with room for cap >= n elements
+    // (tail = cap - n); a buffer already of this length and capacity is left alone, otherwise it is reallocated.
+    std::size_t capacity() const { return n_ + tail_; }
+    void resize(std::size_t n, std::size_t cap)
+    {
+        if (cap < n) cap = n;
+        const std::size_t tail = cap - n;
+        if (n == n_ && tail == tail_) return;
+        if (d_) detail::devicePool().give(d_, (n_ + tail_) * sizeof(T));
+        d_ = nullptr;
+        n_ = 0;
+        tail_ = tail;
+        resize(n);
     }
     // Elements of storage behind size(); data()[size() .. size()+tail()) is addressable. Changing it
     // reallocates (contents are lost), like resize() to a new size.
