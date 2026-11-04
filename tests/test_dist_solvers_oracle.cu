@@ -14,6 +14,7 @@
 //   * symGaussSeidel with the frozen halo reaches the same solution
 // An exit of 77 means "dump not found" (ctest SKIP).
 #include "device_amg.cuh"
+#include "device_amg_detail.cuh"  // braeCondGraphsAvailable()
 #include "device_blas.cuh"
 #include "device_ldu.cuh"
 #include "device_pcg.cuh"
@@ -252,7 +253,7 @@ int main(int argc, char** argv)
         const double gdiff = gmax(maxRel(gs.x, xRef));
         check(gs.perf.finalResidual < 1e-10, "symGaussSeidel reached the tolerance");
         // the CUDA-graph loops on the NCCL backend against the host-driven ones on the OpenFOAM-dumped matrices
-        if (np > 1 && comm->backend() == ProcComm::Backend::Nccl)
+        if (np > 1 && comm->backend() == ProcComm::Backend::Nccl && braeCondGraphsAvailable())
         {
             const Result pg = solvePcg(*sys, x0, tol, true);
             check(pg.perf.nIterations == pcg.perf.nIterations

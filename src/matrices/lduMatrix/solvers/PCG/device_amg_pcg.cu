@@ -858,7 +858,7 @@ static DeviceSolverPerf deviceAMGPCGProcGraph(
 // (BRAE_PCG_DEVICE=0), BRAE_PROC_GRAPH not 0 (proc_hooks.cuh procGraphLoops).
 static bool procPcgGraphWanted(const DeviceLduView& A)
 {
-    return procGraphLoops(*A.proc.comm) && envFlag("BRAE_PCG_DEVICE", true);
+    return procGraphLoops(*A.proc.comm) && envFlag("BRAE_PCG_DEVICE", true) && braeCondGraphsAvailable();
 }
 #endif // BRAE_HAS_GS_DEVICE
 

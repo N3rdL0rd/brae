@@ -17,6 +17,7 @@
 //   (c) symGaussSeidel with the halo frozen per sweep reaches the same solution; all ranks take the same sweep count
 //   (d) the iteration count against np (printed), and the collectives / halo exchanges per PCG iteration (counted)
 #include "device_amg.cuh"
+#include "device_amg_detail.cuh"  // braeCondGraphsAvailable()
 #include "device_blas.cuh"
 #include "device_ldu.cuh"
 #include "device_pcg.cuh"
@@ -419,7 +420,7 @@ void runCase(const Problem& p, const std::string& partName, const std::vector<in
     }
     // (f) the CUDA-graph loops on the NCCL backend (every rank captures its own graph, the collectives are in the WHILE
     // body) against the host-driven loops: the same iteration/sweep count, residuals, history and solution, bit for bit
-    if (np > 1 && g_comm->backend() == ProcComm::Backend::Nccl)
+    if (np > 1 && g_comm->backend() == ProcComm::Backend::Nccl && braeCondGraphsAvailable())
     {
         auto bitsEq = [](const std::vector<scalar>& a, const std::vector<scalar>& b)
         { return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size()*sizeof(scalar)) == 0); };
@@ -528,7 +529,7 @@ void bench()
     // alone (no history hook, no host copy of the solution); best of 3 solves of 60 iterations after a warm-up solve
     struct Mode { const char* name; bool unfused; bool graph; };
     std::vector<Mode> modes = {{"host fused ", false, false}, {"host plain ", true, false}};
-    if (g_comm->backend() == ProcComm::Backend::Nccl && np > 1) modes.push_back({"graph fused", false, true});
+    if (g_comm->backend() == ProcComm::Backend::Nccl && np > 1 && braeCondGraphsAvailable()) modes.push_back({"graph fused", false, true});
     for (const Mode& m : modes)
     {
         DeviceBuffer<scalar> x(static_cast<std::size_t>(s.nC), static_cast<std::size_t>(s.nHalo));

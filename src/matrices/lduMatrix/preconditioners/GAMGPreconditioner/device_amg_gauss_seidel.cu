@@ -1292,7 +1292,7 @@ scalar deviceSymGaussSeidel(
     if (A.proc.active())
     {
 #ifdef BRAE_HAS_GS_DEVICE
-        if (procGraphLoops(*A.proc.comm) && maxIter > 0 && !std::getenv("BRAE_GS_HOST_LOOP"))
+        if (procGraphLoops(*A.proc.comm) && braeCondGraphsAvailable() && maxIter > 0 && !std::getenv("BRAE_GS_HOST_LOOP"))
         {
             DeviceSolverPerf p;
             static thread_local auto& dNf = *new DeviceBuffer<scalar>(1);
