@@ -30,6 +30,19 @@
 // different rounding order from the serial host loop; any other expression, a missing answer, or the CPU loop
 // uses this original host evaluator. runTimeControl reads the same result entry after the batch, as before.
 //
+// UNDER -parallel every rank runs the list on ITS cells and faces, and the objects answer as ONE OpenFOAM run
+// would (the rules are OpenFOAM v2606's, read from its source):
+//   volFieldValue      the rank's sum over its cells (the region's cells in zone order) is reduced over the ranks
+//                      (gSum: rank order); min/max are gMin/gMax; `# Cells` and `# Volume` are the global ones
+//   surfaceFieldValue  the patch's faces on each rank (a rank may hold none), areas and sums reduced
+//   probes             the lowest rank whose cells hold the point owns the probe (listCombineReduce with
+//                      isNotEqOp keeps the first set value in rank order); a point in no rank's cell is skipped;
+//                      the master writes the columns
+//   fieldMinMax        each rank's extremum (the first cell on a tie), then the first rank with a strictly better
+//                      value wins -- value, location and the `processor` column come from that rank
+//   runTimeControl     reads the other objects' reduced results, so every rank decides the same
+//   files              postProcessing/ is written by the master alone, in the single-GPU format
+//
 // WHAT IS NOT HERE, said rather than guessed: an entry of a ported type that asks for something unported
 // (writeFields, weightField, a vector field in volFieldValue, interpolationScheme cellPoint, exprField
 // autowrite, a minMax mode other than maximum/minimum ...) stops the run at start-up and names itself. An
@@ -41,6 +54,7 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "brae_notice.cuh"
+#include "proc_globals.cuh"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -186,6 +200,50 @@ struct Services
     Source                                             src;
     // false on every rank but 0 under -parallel: OpenFOAM writes postProcessing/ from the master alone
     bool                                               isMaster = true;
+    // The reduction/gather layer over the ranks (pg:: over ProcComm). The default is a single rank: every
+    // function is the identity and communicates nothing. createFunctionObjects installs the ProcComm one when
+    // the process has a multi-rank communicator.
+    struct Reduce
+    {
+        int  rank = 0;
+        int  size = 1;
+        std::function<void(double*, int)>                                          sum, min, max;
+        std::function<std::vector<std::vector<double>>(const std::vector<double>&)> gatherAll;
+        std::function<void(const std::string&)>                                    fail;   // collective error
+        bool parallel() const { return size > 1; }
+        bool master() const { return rank == 0; }
+        // every function below is collective when parallel() and the identity otherwise
+        scalar reduceSum(scalar v) const { if (parallel()) { double d = v; sum(&d, 1); return d; } return v; }
+        scalar reduceMin(scalar v) const { if (parallel()) { double d = v; min(&d, 1); return d; } return v; }
+        scalar reduceMax(scalar v) const { if (parallel()) { double d = v; max(&d, 1); return d; } return v; }
+        void   reduceSum(std::vector<double>& v) const { if (parallel() && !v.empty()) sum(v.data(), static_cast<int>(v.size())); }
+        void   reduceMin(std::vector<double>& v) const { if (parallel() && !v.empty()) min(v.data(), static_cast<int>(v.size())); }
+        void   reduceMax(std::vector<double>& v) const { if (parallel() && !v.empty()) max(v.data(), static_cast<int>(v.size())); }
+        // every rank's list, on every rank, in rank order (the master writes from it)
+        std::vector<std::vector<double>> gatherToMaster(const std::vector<double>& local) const
+        {
+            return parallel() ? gatherAll(local) : std::vector<std::vector<double>>(1, local);
+        }
+        // a condition only some ranks can see: every rank stops with the message
+        [[noreturn]] void abortAll(const std::string& msg) const
+        {
+            if (parallel() && fail) fail(msg);
+            throw std::runtime_error(msg);
+        }
+        static Reduce procComm()
+        {
+            Reduce r;
+            if (!pg::parallel()) return r;
+            r.rank = pg::rank();
+            r.size = pg::nProcs();
+            r.sum = [](double* v, int n) { pg::sum(v, n); };
+            r.min = [](double* v, int n) { pg::min(v, n); };
+            r.max = [](double* v, int n) { pg::max(v, n); };
+            r.gatherAll = [](const std::vector<double>& v) { return pg::gatherAll(v); };
+            r.fail = [](const std::string& m) { pg::fail(m); };
+            return r;
+        }
+    }                                                  red;
 };
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1164,8 +1222,8 @@ inline CellRegion readCellRegion(const FoamDict& d, const std::string& object, R
         const auto it = rt.svc.cellZones ? rt.svc.cellZones->find(zone) : std::map<std::string, std::vector<label>>::const_iterator();
         if (!rt.svc.cellZones || it == rt.svc.cellZones->end())
         {
-            throw std::runtime_error("brae function objects: `" + object + "` names the cellZone `" + zone
-                                     + "`, which is not in constant/polyMesh/cellZones");
+            rt.svc.red.abortAll("brae function objects: `" + object + "` names the cellZone `" + zone
+                                + "`, which is not in constant/polyMesh/cellZones");
         }
         r.all = false;
         r.cells = it->second;
@@ -1180,6 +1238,21 @@ inline CellRegion readCellRegion(const FoamDict& d, const std::string& object, R
     {
         throw std::runtime_error("brae function objects: `" + object + "` has regionType `" + type
                                  + "`; brae has all and cellZone for volFieldValue");
+    }
+    // volRegion::calculateCache (volRegion.C): nCells_ = returnReduce(count), V_ reduced from each rank's own
+    // sequential sum -- the header's `# Cells` and `# Volume` are the whole mesh's. A zone nobody holds is an
+    // error there ("Region has no cells").
+    if (rt.svc.red.parallel())
+    {
+        std::vector<double> nv = {static_cast<double>(r.n), static_cast<double>(r.volume)};
+        rt.svc.red.reduceSum(nv);
+        r.n = static_cast<label>(nv[0]);
+        r.volume = nv[1];
+        if (r.n == 0)
+        {
+            throw std::runtime_error("brae function objects: `" + object + "` selects a region with no cells "
+                                     "on any rank (OpenFOAM stops on it too: volRegion, `Region has no cells`)");
+        }
     }
     return r;
 }
@@ -1272,39 +1345,84 @@ private:
     std::vector<const std::vector<scalar>*> deviceResults_;
     std::vector<std::shared_ptr<void>>    devicePlans_;
     bool                      deviceDue_ = false;
+    // What one rank adds up over its part of the region
+    struct Part
+    {
+        scalar acc = 0, vol = 0, mn = 0, mx = 0;
+    };
+
     void emit(const Step& s, Runtime& rt)
     {
         const std::vector<scalar>& V = rt.svc.geom->V();
+        const Services::Reduce& red = rt.svc.red;
+        std::vector<Part> parts(fields_.size());
+        std::vector<char> fromDevice(fields_.size(), 0);
+        for (std::size_t i = 0; i < fields_.size(); ++i)
+        {
+            const bool device = i < deviceResults_.size() && deviceResults_[i] && deviceResults_[i]->size() == 1;
+            fromDevice[i] = device;
+            if (device) parts[i].acc = (*deviceResults_[i])[0];
+            else parts[i] = localPart(rt.scalarField(fields_[i]), V);
+        }
+        std::vector<scalar> values(fields_.size());
+        if (!red.parallel())
+        {
+            for (std::size_t i = 0; i < fields_.size(); ++i) values[i] = fromDevice[i] ? parts[i].acc : finish(parts[i]);
+        }
+        else
+        {
+            // volFieldValue::processValues: gSum(V*values) (each rank's sequential sum, then the ranks' in rank
+            // order), gSum(V) for the average, gMin/gMax -- one collective for all the fields
+            std::vector<double> pack;
+            const bool average = op_ == "volAverage";
+            for (const Part& p : parts)
+            {
+                if (op_ == "min") pack.push_back(p.mn);
+                else if (op_ == "max") pack.push_back(p.mx);
+                else
+                {
+                    pack.push_back(p.acc);
+                    if (average) pack.push_back(p.vol);
+                }
+            }
+            if (op_ == "min") red.reduceMin(pack);
+            else if (op_ == "max") red.reduceMax(pack);
+            else red.reduceSum(pack);
+            std::size_t k = 0;
+            for (std::size_t i = 0; i < fields_.size(); ++i)
+            {
+                if (average)
+                {
+                    values[i] = pack[k]/pack[k + 1];
+                    k += 2;
+                }
+                else values[i] = pack[k++];
+            }
+        }
         std::string line = fmtNum(s.time, rt.svc.precision);
         for (std::size_t i = 0; i < fields_.size(); ++i)
         {
-            const std::string& f = fields_[i];
-            scalar value = 0;
-            const bool device = i < deviceResults_.size() && deviceResults_[i] && deviceResults_[i]->size() == 1;
-            if (device) value = (*deviceResults_[i])[0];
-            else value = reduce(rt.scalarField(f), V);
-            rt.results[name][op_ + "(" + f + ")"] = value;
-            line += "\t" + fmtNum(value, rt.svc.precision);
+            rt.results[name][op_ + "(" + fields_[i] + ")"] = values[i];
+            line += "\t" + fmtNum(values[i], rt.svc.precision);
         }
         if (writeToFile_) dat_.row(line);
         deviceResults_.clear();
         deviceDue_ = false;
     }
 
-    scalar reduce(const SF& f, const std::vector<scalar>& V) const
+    Part localPart(const SF& f, const std::vector<scalar>& V) const
     {
         auto at = [&](std::size_t c) { return f.isConst() ? f.c : f.v()[c]; };
-        scalar acc = 0;
-        scalar vol = 0;
-        scalar mn = std::numeric_limits<scalar>::max();
-        scalar mx = -std::numeric_limits<scalar>::max();
+        Part p;
+        p.mn = std::numeric_limits<scalar>::max();
+        p.mx = -std::numeric_limits<scalar>::max();
         auto visit = [&](std::size_t c)
         {
             const scalar x = at(c);
-            acc += (op_ == "volIntegrate" || op_ == "volAverage") ? V[c]*x : x;
-            vol += V[c];
-            mn = std::min(mn, x);
-            mx = std::max(mx, x);
+            p.acc += (op_ == "volIntegrate" || op_ == "volAverage") ? V[c]*x : x;
+            p.vol += V[c];
+            p.mn = std::min(p.mn, x);
+            p.mx = std::max(p.mx, x);
         };
         if (region_.all)
         {
@@ -1314,10 +1432,15 @@ private:
         {
             for (label c : region_.cells) visit(static_cast<std::size_t>(c));
         }
-        if (op_ == "volAverage") return acc/vol;
-        if (op_ == "min") return mn;
-        if (op_ == "max") return mx;
-        return acc;
+        return p;
+    }
+
+    scalar finish(const Part& p) const
+    {
+        if (op_ == "volAverage") return p.acc/p.vol;
+        if (op_ == "min") return p.mn;
+        if (op_ == "max") return p.mx;
+        return p.acc;
     }
 };
 
@@ -1345,14 +1468,24 @@ public:
         }
         if (patch_ < 0)
         {
-            throw std::runtime_error("brae function objects: `" + name + "` names the patch `" + patchName_
-                                     + "`, which the mesh does not have");
+            rt.svc.red.abortAll("brae function objects: `" + name + "` names the patch `" + patchName_
+                                + "`, which the mesh does not have");
         }
         for (scalar a : patches[static_cast<std::size_t>(patch_)].magSf)
         {
             area_ += a;
         }
         nFaces_ = static_cast<label>(patches[static_cast<std::size_t>(patch_)].magSf.size());
+        // the patch's faces lie on several ranks (and on none of some): `# Faces` is returnReduce(count) and
+        // the area gSum(magSf) of the rank's own sequential sums (surfaceFieldValue.C:203, :560). A processor
+        // patch is never selected: the name is a physical patch's.
+        if (rt.svc.red.parallel())
+        {
+            std::vector<double> fa = {static_cast<double>(nFaces_), static_cast<double>(area_)};
+            rt.svc.red.reduceSum(fa);
+            nFaces_ = static_cast<label>(fa[0]);
+            area_ = fa[1];
+        }
         op_ = d.wordOr("operation", "");
         if (op_ != "areaAverage" && op_ != "areaIntegrate" && op_ != "sum" && op_ != "min" && op_ != "max")
         {
@@ -1422,6 +1555,12 @@ public:
                 mn = std::min(mn, v[i]);
                 mx = std::max(mx, v[i]);
             }
+            // gSum / gMin / gMax over the ranks' parts of the patch (a rank without faces adds 0, and the
+            // identity of min and max)
+            const Services::Reduce& red = rt.svc.red;
+            if (op_ == "min") mn = red.reduceMin(mn);
+            else if (op_ == "max") mx = red.reduceMax(mx);
+            else acc = red.reduceSum(acc);
             scalar value = acc;
             if (op_ == "areaAverage") value = acc/area_;
             if (op_ == "min") value = mn;
@@ -1591,24 +1730,67 @@ public:
         // OpenFOAM's probes skip a location that lies in no cell ("Did not find location ... in any cell. Skipping
         // location.") and write the files for the others, numbered from 0 again: the columns after a skipped probe
         // shift down. brae does the same, and says which locations it left out.
+        //
+        // UNDER -parallel (internalFieldProbe::findElements, ::sample): every rank looks for the point in ITS
+        // cells; the probe is skipped when no rank has it; the VALUE is the first set one in rank order
+        // (listCombineReduce with isNotEqOp), i.e. the lowest rank whose cells hold the point -- a point on a
+        // processor face is in a cell of both and the lower rank owns it (OpenFOAM warns about this case).
+        // The master writes every column; the other ranks send their owned values.
         {
             const std::vector<label> found = locatePoints(points_, *rt.svc.mesh, *rt.svc.geom, name);
+            const Services::Reduce& red = rt.svc.red;
+            std::vector<int> owner(points_.size(), 0);
+            if (red.parallel())
+            {
+                std::vector<double> flags(points_.size());
+                for (std::size_t i = 0; i < points_.size(); ++i) flags[i] = found[i] >= 0 ? 1.0 : 0.0;
+                const std::vector<std::vector<double>> all = red.gatherToMaster(flags);
+                for (std::size_t i = 0; i < points_.size(); ++i)
+                {
+                    owner[i] = -1;
+                    int holders = 0;
+                    for (std::size_t r = 0; r < all.size(); ++r)
+                    {
+                        if (all[r][i] != 0.0)
+                        {
+                            if (owner[i] < 0) owner[i] = static_cast<int>(r);
+                            ++holders;
+                        }
+                    }
+                    if (holders > 1 && red.master())
+                    {
+                        noticeIgnored("functions/" + name + " probe " + std::to_string(i),
+                                      "is in cells of " + std::to_string(holders) + " ranks (a point on a processor "
+                                      "face); rank " + std::to_string(owner[i]) + " owns it, as in OpenFOAM");
+                    }
+                }
+            }
+            else
+            {
+                for (std::size_t i = 0; i < points_.size(); ++i) owner[i] = found[i] >= 0 ? 0 : -1;
+            }
             std::vector<vector> kept;
             std::vector<label>  keptCells;
+            std::vector<int>    keptOwner;
             for (std::size_t i = 0; i < points_.size(); ++i)
             {
-                if (found[i] < 0)
+                if (owner[i] < 0)
                 {
-                    noticeIgnored("functions/" + name + " probe " + std::to_string(i) + " at ("
-                                  + fmtNum(points_[i].x, 8) + " " + fmtNum(points_[i].y, 8) + " "
-                                  + fmtNum(points_[i].z, 8) + ")",
-                                  "lies in no cell; skipped, as OpenFOAM's probes skip it. The files have one column "
-                                  "fewer, and the probes after this one are numbered one lower");
+                    if (red.master())
+                    {
+                        noticeIgnored("functions/" + name + " probe " + std::to_string(i) + " at ("
+                                      + fmtNum(points_[i].x, 8) + " " + fmtNum(points_[i].y, 8) + " "
+                                      + fmtNum(points_[i].z, 8) + ")",
+                                      "lies in no cell; skipped, as OpenFOAM's probes skip it. The files have one column "
+                                      "fewer, and the probes after this one are numbered one lower");
+                    }
                 }
                 else
                 {
                     kept.push_back(points_[i]);
-                    keptCells.push_back(found[i]);
+                    // this rank's cell when it owns the probe, -1 when another rank does
+                    keptCells.push_back(owner[i] == red.rank ? found[i] : label(-1));
+                    keptOwner.push_back(owner[i]);
                 }
             }
             if (kept.empty())
@@ -1618,6 +1800,7 @@ public:
             }
             points_ = kept;
             cells_ = keptCells;
+            owner_ = keptOwner;
         }
         for (const std::string& f : fields_)
         {
@@ -1642,10 +1825,13 @@ public:
 
     void write(const Step& s, Runtime& rt) override
     {
+        const Services::Reduce& red = rt.svc.red;
         for (std::size_t k = 0; k < fields_.size(); ++k)
         {
             const std::string& f = fields_[k];
-            std::string line = fmtNum(s.time, rt.svc.precision);
+            const int nComp = (f == "U") ? 3 : 1;
+            // the probes this rank owns, in probe order
+            std::vector<double> mine;
             if (f == "U")
             {
                 const std::vector<scalar>& ux = rt.svc.src.Ux();
@@ -1653,9 +1839,11 @@ public:
                 const std::vector<scalar>& uz = rt.svc.src.Uz();
                 for (label c : cells_)
                 {
+                    if (c < 0) continue;
                     const std::size_t i = static_cast<std::size_t>(c);
-                    line += " (" + fmtNum(ux[i], rt.svc.precision) + " " + fmtNum(uy[i], rt.svc.precision) + " "
-                          + fmtNum(uz[i], rt.svc.precision) + ")";
+                    mine.push_back(ux[i]);
+                    mine.push_back(uy[i]);
+                    mine.push_back(uz[i]);
                 }
             }
             else
@@ -1663,7 +1851,27 @@ public:
                 const std::vector<scalar>& v = (f == "p_rgh") ? rt.svc.src.p_rgh() : rt.svc.src.alpha();
                 for (label c : cells_)
                 {
-                    line += " " + fmtNum(v[static_cast<std::size_t>(c)], rt.svc.precision);
+                    if (c < 0) continue;
+                    mine.push_back(v[static_cast<std::size_t>(c)]);
+                }
+            }
+            // everyone takes part; only the master has a file to write
+            const std::vector<std::vector<double>> all = red.gatherToMaster(mine);
+            std::string line = fmtNum(s.time, rt.svc.precision);
+            std::vector<std::size_t> cursor(all.size(), 0);
+            for (std::size_t pi = 0; pi < cells_.size(); ++pi)
+            {
+                const std::size_t r = static_cast<std::size_t>(owner_[pi]);
+                const double* v = all[r].data() + cursor[r];
+                cursor[r] += static_cast<std::size_t>(nComp);
+                if (f == "U")
+                {
+                    line += " (" + fmtNum(v[0], rt.svc.precision) + " " + fmtNum(v[1], rt.svc.precision) + " "
+                          + fmtNum(v[2], rt.svc.precision) + ")";
+                }
+                else
+                {
+                    line += " " + fmtNum(v[0], rt.svc.precision);
                 }
             }
             files_[k].row(line);
@@ -1673,7 +1881,8 @@ public:
 private:
     std::vector<std::string> fields_;
     std::vector<vector>      points_;
-    std::vector<label>       cells_;
+    std::vector<label>       cells_;     // this rank's cell of each kept probe, -1 when another rank owns it
+    std::vector<int>         owner_;     // the owning rank of each kept probe
     std::vector<DatFile>     files_;
 };
 
@@ -1717,14 +1926,50 @@ public:
         {
             auto emit = [&](const std::string& label, const std::vector<scalar>& val)
             {
-                std::size_t imin = 0, imax = 0;
-                for (std::size_t i = 1; i < val.size(); ++i)
+                const Services::Reduce& red = rt.svc.red;
+                if (!red.parallel())
                 {
-                    if (val[i] < val[imin]) imin = i;
-                    if (val[i] > val[imax]) imax = i;
+                    std::size_t imin = 0, imax = 0;
+                    for (std::size_t i = 1; i < val.size(); ++i)
+                    {
+                        if (val[i] < val[imin]) imin = i;
+                        if (val[i] > val[imax]) imax = i;
+                    }
+                    dat_.row(fmtNum(s.time, rt.svc.precision) + "\t" + label + "\t" + fmtNum(val[imin], rt.svc.precision)
+                             + "\t" + vec3(imin) + "\t0\t" + fmtNum(val[imax], rt.svc.precision) + "\t" + vec3(imax) + "\t0");
+                    return;
                 }
-                dat_.row(fmtNum(s.time, rt.svc.precision) + "\t" + label + "\t" + fmtNum(val[imin], rt.svc.precision)
-                         + "\t" + vec3(imin) + "\t0\t" + fmtNum(val[imax], rt.svc.precision) + "\t" + vec3(imax) + "\t0");
+                // fieldMinMax::calcMinMaxFieldType: each rank's extremum (the FIRST cell on a tie; a rank with
+                // no cells offers +max / -max and the centre 0), gathered; the winner is the first rank in
+                // rank order whose value is STRICTLY better, and its value, location and rank are the row
+                const scalar big = std::numeric_limits<scalar>::max();
+                std::vector<double> mine = {big, 0, 0, 0, -big, 0, 0, 0};
+                if (!val.empty())
+                {
+                    std::size_t imin = 0, imax = 0;
+                    for (std::size_t i = 1; i < val.size(); ++i)
+                    {
+                        if (val[i] < val[imin]) imin = i;
+                        if (val[i] > val[imax]) imax = i;
+                    }
+                    mine = {val[imin], C[imin].x, C[imin].y, C[imin].z, val[imax], C[imax].x, C[imax].y, C[imax].z};
+                }
+                const std::vector<std::vector<double>> all = red.gatherToMaster(mine);
+                std::size_t pmin = 0, pmax = 0;
+                for (std::size_t r = 1; r < all.size(); ++r)
+                {
+                    if (all[r][0] < all[pmin][0]) pmin = r;
+                    if (all[pmax][4] < all[r][4]) pmax = r;
+                }
+                auto at = [&](const std::vector<double>& v, int o)
+                {
+                    return "(" + fmtNum(v[o], rt.svc.precision) + " " + fmtNum(v[o + 1], rt.svc.precision) + " "
+                         + fmtNum(v[o + 2], rt.svc.precision) + ")";
+                };
+                dat_.row(fmtNum(s.time, rt.svc.precision) + "\t" + label + "\t" + fmtNum(all[pmin][0], rt.svc.precision)
+                         + "\t" + at(all[pmin], 1) + "\t" + std::to_string(pmin) + "\t"
+                         + fmtNum(all[pmax][4], rt.svc.precision) + "\t" + at(all[pmax], 5) + "\t"
+                         + std::to_string(pmax));
             };
             if (f == "U")
             {
@@ -1805,7 +2050,7 @@ public:
             throw std::runtime_error("brae function objects: `" + name + "` has autowrite true; brae keeps expression "
                                      "fields in memory and does not write them");
         }
-        if (!d.found("autowrite"))
+        if (!d.found("autowrite") && rt.svc.isMaster)
         {
             noticeDefaulted("functions/" + name + " autowrite", "false: brae does not write expression fields");
         }
@@ -1895,7 +2140,8 @@ public:
     bool evaluate(const Step&, Runtime& rt) override
     {
         const int prec = std::max(rt.svc.precision, 6);
-        if (log)
+        const bool say = log && rt.svc.isMaster;   // Info is the master's
+        if (say)
         {
             std::printf("runTimeControl %s output:\n", name.c_str());
         }
@@ -1910,14 +2156,14 @@ public:
             }
             const bool satisfied = c.maximum ? (value > c.threshold) : (value < c.threshold);
             met = met && satisfied;
-            if (log)
+            if (say)
             {
                 std::printf("    minMax: %s %s: value = %s, threshold value = %s, satisfied = %s\n",
                             c.maximum ? "maximum" : "minimum", c.fields.front().c_str(), fmtNum(value, prec).c_str(),
                             fmtNum(c.threshold, prec).c_str(), satisfied ? "true" : "false");
             }
         }
-        if (log)
+        if (say)
         {
             std::printf(met ? "    Conditions met\n" : "    Conditions not met\n");
             std::fflush(stdout);
@@ -2019,8 +2265,8 @@ public:
             line += "; disabled";
             for (const std::string& n : list->disabled_) line += " `" + n + "`";
         }
-        std::printf("%s\n", line.c_str());
-        if (!notRun.empty())
+        if (list->rt_.svc.isMaster) std::printf("%s\n", line.c_str());
+        if (!notRun.empty() && list->rt_.svc.isMaster)
         {
             std::string nr;
             for (const std::string& n : notRun) nr += " " + n;
@@ -2099,6 +2345,7 @@ inline std::shared_ptr<FunctionObjectList> createFunctionObjects(
     s.cellZones = &zones;
     s.src = src;
     s.isMaster = isMaster;
+    s.red = Services::Reduce::procComm();   // identity without a multi-rank communicator
     std::shared_ptr<FunctionObjectList> list = FunctionObjectList::read(controlDict, s);
     if (list && meshChanges)
     {
