@@ -403,6 +403,20 @@ add_test(NAME proc_comm_graph_mpi_refuses
          COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 2 $<TARGET_FILE:test_proc_comm_graph> mpi)
 set_tests_properties(proc_comm_graph_mpi_refuses PROPERTIES TIMEOUT 120)
 
+# the NCCL backend (BRAE_WITH_NCCL): one process per GPU, so np must not exceed the GPUs of the machine. The default
+# runs np=1 only (identity); on a multi-GPU node: -DBRAE_NCCL_TEST_NP="1;2;4;8". See tools/proc_comm_nccl/README.md.
+if(BRAE_WITH_NCCL)
+    set(BRAE_NCCL_TEST_NP "1" CACHE STRING "process counts of the proc_comm NCCL tests (needs that many GPUs)")
+    foreach(_np ${BRAE_NCCL_TEST_NP})
+        add_test(NAME proc_comm_nccl_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_proc_comm> nccl)
+        set_tests_properties(proc_comm_nccl_np${_np} PROPERTIES TIMEOUT 600 RESOURCE_LOCK gpu_nccl)
+        add_test(NAME proc_comm_graph_nccl_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_proc_comm_graph> nccl)
+        set_tests_properties(proc_comm_graph_nccl_np${_np} PROPERTIES TIMEOUT 900 RESOURCE_LOCK gpu_nccl)
+    endforeach()
+endif()
+
 # Multi-GPU Phase 0b: per-rank DeviceMesh upload + device-path reconstruction
 add_executable(test_gpu_decompose tests/test_gpu_decompose.cu)
 target_include_directories(test_gpu_decompose PRIVATE ${BRAE_HEADER_DIRS})

@@ -3,6 +3,10 @@
 //
 //   test_proc_comm            LOOPBACK backend: np = 1,2,3,4,8 virtual ranks (threads) on one GPU
 //   mpirun -np N test_proc_comm mpi     MPI-host backend, one process per rank (np > GPUs is fine)
+//   mpirun -np N test_proc_comm nccl    NCCL backend (build with BRAE_WITH_NCCL), one process per GPU: np <= GPUs
+//   mpirun -np N test_proc_comm auto    ProcComm::create() decides (env BRAE_COMM, else NCCL if built and np <= GPUs, else mpi)
+//   An optional second argument keeps only the tests whose name contains it (e.g. `nccl collectiveAbort`).
+//   The backend that ran is printed ("backend: ...") and prefixes every PASS line.
 //
 // Every blocking region runs under a watchdog: a hang prints FAIL and exits instead of stalling ctest.
 #include "proc_comm.cuh"
@@ -550,16 +554,23 @@ int loopbackSuite()
     return fails;
 }
 
-int mpiSuite(int argc, char** argv)
+int mpiSuite(int argc, char** argv, const std::string& backendArg)
 {
     Pstream::init(argc, argv);
     const int np = Pstream::nProcs();
     int fails = 0;
     {
-        std::unique_ptr<ProcComm> c = ProcComm::createMpiHost();
+        std::unique_ptr<ProcComm> c = std::move(ProcComm::create(backendArg == "auto" ? "" : backendArg)[0]);
+        const std::string bn = ProcComm::backendName(c->backend());
+        if (c->isMaster())
+            std::printf("backend: %s (np=%d, rank 0 on GPU %d%s)\n", bn.c_str(), np, c->device(),
+                        np == 1 ? "; np=1 is the identity: no communicator is created" : "");
         cudaStream_t s;
         cu(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
+        // optional argv[2]: run only the tests whose name contains it (every rank applies the same filter)
+        const std::string only = argc > 2 ? argv[2] : "";
         auto run = [&](const char* name, const std::function<void()>& f) {
+            if (!only.empty() && std::string(name).find(only) == std::string::npos) return;
             Watchdog wd(name, 180);
             int bad = 0;
             try { c->guarded(f); }
@@ -577,7 +588,7 @@ int mpiSuite(int argc, char** argv)
         };
         if (np == 1)
         {
-            run("mpi np=1 identity", [&] { testIdentity(*c, s); });
+            run((bn + " np=1 identity").c_str(), [&] { testIdentity(*c, s); });
         }
         else
         {
@@ -589,7 +600,7 @@ int mpiSuite(int argc, char** argv)
             }
             for (auto& pc : parts)
             {
-                const std::string name = "mpi " + pc.first;
+                const std::string name = bn + " " + pc.first;
                 run(name.c_str(), [&] { runCase(*c, np, pc.second, s); });
                 run((name + " plan from processor patches").c_str(), [&] { testBuildFromPatches(*c, pc.second, s); });
             }
@@ -597,7 +608,7 @@ int mpiSuite(int argc, char** argv)
             for (int late = 0; late < 2; ++late)
                 for (int inEx = 0; inEx < 2; ++inEx)
                 {
-                    const std::string an = std::string("mpi collectiveAbort (") + (late ? "late" : "early") + " failing rank, in "
+                    const std::string an = bn + " collectiveAbort (" + (late ? "late" : "early") + " failing rank, in "
                                            + (inEx ? "exchangeCells" : "allReduce") + ")";
                     run(an.c_str(), [&] { testAbort(*c, np, ap, s, late, inEx); });
                 }
@@ -613,7 +624,8 @@ int main(int argc, char** argv)
 {
     try
     {
-        if (argc > 1 && std::string(argv[1]) == "mpi") return mpiSuite(argc, argv) == 0 ? 0 : 1;
+        if (argc > 1 && (std::string(argv[1]) == "mpi" || std::string(argv[1]) == "nccl" || std::string(argv[1]) == "auto"))
+            return mpiSuite(argc, argv, argv[1]) == 0 ? 0 : 1;
         int nDev = 0;
         if (cudaGetDeviceCount(&nDev) != cudaSuccess || nDev <= 0) { std::printf("SKIP: no CUDA device\n"); return 77; }
         const int fails = loopbackSuite();
