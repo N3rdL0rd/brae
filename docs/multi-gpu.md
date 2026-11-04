@@ -86,3 +86,38 @@ global quiescence (measured at np=2 on one shared GPU), so the captured graphs a
 
 What has not run: any real multi-GPU NCCL run across distinct physical GPUs, NVLink behaviour, and sm_70 execution of
 this code.
+
+## Running on Rosie (MSOE), the V100 DGX-1 nodes
+
+Measured 2026-11-04 on the `dgx` partition of Rosie at MSOE, node `dh-dgx1-3` (8x Tesla V100-SXM2-32GB, hybrid cube-mesh NVLink, two sockets, GPUs 0-3 and 4-7; SYS between sockets). Site-specific: other clusters differ.
+
+**The node is old.** Ubuntu 20.04 (glibc 2.31, gcc 9.4, cmake 3.16), only CUDA 10.1, no OpenMPI or Scotch, kernel driver 535.161.08 (CUDA 12.2). The CUDA 12.9 and OpenMPI modules exist but live on other nodes' local disks. Build elsewhere and bring the runtime along:
+
+- Build on `dh-node3` (`batch` partition) with a conda-forge toolchain: `gcc_linux-64=14 gxx_linux-64=14 sysroot_linux-64=2.28 openmpi scotch cmake=3.28 ninja`, `-DCMAKE_CUDA_ARCHITECTURES=70 -DBRAE_WITH_NVSHMEM=OFF -DBRAE_WITH_NCCL=ON`, CUDA 12.9 as the nvcc. The sysroot pin matters: without it the binaries need glibc 2.38 and do not start on the node. Check with `objdump -T <binary> | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1` (must be <= 2.31).
+- Copy `libcudart`, `libnvrtc`, `libnvrtc-builtins` and `libnvJitLink` of CUDA 12.9 and an NCCL >= 2.28 (the `nvidia-nccl-cu12` wheel works) next to the binaries and put them on the rpath.
+- `mpirun` inside an `srun` step takes its slot count from the step: unset all `SLURM_*` variables, set `OMPI_MCA_ras=^slurm`, use `--host localhost:N --bind-to none`. Do not use `--oversubscribe` with NCCL.
+
+**Conditional graphs need the forward-compatibility driver.** With the node's 535 driver, conditional graph nodes (the device-resident WHILE loops, CUDA 12.4+) fail: `cudaGraphConditionalHandleCreate` returns error 36, `cudaGraphInstantiate` is refused, and the graph ProcComm test stops with `kernel image is invalid`. brae notices this at run time (`braeCondGraphsAvailable()` checks the driver's CUDA version) and takes the host-driven loops; `BRAE_COND_GRAPH=0` forces them, `=1` skips the check. The host loops are slower (about 65% on the RTX 5090 test case) and not byte-identical to the graph loops.
+
+NVIDIA's `cuda-compat` package fixes it without root: a newer user-mode `libcuda.so` placed first on `LD_LIBRARY_PATH`, supported on data-center GPUs such as the V100. Tested on `dh-dgx1-3` with compat 12.4, 12.6, 12.8 and 12.9 (driver 550.163.01, 560.35.05, 570.211.01, 575.57.08, from NVIDIA's `ubuntu2004` repository, extracted with `dpkg-deb -x`):
+
+| test | result with compat 12.9 |
+|---|---|
+| standalone conditional-WHILE graph (loop count checked) | passes with 12.4, 12.6, 12.8 and 12.9 |
+| `test_proc_comm_graph nccl`, np 2, 4, 8 (1,000 replays each, bitwise) | pass |
+| `test_proc_comm nccl`, np 8 | pass |
+| `nccl_spike` (single process, N GPUs) | still fails at `cudaGraphInstantiate` ("operation not permitted when stream is capturing") at 2, 4, 8 GPUs; its eager test, which showed reduction mismatches without compat, now has none |
+| `nvidia-smi` | unchanged: kernel driver 535.161.08 (its CUDA field shows 12.9) |
+
+Not run: any brae solver or benchmark with the compat libraries. `cudaDriverGetVersion` reports 12090 with them, so `braeCondGraphsAvailable()` accepts the graph loops.
+
+```bash
+ROOT="$HOME/brae-mgpu"; export PATH="$ROOT/env/bin:$PATH" OPAL_PREFIX="$ROOT/env" CUDA_DEVICE_ORDER=PCI_BUS_ID
+export LD_LIBRARY_PATH="$ROOT/compat/12-9:$ROOT/env/lib:$ROOT/nccl/nvidia/nccl/lib:$ROOT/cuda12rt:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+The compat directory is about 300 MB and NVIDIA's proprietary libraries: keep it in your own home, do not redistribute it or commit it. The clean fix is a driver of 550 or newer on the nodes (a request to the administrators).
+
+**Job etiquette on Rosie.** One allocation at a time. Hold the node with `sbatch -p dgx --nodelist=dh-dgx1-3 --gres=gpu:v100:8 --exclusive --time=... --wrap='sleep N'`, run steps with `srun --jobid=<id> --overlap ...` one at a time, release with `scancel <id>` when done.
+
+**Measured on the V100s so far:** `test_proc_comm` with NCCL passes at np 2, 4 and 8 on distinct GPUs, including all abort tests. No solver run has happened there yet.
