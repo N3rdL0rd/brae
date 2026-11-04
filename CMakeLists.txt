@@ -81,6 +81,7 @@ add_library(brae_core STATIC
     src/parallel/pstream/device_reduce.cu
     src/parallel/proc_comm.cu
     src/parallel/processor_coupling.cu
+    src/parallel/proc_topology.cu
     src/OpenFOAM/meshes/interface/processor_interface.cu
     src/OpenFOAM/db/foam_token_reader.cu
     src/OpenFOAM/db/dynamicLibrary/codedBase/coded_library.cu
@@ -402,6 +403,16 @@ set_tests_properties(proc_comm_graph_loopback PROPERTIES SKIP_RETURN_CODE 77 TIM
 add_test(NAME proc_comm_graph_mpi_refuses
          COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 2 $<TARGET_FILE:test_proc_comm_graph> mpi)
 set_tests_properties(proc_comm_graph_mpi_refuses PROPERTIES TIMEOUT 120)
+
+# rank -> GPU placement (cut-weight matrix x GPU link table, exhaustive, deterministic); unit test + the launcher's advisor
+add_executable(test_proc_topology tests/test_proc_topology.cu)
+target_include_directories(test_proc_topology PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_topology PRIVATE brae_core)
+add_test(NAME proc_topology COMMAND test_proc_topology)
+set_tests_properties(proc_topology PROPERTIES TIMEOUT 120)
+add_executable(proc_topology_tool tools/proc_comm_nccl/proc_topology_tool.cu)
+target_include_directories(proc_topology_tool PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(proc_topology_tool PRIVATE brae_core)
 
 # the NCCL backend (BRAE_WITH_NCCL): one process per GPU, so np must not exceed the GPUs of the machine. The default
 # runs np=1 only (identity); on a multi-GPU node: -DBRAE_NCCL_TEST_NP="1;2;4;8". See tools/proc_comm_nccl/README.md.

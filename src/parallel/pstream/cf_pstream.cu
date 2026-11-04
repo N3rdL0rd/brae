@@ -26,7 +26,11 @@ namespace {
     // build or a CPU-only CI node has no device, so a missing/zero device count is not an error -- the binding
     // is simply skipped and any CUDA error state is cleared so later code is unaffected. On GB10 (one GPU)
     // every rank binds to device 0.
-    void bindRankToDevice(int nodeLocalRank)
+    //
+    // BRAE_GPU_MAP="g0,g1,...": the topology-aware placement (tools/proc_comm_nccl/proc_topology_tool, proc_topology.cuh):
+    // node-local rank i uses GPU gi. It is applied here, before any CUDA context exists. An invalid map (not
+    // `localSize` distinct in-range GPU ids) aborts the job instead of silently running on the wrong GPUs.
+    void bindRankToDevice(int nodeLocalRank, int localSize)
     {
         int nDev = 0;
         if (cudaGetDeviceCount(&nDev) != cudaSuccess || nDev <= 0)
@@ -36,6 +40,31 @@ namespace {
             return;
         }
         g_device = nodeLocalRank % nDev;
+        if (const char* m = std::getenv("BRAE_GPU_MAP"))
+        {
+            std::vector<int> map;
+            const char* p = m;
+            bool ok = *p != '\0';
+            while (ok && *p)
+            {
+                char* end = nullptr;
+                const long v = std::strtol(p, &end, 10);
+                if (end == p || v < 0 || v >= nDev) { ok = false; break; }
+                for (int g : map) if (g == v) ok = false;
+                map.push_back(static_cast<int>(v));
+                p = end;
+                if (*p == ',') ++p;
+                else if (*p != '\0') ok = false;
+            }
+            if (!ok || static_cast<int>(map.size()) != localSize)
+            {
+                if (nodeLocalRank == 0)
+                    std::fprintf(stderr, "brae FATAL: BRAE_GPU_MAP='%s' must list %d distinct GPU ids in 0..%d (one per rank on the node)\n",
+                                 m, localSize, nDev - 1);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            g_device = map[nodeLocalRank];
+        }
         cudaSetDevice(g_device);
     }
 
@@ -115,7 +144,7 @@ void Pstream::init(int& argc, char**& argv)
     MPI_Comm_size(node, &localSize);
     MPI_Comm_free(&node);
 
-    bindRankToDevice(localRank);
+    bindRankToDevice(localRank, localSize);
     configureNvshmemTransport(localSize);   // may MPI_Abort on rank/GPU oversubscription
     bootstrapNvshmem();
     g_init = true;
