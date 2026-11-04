@@ -8665,7 +8665,9 @@ RunReport runInterFoamDevice(
         dK.copyTo(f.K);
         cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
         cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
-        unflatten(dRhoBLast, stepRhoBnd);
+        // only once the interface-forces hook has produced a boundary rho: a run that took no step (a restart
+        // already at endTime) never filled dRhoBLast, and unflattening the empty buffer ran off its end
+        if (dRhoBLast.size() > 0) unflatten(dRhoBLast, stepRhoBnd);
     }
     // ...and alpha's patches and the mixture's boundary as the last hook left them, for the caller
     if (contactAngleDevice)
