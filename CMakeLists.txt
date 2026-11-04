@@ -3318,6 +3318,15 @@ target_include_directories(test_device_interface_properties PRIVATE ${BRAE_HEADE
 target_link_libraries(test_device_interface_properties PRIVATE brae_core)
 add_test(NAME device_interface_properties COMMAND test_device_interface_properties)
 
+# Multi-GPU interFoam, WP1 first half: processor patches read with myProcNo/neighbProcNo/referPatch (a real
+# decomposePar boundary, the cache magic, FvPatch), every tracked boundary parsing as it did before, and the
+# per-rank roots (-parallel, -rank/-nprocs, the launcher's environment) with the refusals by name.
+add_executable(test_processor_patch_reader tests/test_processor_patch_reader.cu)
+target_include_directories(test_processor_patch_reader PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_processor_patch_reader PRIVATE brae_core)
+add_test(NAME processor_patch_reader COMMAND test_processor_patch_reader ${CMAKE_CURRENT_SOURCE_DIR})
+
 # ...and MULES. Two kinds of arm: the PROPERTY (alpha stays in [0,1]) asserted exactly, because that is
 # what MULES is for and needs no host to compare against; and lambda itself within a measured
 # tolerance, because each cell's five gathers run in a different ORDER from the host's face loop and
