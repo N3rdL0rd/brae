@@ -26,13 +26,10 @@ inline bool fileExists(const std::string& p)
 }
 }   // namespace parallelDetail
 
-// THE GATE OF THE MULTI-GPU COUPLING. Every by-name refusal of a processor patch (refuseProcessorCoupling below,
-// the case translation's coupled-patch block, setRDeltaT, the kOmegaSST closure) stays in force unless the
-// environment says BRAE_MGPU_GEOMETRY_ONLY=1: then they step aside for a `processor` patch AND the driver stops
-// right after the coupling geometry is built (braeInterFoam.cu: runProcessorGeometryOnly, which couples the
-// patches over ProcComm, builds the device interface and writes the geometry dump) -- the operators across a
-// processor face are not ported, so nothing past that point may run. Close the gate for good by deleting it
-// when the operator and solver work lands; no case file can open it.
+// THE TWO DIAGNOSTIC GATES. A normal `-parallel -device` run builds the processor coupling and takes the
+// full time step. BRAE_MGPU_GEOMETRY_ONLY=1 stops after the geometry dump; BRAE_MGPU_STAGE_DUMP=<dir> stops
+// after the requested operator stages. They exist for validation only: neither is needed to open the
+// processor operators, and no case file can select either.
 inline bool mgpuGeometryOnly()
 {
     static const bool on = [] {
@@ -42,18 +39,16 @@ inline bool mgpuGeometryOnly()
     return on;
 }
 
-// THE STAGE-DUMP GATE (BRAE_MGPU_STAGE_DUMP=<dir>): the driver couples the processor patches over ProcComm, builds the
-// halo-extended device state and the processor interface, runs the FIRST step's explicit stages (interface normal and
-// curvature, the surface-tension force, the high-order alpha flux) with the processor face operators, writes them per
-// rank in the OpenFOAM dump format under <dir>/processor<rank>/<time>/ and stops (inter_stage_dump.cuh). The solver
-// path past that point (limiter, momentum, pressure, collectives) is not ported, so nothing else may run: the same
-// by-name refusals step aside for a `processor` patch as for BRAE_MGPU_GEOMETRY_ONLY, and only for this run.
+// THE STAGE-DUMP GATE (BRAE_MGPU_STAGE_DUMP=<dir>): the driver couples the processor patches over ProcComm,
+// builds the halo-extended device state and the processor interface, runs the requested operator stages,
+// writes them per rank in the OpenFOAM dump format under <dir>/processor<rank>/<time>/ and stops
+// (inter_stage_dump.cuh). The same by-name processorCyclic/AMI refusals apply as in a normal run.
 inline std::string mgpuStageDumpDir()
 {
     const char* e = std::getenv("BRAE_MGPU_STAGE_DUMP");
     return (e != nullptr && e[0] != '\0') ? std::string(e) : std::string();
 }
-// either gate steps the by-name refusals of a processor patch aside
+// the diagnostic gates select a stop after coupling, not whether the processor operators exist
 inline bool mgpuProcessorGate()
 {
     return mgpuGeometryOnly() || !mgpuStageDumpDir().empty();
@@ -165,9 +160,8 @@ inline void refuseUnderParallel(const CaseRoots& roots, const std::vector<PatchI
     }
 }
 
-// A processor patch with faces is half of a coupled interface that the multi-GPU path does not couple yet.
-// np = 1 has none (decomposePar writes a processor patch only where a face is cut), so it runs as an
-// ordinary case; a processor patch handed to the SERIAL loop would be solved as an ordinary wall.
+// A processor patch handed to the SERIAL loop would be solved as an ordinary wall. Under `-parallel` the
+// device driver couples it over ProcComm; the host-only loop still refuses it by name.
 inline void refuseProcessorCoupling(const CaseRoots& roots, const std::vector<PatchInfo>& patches)
 {
     for (const PatchInfo& p : patches)
@@ -175,18 +169,12 @@ inline void refuseProcessorCoupling(const CaseRoots& roots, const std::vector<Pa
         if (p.type != "processor" || p.size == 0) continue;
         if (roots.parallel)
         {
-            if (mgpuProcessorGate()) continue;   // the gates: the driver builds the coupling and stops after its stage
-            throw std::runtime_error(
-                "-parallel: rank " + std::to_string(roots.rank) + " of " + std::to_string(roots.nProcs)
-                + " has the processor patch '" + p.name + "' (" + std::to_string((long)p.size) + " faces, rank "
-                + std::to_string((int)p.myProcNo) + " <-> rank " + std::to_string((int)p.neighbProcNo)
-                + "): processor patches need the multi-GPU coupling, not yet implemented.");
+            continue;
         }
         throw std::runtime_error(
             "patch '" + p.name + "' is a processor patch (rank " + std::to_string((int)p.myProcNo)
             + " <-> rank " + std::to_string((int)p.neighbProcNo) + ") of a decomposed case, and a serial run would "
-            "solve it as an ordinary wall. Run the decomposed case with -parallel; processor patches also need the "
-            "multi-GPU coupling, not yet implemented.");
+            "solve it as an ordinary wall. Run the decomposed case with -parallel -device.");
     }
 }
 

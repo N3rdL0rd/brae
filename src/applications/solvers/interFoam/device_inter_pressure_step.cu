@@ -1,6 +1,7 @@
 // One pass of pEqn.H -- see device_inter_pressure_step.cuh for the three placements it owns.
 #include "inter_phase_time.cuh"
 #include "device_inter_pressure_step.cuh"
+#include "device_processor_ops.cuh"
 #include "device_fvc_reconstruct.cuh"
 #include "device_blas.cuh"
 #include "device_ldu.cuh"
@@ -198,10 +199,32 @@ scalar deviceInterPressureStep(
             deviceCopy(taps->rAUfIf, rAUfIf);
         }
     }
+    DeviceProcCtx* const proc = DeviceProcCtx::active(dm) ? DeviceProcCtx::current() : nullptr;
+    DeviceBuffer<scalar> procPhig, procRhoRAU, procDdt;
+    if (proc)
+    {
+        procExchange(*proc, {const_cast<DeviceBuffer<scalar>*>(&rAU),
+                             const_cast<DeviceBuffer<scalar>*>(in.rho)}, "rAU and rho");
+        deviceCyclicFaceValue(proc->cyc(), rAU, procRhoRAU);
+        procScatter(*proc, procRhoRAU, const_cast<DeviceBuffer<scalar>&>(*in.rAUfAll));
+        // phig's three face fields were formed by interfaceForces on the processor faces already.
+        DeviceBuffer<scalar> stfP, ghfP, snRhoP;
+        procGather(*proc, *in.stf, stfP);
+        procGather(*proc, *in.ghf, ghfP);
+        procGather(*proc, *in.snGradRho, snRhoP);
+        deviceBuoyancyFlux(proc->nFaces(), stfP, ghfP, snRhoP, procRhoRAU,
+                           proc->cyc().magSf, procPhig);
+    }
 
     // interpolate(rho*rAU) -- the PRODUCT, interpolated once; see device_inter_peqn.cuh note 2.
     DeviceBuffer<scalar> rhoRAUf;
     deviceRhoRAUf(dm, *in.rho, rAU, rhoRAUf);
+    if (proc)
+    {
+        DeviceBuffer<scalar> cellProduct = makeCellBuffer<scalar>(dm);
+        deviceHadamard(cellProduct, *in.rho, rAU);
+        deviceCyclicFaceValue(proc->cyc(), cellProduct, procRhoRAU);
+    }
 
     DeviceBuffer<scalar> zeroIf(static_cast<std::size_t>(nIf));
     if (nIf > 0) ckS(cudaMemset(zeroIf.data(), 0, sizeof(scalar)*nIf), "zero");
@@ -210,6 +233,16 @@ scalar deviceInterPressureStep(
                                in.ddtCorrInt ? *in.ddtCorrInt : zeroIf, in.ddtCorrInt != nullptr,
                                phiHbyAInt, phiHbyABnd, in.mrf,
                                in.ddtCorrBnd, in.rhoBndFace, &rAU, in.bndUFixesValue);
+    if (proc && in.ddtCorrBnd)
+    {
+        procGather(*proc, *in.ddtCorrBnd, procDdt);
+        DeviceBuffer<scalar> weighted;
+        deviceHadamard(weighted, procDdt, procRhoRAU);
+        DeviceBuffer<scalar> phiProc;
+        procGather(*proc, phiHbyABnd, phiProc);
+        deviceAxpy(scalar(1), weighted, phiProc);
+        procScatter(*proc, phiProc, phiHbyABnd);
+    }
 
     // pEqn.H:21-26 -- `if (p_rgh.needReference()) { fvc::makeRelative(phiHbyA, U);
     // adjustPhi(phiHbyA, U, p_rgh); fvc::makeAbsolute(phiHbyA, U); }` -- transcribed from the host's
@@ -288,8 +321,22 @@ scalar deviceInterPressureStep(
         // a moving mesh the wall flux is not zero, the wall moves.
         deviceCopy(taps->phiHbyABndPrePhig, phiHbyABnd);
     }
+    DeviceBuffer<scalar> phiHbyABndBeforeProc;
+    if (proc) deviceCopy(phiHbyABndBeforeProc, phiHbyABnd);
     // pEqn.H:36
     deviceInterAddPhig(dm, phigInt, phigBnd, phiHbyAInt, phiHbyABnd);
+    if (proc)
+    {
+        DeviceBuffer<scalar> phiProc;
+        procGather(*proc, phiHbyABnd, phiProc);
+        deviceAxpy(scalar(1), procPhig, phiProc);
+        procScatter(*proc, phiProc, phiHbyABnd);
+    }
+    if (proc && taps)
+    {
+        deviceCopy(taps->phigBndTap, procPhig);
+        deviceCopy(taps->phiHbyABndPrePhig, phiHbyABndBeforeProc);
+    }
 
     // rAUf on the internal faces -- the head of the full array the caller passed.
     DeviceBuffer<scalar> rAUfInt(static_cast<std::size_t>(nIf));
@@ -391,6 +438,13 @@ scalar deviceInterPressureStep(
                                         jumpHere ? &cycJump : nullptr, ffcIf);
                 deviceCyclicAddToOwner(*in.cyc, ffcIf, scalar(-1), corrSource);
             }
+            if (proc)
+            {
+                procExchange(*proc, {&p_rgh, &gx, &gy, &gz}, "p_rgh and grad(p_rgh)");
+                deviceCyclicLapCorrFlux(proc->cyc(), rAU, p_rgh, gx, gy, gz, in.snGradLimitCoeff,
+                                        nullptr, ffcIf);
+                deviceCyclicAddToOwner(proc->cyc(), ffcIf, scalar(-1), corrSource);
+            }
             if (taps && pass == 0) deviceCopy(taps->nonOrthSource, corrSource);
         }
 
@@ -421,10 +475,14 @@ scalar deviceInterPressureStep(
         // ...and the periodic pair's off-diagonal, which deviceAmul applies as
         // Apsi[own] += ifCoeff*psi[nbr] (device_ldu.cuh:28-33). Without it the solve is a different
         // operator from the matrix that was assembled.
-        const DeviceLduView A = (in.cyc && in.cyc->n > 0)
+        DeviceLduView A = (in.cyc && in.cyc->n > 0)
             ? deviceLduViewPair(dm, diagC, P.upper, P.lower, *in.cyc,
                                 haveJump ? cycJump.data() : nullptr)
             : deviceLduView(dm, diagC, P.upper, P.lower);
+        if (proc)
+        {
+            A.proc = proc->interfaceView();
+        }
         // THE PRESSURE RULE: brae's AMG-PCG whatever the entry names, with the entry's own stopping controls.
         // BRAE_PRESSURE_CASE_SOLVER=1 runs the case's own entry as ported instead -- what the exact gates
         // against OpenFOAM run (CMakeLists.txt sets it for every test; the user's decisions, 2026-10-03), so
@@ -650,6 +708,10 @@ scalar deviceInterPressureStep(
         {
             in.solveLog->push_back(perf);
         }
+        if (proc)
+        {
+            procExchange(*proc, {&p_rgh}, "p_rgh after solve");
+        }
         // p_rgh.correctBoundaryConditions() after every solve; after the last one the caller does it
         if (!lastPass && hooks.updateBoundary)
         {
@@ -661,6 +723,33 @@ scalar deviceInterPressureStep(
     // fvMatrix::flux() reads upper/lower and the boundary coefficients, not the folded diagonal.
     DeviceBuffer<scalar> fluxInt, fluxBnd;
     deviceInterPEqnFlux(dm, P, iC, bC, p_rgh, fluxInt, fluxBnd, in.correctedLaplacian ? &ffc : nullptr);
+    if (proc)
+    {
+        DeviceBuffer<scalar> procFlux;
+        deviceCyclicPressureFlux(proc->cyc(), p_rgh, procFlux);
+        procScatter(*proc, procFlux, fluxBnd);
+        if (in.correctedLaplacian && ffcIf.size() == static_cast<std::size_t>(proc->nFaces()))
+        {
+            deviceAxpy(scalar(1), ffcIf, fluxBnd);
+        }
+    }
+    DeviceBuffer<scalar> ffProc, rAUfProc;
+    if (proc)
+    {
+        deviceCyclicPressureFlux(proc->cyc(), p_rgh, ffProc);
+        if (in.correctedLaplacian && ffcIf.size() == static_cast<std::size_t>(proc->nFaces()))
+        {
+            deviceAxpy(scalar(1), ffcIf, ffProc);
+        }
+        deviceAxpy(scalar(-1), ffProc, procPhig);
+        deviceCyclicFaceValue(proc->cyc(), rAU, rAUfProc);
+        if (taps)
+        {
+            deviceCopy(taps->phigIf, procPhig);
+            deviceCopy(taps->rAUfIf, rAUfProc);
+            deviceCopy(taps->ffIf, ffProc);
+        }
+    }
     phiInt.resize(static_cast<std::size_t>(nIf));
     phiBnd.resize(static_cast<std::size_t>(nBf));
     if (nIf > 0)
@@ -729,6 +818,11 @@ scalar deviceInterPressureStep(
                           havePair ? in.cyc : nullptr,
                           havePair ? &ffIf : nullptr,
                           havePair ? &rAUfIf : nullptr);
+    if (proc)
+    {
+        // ffBnd/rAUfBnd's processor suffix already carries (phig-flux)/rAUf into deviceCorrectVelocity;
+        // ffProc/rAUfProc are retained for the stage tap and for the corrector's next processor flux.
+    }
 
     // THE ABSOLUTE FLUX, handed back before the line below makes it relative. pEqn.H runs
     // fvc::correctUf(Uf, U, phi) at :66 and fvc::makeRelative(phi, U) at :69, in that order, so the

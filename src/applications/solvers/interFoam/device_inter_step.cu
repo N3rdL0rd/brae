@@ -1,6 +1,7 @@
 // One whole interFoam time step -- see device_inter_step.cuh for the loop order and what it decides.
 #include "inter_phase_time.cuh"
 #include "device_inter_step.cuh"
+#include "device_processor_ops.cuh"
 #include "inter_peqn_cpp.cuh"   // tapCorrectorWanted
 #include "device_alpha_flux.cuh"
 #include "device_blas.cuh"
@@ -688,6 +689,10 @@ void deviceInterStep(
         // uncoupled patch, which is what fvc::interpolate gives there.
         DeviceBuffer<scalar> rAUfAll;
         deviceInterpolateFull(dm, st.rAU, rAUfAll);
+        if (DeviceProcCtx::active(dm))
+        {
+            procFaceValue(*DeviceProcCtx::current(), st.rAU, rAUfAll);
+        }
 
         // fvc::ddtCorr(U, phi), Euler. The coefficient is OpenFOAM's DEFAULT LIMITER
         // (ddtPhiCoeff_ = -1), not a constant: it switches the correction off where it is large
@@ -736,7 +741,7 @@ void deviceInterStep(
                                 ctl.cyc, &ctl.cn->ddtCorrPhiIf, ctl.phiOldIf, ctl.cn->phiOOIf, &ddtCorrIf);
             }
         }
-        else
+        if (!(ctl.cn && ctl.cn->momentum))
         {
             deviceDdtCorr(dm, phiOldInt, phiOldBnd, UOldX, UOldY, UOldZ, bndUFixesValue,
                           /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB,
@@ -745,6 +750,21 @@ void deviceInterStep(
                           ctl.phiUfOldInt,
                           // ...and under localEuler the face rDeltaT takes 1/deltaT's
                           ctl.rDeltaTfInt, ctl.rDeltaTfBnd);
+        }
+        if (DeviceProcCtx::active(dm))
+        {
+            DeviceProcCtx& pc = *DeviceProcCtx::current();
+            procExchange(pc, {const_cast<DeviceBuffer<scalar>*>(&UOldX), const_cast<DeviceBuffer<scalar>*>(&UOldY),
+                              const_cast<DeviceBuffer<scalar>*>(&UOldZ)}, "U.oldTime");
+            DeviceBuffer<scalar> ddtIf;
+            if (!(ctl.cn && ctl.cn->momentum))
+            {
+                DeviceBuffer<scalar> oldIf;
+                procGather(pc, phiOldBnd, oldIf);
+                deviceInterDdtCorrCyclic(pc.cyc(), oldIf, UOldX, UOldY, UOldZ,
+                                         /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtIf);
+                procScatter(pc, ddtIf, ddtCorrB);
+            }
         }
 
         // MRF.zeroFilter(interpolate(rho*rAU)*fvc::ddtCorr(U, phi)), pEqn.H:18. MRFZone::zero sets the

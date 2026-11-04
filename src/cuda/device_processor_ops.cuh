@@ -52,6 +52,11 @@ public:
     int bndStart() const { return dp_->bndStart; }
     int nCellsExt() const { return dp_->nCellsExt; }
     const HaloPlan& plan() const { return *dp_->plan; }
+    // The distributed LDU view's plan/global-cell metadata and this interface's coefficient storage.
+    // The coefficient pointer is replaced with the matrix's own saved array by MomentumMatrix::view or
+    // the pressure assembly before a solve.
+    DeviceProcView interfaceView() const;
+    void setGlobalCells(long long n) { globalCells_ = n; }
 
     // the context of this thread's rank (null: no processor interface, the single-GPU run)
     static DeviceProcCtx* current() { return slot(); }
@@ -70,7 +75,9 @@ private:
     }
     DeviceProcInterface* dp_;
     ProcComm* comm_;
+    long long globalCells_ = 0;
 };
+
 
 namespace procdetail {
 inline void check(cudaError_t e, const char* what)
@@ -88,6 +95,22 @@ inline void needHalo(const DeviceProcCtx& c, const DeviceBuffer<scalar>& b, cons
     }
 }
 }   // namespace procdetail
+
+inline DeviceProcView DeviceProcCtx::interfaceView() const
+{
+    DeviceProcView v;
+    if (nFaces() == 0) return v;
+    v.comm = comm_;
+    v.plan = dp_->plan;
+    v.nFaces = dp_->nProcFaces;
+    v.faceCell = dp_->cyc.ownCell.data();
+    v.nbrIdx = dp_->cyc.nbrCell.data();
+    v.coeff = dp_->cyc.ifCoeff.data();
+    v.rank = dp_->cyc.ifRank.data();
+    v.nRanks = dp_->cyc.nIfRanks;
+    v.nGlobalCells = globalCells_;
+    return v;
+}
 
 // 1. REFRESH THE HALO TAILS of these cell arrays from the neighbour ranks (one batched exchange; the components of
 // a vector or a gradient go together). Every array must have been allocated with its halo capacity.

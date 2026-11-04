@@ -220,6 +220,27 @@ void prghEvaluateKernel(
     if (b >= nB) return;
     val[b] = pr[cell[b]] + grad[b] / dc[b];
 }
+__global__ void prghProcCoeffsKernel(
+    int n,
+    int bndStart,
+    const label* __restrict__ own,
+    CyclicNbr nbr,
+    const scalar* __restrict__ dc,
+    const scalar* __restrict__ weight,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ rAU,
+    scalar* __restrict__ iC,
+    scalar* __restrict__ bC)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    const scalar gamma = weight[j]*rAU[own[j]] + (scalar(1) - weight[j])*cyclicNbrValue(nbr, rAU, j);
+    const scalar coeff = gamma * dc[j] * magSf[j];
+    iC[bndStart + j] = coeff;
+    bC[bndStart + j] = scalar(0);
+}
+
+
 
 // A scalar's value in each of `n` listed cells, in the list's order: the cells under a set of patch faces.
 __global__
@@ -647,17 +668,12 @@ RunReport runInterFoamDevice(
             throw std::runtime_error("brae interFoam (device): the mesh has processor faces and no communicator was "
                                      "created (-parallel under mpirun, braeInterFoam.cu).");
         }
-        if (mgpuStageDumpDir().empty())
-        {
-            throw std::runtime_error("brae interFoam (device): processor patches need the multi-GPU coupling, "
-                                     "which only the stage dump (BRAE_MGPU_STAGE_DUMP) carries so far.");
-        }
         fvpCoupled = fvpHost;
         procCoupling = std::make_unique<ProcessorCoupling>(attachProcessorCoupling(fvpCoupled, g, m.nCells(), *procComm));
     }
-    // EVERYTHING BUT THE DEVICE MESH AND THE DEVICE INTERFACE takes the caller's (uncoupled) list: every host operator
-    // and boundary flatten then treats a processor patch as an ordinary boundary patch with the placeholder field,
-    // and the processor faces' values are the device's (procAlphaTail, the interface kernels).
+    // EVERYTHING BUT THE DEVICE MESH AND THE DEVICE INTERFACE takes the caller's (uncoupled) list: every host
+    // operator and boundary flatten treats a processor patch as an ordinary boundary patch with the placeholder
+    // field, and the processor faces' values are the device's (procAlphaTail, the interface kernels).
     const std::vector<FvPatch>& fvp = fvpHost;
     // the device interface and its context, published for the operators below (set once dm is built)
     DeviceProcInterface dProc;
@@ -1443,6 +1459,7 @@ RunReport runInterFoamDevice(
         dProc = buildDeviceProcInterface(dm, g, fvpCoupled, *procCoupling);
         procCtx.emplace(dProc, *procComm);
         DeviceProcCtx::setCurrent(&*procCtx);
+        procCtx->setGlobalCells(static_cast<long long>(procComm->allReduce(static_cast<double>(m.nCells()), ReduceOp::Sum)));
     }
     // how many times dm's GEOMETRY has been made: a build or a refresh after a move. What a cache of
     // geometry-derived boundary arrays keys on where it leaves the empty patches' faces out of its own key
@@ -4582,6 +4599,28 @@ RunReport runInterFoamDevice(
                 dm.Sfz.data(), scalar(0), dPGrad.data(), iC.data(), bC.data());
             cudaCheck(cudaGetLastError(), "prghFluxCoeffsKernel");
             cycJump.resize(0);
+            if (procCtx)
+            {
+                // Processor faces are coupled faces, not fixedFluxPressure walls. Their gradient is the
+                // processor snGrad and their matrix coefficient is the interface's, not the wall's zero.
+                DeviceBuffer<scalar> gx, gy, gz;
+                deviceGradOf(dm, *prghForHooks, dPVal, f.gradPrgh.leastSquares, f.gradPrgh.cellLimitK,
+                             gx, gy, gz, nullptr);
+                procExchange(*procCtx, {const_cast<DeviceBuffer<scalar>*>(prghForHooks), &gx, &gy, &gz},
+                             "p_rgh and grad(p_rgh)");
+                DeviceBuffer<scalar> snProc;
+                deviceCyclicSnGrad(procCtx->cyc(), *prghForHooks, gx, gy, gz,
+                                   f.snGradScheme.corrected, f.snGradScheme.limitCoeff,
+                                   f.snGradScheme.nonOrthCoeffs, snProc);
+                procScatter(*procCtx, snProc, dPGrad);
+                const int nProc = procCtx->nFaces();
+                prghProcCoeffsKernel<<<(nProc + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                    nProc, procCtx->bndStart(), procCtx->cyc().ownCell.data(), procCtx->cyc().nbr(),
+                    procCtx->cyc().deltaCoeffs.data(), procCtx->cyc().weights.data(),
+                    procCtx->cyc().magSf.data(), rAUCell.data(),
+                    iC.data(), bC.data());
+                cudaCheck(cudaGetLastError(), "processor p_rgh coefficients");
+            }
             return;
         }
         std::optional<interPhase::Nested> hookPart;

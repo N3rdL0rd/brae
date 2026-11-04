@@ -2190,18 +2190,11 @@ InterFields buildInterFields(const CaseRoots&            roots,
                     "cpu::cyclicAMIFvPatch::setup() has; processor patches are not ported here. Refused "
                     "rather than run as two walls.");
             }
-            // A PROCESSOR PATCH IS NOT A CYCLIC: its other half lives on another rank and the operators across it
-            // are not ported. Refused by name unless the multi-GPU gate is open (inter_parallel.cuh), and kept
-            // out of every cyclic-specific refusal below, which name a cyclic and mean its same-mesh pair.
+            // A PROCESSOR PATCH IS COUPLED BY THE DEVICE DRIVER, after the host fields have been built with
+            // their inert patch placeholders. It is not a same-mesh cyclic: the halo plan supplies the other
+            // rank's cells and every operator reads them through DeviceProcCtx.
             if (isProcessorType(q.type))
             {
-                if (q.size > 0 && !mgpuProcessorGate())
-                {
-                    throw std::runtime_error(
-                        "brae interFoam: patch `" + q.name + "` is a processor patch (rank "
-                        + std::to_string((int)q.myProcNo) + " <-> rank " + std::to_string((int)q.neighbProcNo)
-                        + "): processor patches need the multi-GPU coupling, not yet implemented.");
-                }
                 continue;
             }
             if (q.coupled && !firstCoupled)

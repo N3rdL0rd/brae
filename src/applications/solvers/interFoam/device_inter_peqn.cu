@@ -1,6 +1,7 @@
 // interFoam's pressure corrector on the device -- see device_inter_peqn.cuh for the four.
 #include "device_inter_peqn.cuh"
 #include "device_fvc_reconstruct.cuh"
+#include "device_processor_ops.cuh"
 #include "device_mesh.cuh"
 #include "device_ldu.cuh"
 #include "device_simple.cuh"
@@ -587,6 +588,12 @@ void deviceInterAssemblePEqn(
                 "rAU interpolated; there is nothing on the patch to read instead.");
         }
         deviceCyclicAssembleLaplacian(*cyc, *rAUCell, P.diag, /*addToDiag=*/true, corrected || nonOrthCoeffs);
+        if (DeviceProcCtx::active(dm))
+        {
+            DeviceProcCtx& pc = *DeviceProcCtx::current();
+            deviceCyclicAssembleLaplacian(pc.cyc(), *rAUCell, P.diag, /*addToDiag=*/true,
+                                          corrected || nonOrthCoeffs);
+        }
     }
 
     if (needReference)

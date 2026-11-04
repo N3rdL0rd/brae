@@ -248,15 +248,11 @@ int main(int argc, char** argv)
         {
             std::printf("brae_interFoam: OpenFOAM's interFoam, re-ported.\n"
                         "  usage: brae_interFoam [-case] <dir> [-device] [-parallel [-rank N -nprocs M]]\n"
-                        "    -device  run the time loop on the GPU (runInterFoamDevice). The same\n"
-                        "             components and the same case translation; the boundary\n"
-                        "             conditions stay on the host. Without it the HOST loop runs: the\n"
-                        "             reference the gates hold to OpenFOAM, on one core.\n"
                         "    -parallel  read decomposePar's processor<rank>/ of the case: dictionaries from the\n"
-                        "             case, mesh, fields and output from the rank's directory. Rank and size come\n"
-                        "             from mpirun's environment, or from -rank N -nprocs M. A decomposition with\n"
-                        "             processor faces is refused until the multi-GPU coupling lands\n"
-                        "             (BRAE_MGPU_GEOMETRY_ONLY=1 couples the patches, writes the geometry dump and stops).\n"
+                        "             case, mesh, fields and output from the rank's directory. Rank and size\n"
+                        "             come from mpirun's environment, or from -rank N -nprocs M. Processor\n"
+                        "             patches are coupled by the device loop (BRAE_MGPU_GEOMETRY_ONLY=1\n"
+                        "             stops after its geometry dump).\n"
                         "  `brae <dir>` on a case whose controlDict says `application interFoam` runs\n"
                         "  this binary with -device.\n");
             return 0;
@@ -439,10 +435,9 @@ int main(int argc, char** argv)
         // the time directories, at OpenFOAM's write times (inter_writer_cpp.cuh)
         cpu::interFoam::InterWriter writer(roots, startDir, patches, phase1);
 
-        // THE MULTI-GPU COMMUNICATOR (under -parallel on the device loop): ProcComm::current() for the run, which the
-        // driver couples its processor patches over. BRAE_MGPU_STAGE_DUMP=<dir> is the only way past the by-name
-        // refusal of a processor patch for now: the driver runs the first step's explicit stages with the
-        // processor-face operators, writes them and stops (inter_stage_dump.cuh).
+        // THE MULTI-GPU COMMUNICATOR (under -parallel on the device loop): ProcComm::current() for the run,
+        // which the driver couples its processor patches over. BRAE_MGPU_STAGE_DUMP=<dir> selects the
+        // per-rank operator-stage dump instead of a normal time loop (inter_stage_dump.cuh).
         if (!mgpuStageDumpDir().empty() && !onDevice)
         {
             throw std::runtime_error("BRAE_MGPU_STAGE_DUMP needs `-device` (serial for the np = 1 floor, or -parallel).");
