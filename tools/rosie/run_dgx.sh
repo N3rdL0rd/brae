@@ -187,7 +187,9 @@ if [[ $BRAE_MODE == dgx ]]; then
     export OMPI_MCA_plm=isolated OMPI_MCA_btl=self,vader OMPI_MCA_pml=ob1
     ROOT=${ROSIE_ROOT:-$HOME/brae-mgpu}
     export PATH="$ROOT/env/bin:$PATH" OPAL_PREFIX="$ROOT/env"
-    export LD_LIBRARY_PATH="$ROOT/compat/12-9:$ROOT/env/lib:$ROOT/nccl/nvidia/nccl/lib:$ROOT/cuda12rt:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    # COMPAT_DIR="" runs without the forward-compatibility libraries (nodes whose kernel driver is older than 535, e.g. dh-dgx1-2 with 525, refuse them: error 803)
+    COMPAT_DIR=${COMPAT_DIR-$ROOT/compat/12-9}
+    export LD_LIBRARY_PATH="${COMPAT_DIR:+$COMPAT_DIR:}$ROOT/env/lib:$ROOT/nccl/nvidia/nccl/lib:$ROOT/cuda12rt:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 else
     # Never inherit a job's Slurm context in the laptop regression either.
     while IFS= read -r name; do unset "$name"; done < <(env | grep -E '^SLURM_' | cut -d= -f1)
