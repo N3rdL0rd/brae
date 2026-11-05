@@ -75,11 +75,11 @@ case contains only `processorN` meshes and initialized fields plus shared
 | np | archive bytes | MiB | uncompressed staged bytes | MiB |
 |---:|---:|---:|---:|---:|
 | 1 | 288,505,846 | 275.14 | 562,305,818 | 536.26 |
-| 2 | 330,395,186 | 315.09 | 584,073,574 | 557.02 |
-| 4 | 332,446,460 | 317.05 | 584,352,752 | 557.28 |
-| 8 | 330,460,540 | 315.15 | 573,342,003 | 546.78 |
+| 2 | 212,393,056 | 202.53 | 438,361,632 | 418.05 |
+| 4 | 212,220,015 | 202.37 | 437,891,768 | 417.60 |
+| 8 | 208,711,844 | 199.02 | 425,705,531 | 405.98 |
 
-Total upload: **1,281,808,032 bytes = 1,222.44 MiB (1.282 GB)**. Decomposed cases
+Total upload: **921,830,761 bytes = 879.06 MiB (0.922 GB)**. Decomposed cases
 are not byte-for-byte invariant across repeated Scotch calls; use these supplied
 archives for all runs rather than mixing newly decomposed copies.
 

@@ -223,6 +223,8 @@ for np in "${NPS[@]}"; do
             [[ -f $dest/processor$rank/0/alpha.water ]] || {
                 echo "missing decomposed initial alpha at rank $rank" >&2; exit 3;
             }
+            rm -f "$dest/processor$rank/0/C" "$dest/processor$rank/0/Cx" \
+                "$dest/processor$rank/0/Cy" "$dest/processor$rank/0/Cz"
         done
         python3 "$SELECTOR" --verify-decomposed "$dest" "$np" "$CELL_CENTRE" --centres "$CENTRES_FILE" \
             > "$OUT/log.reference.${BASE_NAME}_np${np}"
