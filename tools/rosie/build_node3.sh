@@ -25,7 +25,7 @@ BUILD_SPIKES=1
 usage() {
     cat <<'EOF'
 Usage: build_node3.sh [--reconfigure] [--no-spikes]
-Environment: SRC, ROOT, BUILD, ENV_PREFIX, CONDA, NCCL_ROOT, RT, CUDA, NJ.
+Environment: SRC, ROOT, BUILD, ENV_PREFIX, CONDA, NCCL_ROOT, RT, CUDA, NJ, GCC_VER (conda gcc major, 14 for CUDA 12.9; nvcc 12.1 needs <= 12).
   --reconfigure  remove only CMake's cache/configuration, preserving objects
   --no-spikes    skip the optional nccl_while_graph standalone test programs
 Incremental by default. SRC can be any brae source checkout (including a
@@ -66,7 +66,7 @@ if [[ ! -x $CONDA/bin/conda ]]; then
 fi
 if [[ ! -x $ENV_PREFIX/bin/x86_64-conda-linux-gnu-g++ ]]; then
     "$CONDA/bin/conda" create -y -p "$ENV_PREFIX" -c conda-forge --override-channels \
-        gcc_linux-64=14 gxx_linux-64=14 sysroot_linux-64=2.28 \
+        gcc_linux-64=${GCC_VER:-14} gxx_linux-64=${GCC_VER:-14} sysroot_linux-64=2.28 \
         openmpi scotch cmake=3.28 ninja make zlib
 fi
 # Pin on every invocation, including an env made earlier without the pin.
