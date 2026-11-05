@@ -54,6 +54,13 @@ __global__ void subKernel(const scalar* __restrict__ a, const scalar* __restrict
     if (i < n) out[i] = a[i] - b[i];
 }
 
+__global__ void mulKernel(const scalar* __restrict__ a, const scalar* __restrict__ b,
+                          int n, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] * b[i];
+}
+
 // phiHbyA += phig on the pair's faces, the interface twin of addPhigBoundaryKernel -- and `a += b` on any
 // face array, which is all fvc::makeAbsolute is.
 __global__ void addPhigIfKernel(const scalar* __restrict__ phig, int n, scalar* __restrict__ phiHbyA)
@@ -255,17 +262,33 @@ scalar deviceInterPressureStep(
     if (proc)
     {
         DeviceBuffer<scalar> cellProduct = makeCellBuffer<scalar>(dm);
-        deviceHadamard(cellProduct, *in.rho, rAU);
+        // the product over the OWNED cells AND the halo (both factors' halos are current): deviceHadamard
+        // leaves the tail it did not compute at zero, which weighted every processor face by half its value
+        const int nExt = proc->nCellsExt();
+        mulKernel<<<(nExt + 255)/256, 256, 0, cudaStreamPerThread>>>(in.rho->data(), rAU.data(), nExt, cellProduct.data());
+        ckS(cudaGetLastError(), "rho*rAU over the halo");
         deviceCyclicFaceValue(proc->cyc(), cellProduct, procRhoRAU);
     }
 
     DeviceBuffer<scalar> zeroIf(static_cast<std::size_t>(nIf));
     if (nIf > 0) ckS(cudaMemset(zeroIf.data(), 0, sizeof(scalar)*nIf), "zero");
     // pEqn.H:13-19: + interpolate(rho*rAU)*ddtCorr, then MRF.makeRelative
+    // the processor faces' ddtCorr is added below with the interpolated rho*rAU; the generic boundary path must not
+    // add its own (placeholder-weighted) copy of it as well, so it sees the boundary array with that segment zero
+    DeviceBuffer<scalar> ddtBndNoProc;
+    const DeviceBuffer<scalar>* ddtBndForGeneric = in.ddtCorrBnd;
+    if (proc && in.ddtCorrBnd)
+    {
+        deviceCopy(ddtBndNoProc, *in.ddtCorrBnd);
+        ckS(cudaMemsetAsync(ddtBndNoProc.data() + proc->bndStart(), 0,
+                            static_cast<std::size_t>(proc->nFaces())*sizeof(scalar), cudaStreamPerThread),
+            "zero the processor segment of ddtCorr for the generic path");
+        ddtBndForGeneric = &ddtBndNoProc;
+    }
     deviceInterAddDdtCorrTerms(dm, rhoRAUf,
                                in.ddtCorrInt ? *in.ddtCorrInt : zeroIf, in.ddtCorrInt != nullptr,
                                phiHbyAInt, phiHbyABnd, in.mrf,
-                               in.ddtCorrBnd, in.rhoBndFace, &rAU, in.bndUFixesValue);
+                               ddtBndForGeneric, in.rhoBndFace, &rAU, in.bndUFixesValue);
     if (proc && in.ddtCorrBnd)
     {
         procGather(*proc, *in.ddtCorrBnd, procDdt);
@@ -358,13 +381,8 @@ scalar deviceInterPressureStep(
     if (proc) deviceCopy(phiHbyABndBeforeProc, phiHbyABnd);
     // pEqn.H:36
     deviceInterAddPhig(dm, phigInt, phigBnd, phiHbyAInt, phiHbyABnd);
-    if (proc)
-    {
-        DeviceBuffer<scalar> phiProc;
-        procGather(*proc, phiHbyABnd, phiProc);
-        deviceAxpy(scalar(1), procPhig, phiProc);
-        procScatter(*proc, phiProc, phiHbyABnd);
-    }
+    // (the processor faces' phig is in phigBnd already -- rAUfAll's and stf/ghf/snGrad(rho)'s processor segments are
+    // set -- and deviceInterAddPhig added it above; adding procPhig on top of it counted it twice)
     if (proc && taps)
     {
         deviceCopy(taps->phigBndTap, procPhig);

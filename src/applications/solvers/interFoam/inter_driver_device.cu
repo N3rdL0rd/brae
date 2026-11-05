@@ -1607,9 +1607,20 @@ RunReport runInterFoamDevice(
             scalar seedMax = 0;
             for (const scalar v : procFlux) seedMax = std::fmax(seedMax, std::fabs(v));
             std::printf("brae interFoam: processor flux seed max %.17g\n", (double)seedMax);
-            cudaCheck(cudaMemcpy(dPhiB.data() + procCtx->bndStart(), procFlux.data(),
-                                 procFlux.size()*sizeof(scalar), cudaMemcpyHostToDevice),
-                      "seed processor flux");
+            // coupledFace() hands back zeros for a processor patch (no pair flux to rebuild); the patch's own list holds
+            // the file's stored flux (decomposePar / a restart write it), which dPhiB already has -- keep that
+            if (seedMax > scalar(0))
+                cudaCheck(cudaMemcpy(dPhiB.data() + procCtx->bndStart(), procFlux.data(),
+                                     procFlux.size()*sizeof(scalar), cudaMemcpyHostToDevice),
+                          "seed processor flux");
+            else
+            {
+                scalar kept = 0;
+                const std::vector<scalar> hb = dPhiB.host();
+                for (std::size_t j = 0; j < procFlux.size(); ++j)
+                    kept = std::fmax(kept, std::fabs(hb[static_cast<std::size_t>(procCtx->bndStart()) + j]));
+                std::printf("brae interFoam: processor flux kept from the patches' own values, max %.17g\n", (double)kept);
+            }
         }
     }
     // rhoPhi, which the alpha step writes. Declared HERE because pushFlux reads its boundary: a

@@ -518,7 +518,9 @@ void assembleUEqn(
                 }
                 if (proc)
                 {
-                    deviceCyclicAddLinUpwindCorr(proc->cyc(), k, gxA, gyA, gzA, lu, in.phiBnd);
+                    DeviceBuffer<scalar> procLuFlux;
+                    procGather(*proc, *in.phiBnd, procLuFlux);    // the interface's own face order, not the boundary array
+                    deviceCyclicAddLinUpwindCorr(proc->cyc(), k, gxA, gyA, gzA, lu, &procLuFlux);
                 }
                 deviceAxpy(-corrFac, lu, M.source[k]);
             }

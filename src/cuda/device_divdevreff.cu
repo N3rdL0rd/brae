@@ -3,6 +3,7 @@
 #include "device_kepsilon.cuh"   // deviceCellLimitGradU (the named grad(U) scheme)
 #include "stage_dump.cuh"   // sigma comparison against OF (ACMI trace)
 #include "device_blas.cuh"
+#include "device_processor_ops.cuh"   // a decomposed mesh: the processor faces' stress
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -396,6 +397,19 @@ DevReffWorkspace& devReffWorkspace(const DeviceMesh& dm)
     static auto& cache = *new std::map<const void*, DevReffWorkspace>();
     return cache[dm.owner.data()];
 }
+
+// A processor face's stress is the two cells' sigma interpolated linearly (volTensorField -> face), w on the own side:
+// it replaces the placeholder boundary tensor the uncoupled path built there.
+struct SigmaHalo9 { const scalar* q[9]; };
+__global__
+void procSigmaKernel(int n, int bndStart, int nB, const label* __restrict__ own, const label* __restrict__ nbr,
+                     const scalar* __restrict__ w, SigmaHalo9 s, scalar* __restrict__ sigmaB)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= n) return;
+    for (int k = 0; k < 9; ++k)
+        sigmaB[static_cast<std::size_t>(k)*nB + bndStart + j] = w[j]*s.q[k][own[j]] + (scalar(1) - w[j])*s.q[k][nbr[j]];
+}
 }   // namespace
 
 void deviceDivDevReff(
@@ -556,6 +570,25 @@ void deviceDivDevReff(
     sigmaB.resize(static_cast<std::size_t>(9) * nB);
     sigmaKernel<<<nBlocks(nB), TPB>>>(nB, gradB.data(), nuBnd.data(), sigmaB.data());
     cudaCheck(cudaGetLastError(), "ddr sigmaB");
+    if (DeviceProcCtx::active(dm) && DeviceProcCtx::current()->nFaces() > 0)
+    {
+        DeviceProcCtx& pc = *DeviceProcCtx::current();
+        DeviceBuffer<scalar> sg[9];
+        SigmaHalo9 sh;
+        for (int k = 0; k < 9; ++k)
+        {
+            sg[k].resize(static_cast<std::size_t>(nC), static_cast<std::size_t>(pc.nCellsExt()));
+            cudaCheck(cudaMemcpyAsync(sg[k].data(), sigmaC.data() + static_cast<std::size_t>(k)*nC,
+                                      static_cast<std::size_t>(nC)*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                                      cudaStreamPerThread), "ddr sigma halo");
+            sh.q[k] = sg[k].data();
+        }
+        procExchange(pc, {&sg[0], &sg[1], &sg[2], &sg[3], &sg[4], &sg[5], &sg[6], &sg[7], &sg[8]}, "sigma");
+        procSigmaKernel<<<nBlocks(pc.nFaces()), TPB, 0, cudaStreamPerThread>>>(
+            pc.nFaces(), pc.bndStart(), nB, pc.cyc().ownCell.data(), pc.cyc().nbrCell.data(), pc.cyc().weights.data(), sh,
+            sigmaB.data());
+        cudaCheck(cudaGetLastError(), "ddr proc sigma");
+    }
 
 
     if (stageDumpActive() && stageDumpFirstOnly("ddrSigma"))
