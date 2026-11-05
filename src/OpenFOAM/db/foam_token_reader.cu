@@ -589,6 +589,12 @@ std::vector<std::string> tokenizeFoamBinary(const std::vector<char>& in)
                                                          in.begin() + static_cast<std::ptrdiff_t>(j)).c_str(), nullptr, 10);
         std::size_t k = j;
         while (k < in.size() && std::isspace(static_cast<unsigned char>(in[k]))) ++k;
+        if (haveCount && count == 0 && k < in.size() && in[k] == ';')
+        {
+            appendText(i, close + 1);
+            i = close + 1;
+            continue;
+        }
         if (nCmpt == 0 || !haveCount || k >= in.size() || in[k] != '(')
         {
             appendText(i, close + 1);
@@ -603,10 +609,9 @@ std::vector<std::string> tokenizeFoamBinary(const std::vector<char>& in)
             i = close + 1;
             continue;
         }
-        // OpenFOAM writes `N (\n` before a raw payload. Skip whitespace after the opening parenthesis;
-        // the byte count starts at the first raw scalar, not at the newline.
-        std::size_t payload = k + 1;
-        while (payload < in.size() && std::isspace(static_cast<unsigned char>(in[payload]))) ++payload;
+        // The byte immediately after the opening parenthesis is the first raw scalar byte. Do NOT skip
+        // whitespace there: a binary double is allowed to begin with 0x20/0x09/0x0a.
+        const std::size_t payload = k + 1;
         appendText(i, payload);
         const char* raw = in.data() + payload;
         for (std::size_t e = 0; e < count; ++e)

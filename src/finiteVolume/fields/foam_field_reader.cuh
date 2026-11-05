@@ -14,6 +14,8 @@
 #include "cf_types.cuh"
 #include "function1.cuh"   // OF Function1: constant / table
 #include "patchExprFunction1.cuh"   // OF PatchFunction1 `expression`: the spec the reader fills
+#include <cstdio>
+#include <cstdlib>
 #include "foam_token_reader.cuh"
 #include "brae_notice.cuh"   // noticeApproximated: a per-patch wall-function coefficient brae applies model-wide
 #include <string>
@@ -356,15 +358,17 @@ inline void readUniformOrList(
         const label n = ts.nextLabel();
         // OpenFOAM writes an EMPTY list as `List<scalar> 0;` -- no parentheses (a patch with no faces on one rank of
         // a decomposed case: `value nonuniform List<scalar> 0;`)
-        if (n == 0 && ts.peek() == ";")
+        if (n == 0)
         {
             vals.clear();
+            if (ts.peek() == ";") ts.next();
             return;
         }
         ts.expect("(");
         vals.resize(n);
         for (label i = 0; i < n; ++i)
         {
+            if (std::getenv("BRAE_DEBUG_LIST")) std::fprintf(stderr, "list n %ld next %s\n", (long)n, ts.peek().c_str());
             vals[i] = readFoamValue<T>(ts);
         }
         ts.expect(")");
@@ -1489,7 +1493,7 @@ inline FieldData<T> readField(const std::string& path)
                     {
                         readValueOrInternal(ts, fd, p.gradientUniform, p.gradientUniformValue, p.gradientValues);
                         p.hasGradient = true;
-                        ts.expect(";");
+                        if (ts.peek() == ";") ts.next();   // a binary gradient list has no trailing ';'
                     }
                     // mixedEnergy is OpenFOAM's own spelling for a mixed he patch (basicThermo maps
                     // T `mixed` onto it), and it is what OF WRITES into an he output file -- so a
