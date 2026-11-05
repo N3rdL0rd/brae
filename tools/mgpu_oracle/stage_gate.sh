@@ -82,11 +82,12 @@ if [ -d ofExplicit ]; then sed -i 's/^startFrom .*/startFrom       latestTime;/'
 # OpenFOAM: first the alpha step in alpha-stage mode, then the explicit stages from the unchanged input.
 if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then export BRAE_STAGE_ALPHA=1; fi
 if [ "$BRAE_STAGE_ALPHA" = 1 ]; then
-    export BRAE_ORACLE_ITERS=2
-    if [ "$NP" = 1 ]; then ( cd of && "$SOLVER" > ../log.of 2>&1 )
-    else ( cd of && mpirun --bind-to none -np "$NP" "$SOLVER" -parallel > ../log.of 2>&1 ); fi
+    rm -rf ofReal; cp -r state ofReal
+    sed -i 's/^startFrom .*/startFrom       latestTime;/; s/^endTime .*/endTime 0.00024;/; s/^writeInterval .*/writeInterval 1;/' ofReal/system/controlDict
+    printf '\n#inputMode merge\nfunctions { brae_wr { type writeObjects; libs (utilityFunctionObjects); objects (rho alphaPhi0.water); writeControl timeStep; writeInterval 1; } }\n' >> ofReal/system/controlDict
+    if [ "$NP" = 1 ]; then ( cd ofReal && interFoam > ../log.of 2>&1 )
+    else ( cd ofReal && mpirun --bind-to none -np "$NP" interFoam -parallel > ../log.of 2>&1 ); fi
 fi
-    unset BRAE_ORACLE_ITERS
 ORUN=of; [ -d ofExplicit ] && ORUN=ofExplicit
 if [ "$BRAE_STAGE_ALPHA_REQUESTED" != 1 ]; then
     export BRAE_STAGE_DUMP=1
@@ -109,31 +110,16 @@ grep -a "stage dump" log.brae | head -n 8
 T=$(ls -d state/[0-9]* 2>/dev/null | xargs -n1 basename | sort -g | tail -n 1)
 [ -n "$T" ] && [ "$T" != 0 ] || T=$(ls -d state/processor0/[0-9]* | xargs -n1 basename | sort -g | tail -n 1)
 if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then
-    for D in of/processor*; do
-        [ -d "$D" ] || continue
-        AT=$(find "$D" -name sAlphaAfter.dump -printf '%h\n' | head -n 1)
-        [ -n "$AT" ] || { echo "oracle wrote no alpha stage in $D" >&2; exit 1; }
-        [ "$AT" = "$D/$T" ] || { mkdir -p "$D/$T"; cp "$AT"/sAlphaAfter.dump "$AT"/sAlphaPhi.dump "$AT"/sRhoAfter.dump "$D/$T/"; }
+    # real OpenFOAM interFoam, one step from the plain step-1 state, writes alpha, alphaPhi0 and rho; alias them
+    for D in $( [ "$NP" = 1 ] && echo ofReal || ls -d ofReal/processor* ); do
+        TN=$(ls -d $D/[0-9]* | xargs -n1 basename | sort -g | tail -n 1)
+        [ "$TN" != "$T" ] || { echo "real interFoam wrote no step in $D" >&2; exit 1; }
+        mkdir -p "$D/$T"; DST=$( [ "$NP" = 1 ] && echo of || echo of/$(basename $D) )
+        mkdir -p "$DST/$T"
+        cp "$D/$TN/alpha.water" "$DST/$T/sAlphaAfter.dump"
+        cp "$D/$TN/alphaPhi0.water" "$DST/$T/sAlphaPhi.dump"
+        cp "$D/$TN/rho" "$DST/$T/sRhoAfter.dump"
     done
-    if [ "$NP" = 1 ]; then
-        AT=$(find of -name sAlphaAfter.dump -printf '%h\n' | head -n 1)
-        [ "$AT" = "of/$T" ] || { mkdir -p "of/$T"; cp "$AT"/sAlphaAfter.dump "$AT"/sAlphaPhi.dump "$AT"/sRhoAfter.dump "of/$T/"; }
-    fi
-fi
-if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then
-    for D in of/processor*; do
-        [ -d "$D" ] || continue
-        for F in sAlphaPredictor.dump sAlphaCorr0.dump sAlphaCorr1.dump; do
-            AT=$(find "$D" -name "$F" -print -quit 2>/dev/null)
-            [ -n "$AT" ] && cp "$AT" "$D/$T/"
-        done
-    done
-    if [ "$NP" = 1 ]; then
-        for F in sAlphaPredictor.dump sAlphaCorr0.dump sAlphaCorr1.dump; do
-            AT=$(find of -name "$F" -print -quit 2>/dev/null)
-            [ -n "$AT" ] && cp "$AT" "of/$T/"
-        done
-    fi
 fi
 if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then
     for F in sAlphaAfter.dump sAlphaPhi.dump sRhoAfter.dump; do

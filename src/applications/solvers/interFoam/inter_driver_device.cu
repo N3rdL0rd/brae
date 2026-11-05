@@ -6526,7 +6526,15 @@ RunReport runInterFoamDevice(
             }
             dAlphaPhiWriteB.copyTo(hb);
             dump.surface("sAlphaPhi", hi, hb);
-            const std::vector<scalar> finalAB = contactAngleDevice ? dContact.stored.host() : dABnd.host();
+            std::vector<scalar> finalAB;
+            if (contactAngleDevice) finalAB = dContact.stored.host();
+            else
+            {
+                DeviceBuffer<scalar> hb2;
+                hb2.copyFrom(patchValues(f.alpha1, fvp));   // the host hooks' field after the final mixture.correct()
+                procAlphaTail(dA, hb2);
+                finalAB = hb2.host();
+            }
             dump.vol("sAlphaAfter", dA.host(), &finalAB);
             DeviceBuffer<scalar> finalRhoB(static_cast<std::size_t>(dm.nBndFaces));
             deviceBoundaryRho(alphaBeforeFinalMixture.data(), alpha2BeforeFinalMixture.data(),
