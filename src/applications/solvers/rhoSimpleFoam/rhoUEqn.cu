@@ -572,7 +572,6 @@ void assembleUEqn(
         M.source[2],
         nullptr,
         nullptr,
-        nullptr,
         ubStored,
         in.gradULimitK,
         in.gradULeastSq);

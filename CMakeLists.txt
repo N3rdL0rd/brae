@@ -77,8 +77,6 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(brae_core STATIC
     src/parallel/pstream/cf_pstream.cu
-    src/parallel/pstream/device_halo.cu
-    src/parallel/pstream/device_reduce.cu
     src/parallel/proc_comm.cu
     src/parallel/proc_hooks.cu
     src/parallel/processor_coupling.cu
@@ -291,36 +289,6 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(brae_core PUBLIC ${OpenMP_CXX_LIBRARIES})
 endif()
 
-# ---------------------------------------------------------------------------
-# NVSHMEM device transport (multi-GPU, Phase 1+). Phase 1a is host-side only: the bootstrap
-# (nvshmemx_init_attr off MPI) and the symmetric heap (nvshmem_malloc) link against libnvshmem_host and need
-# NO relocatable device code. Phase 1b's device-initiated put adds -rdc + device-link on its own TU only.
-# Default ON; if NVSHMEM is not found the build falls back to the MPI backend (single-GPU still compiles).
-# Override the location with -DNVSHMEM_HOME=... or the NVSHMEM_HOME env var.
-# ---------------------------------------------------------------------------
-option(BRAE_WITH_NVSHMEM "Build the NVSHMEM device transport for multi-GPU" ON)
-if(BRAE_WITH_NVSHMEM)
-    find_path(NVSHMEM_INCLUDE_DIR NAMES nvshmem.h
-        HINTS $ENV{NVSHMEM_HOME} ${NVSHMEM_HOME}
-        PATHS /opt/nvidia/hpc_sdk/Linux_aarch64/26.5/comm_libs/13.2/nvshmem
-        PATH_SUFFIXES include)
-    find_library(NVSHMEM_HOST_LIB NAMES nvshmem_host
-        HINTS $ENV{NVSHMEM_HOME} ${NVSHMEM_HOME}
-        PATHS /opt/nvidia/hpc_sdk/Linux_aarch64/26.5/comm_libs/13.2/nvshmem
-        PATH_SUFFIXES lib)
-    if(NVSHMEM_INCLUDE_DIR AND NVSHMEM_HOST_LIB)
-        get_filename_component(NVSHMEM_LIB_DIR ${NVSHMEM_HOST_LIB} DIRECTORY)
-        message(STATUS "cf NVSHMEM: ${NVSHMEM_HOST_LIB} (hdr ${NVSHMEM_INCLUDE_DIR})")
-        target_include_directories(brae_core PUBLIC ${NVSHMEM_INCLUDE_DIR})
-        target_link_libraries(brae_core PUBLIC ${NVSHMEM_HOST_LIB})
-        target_compile_definitions(brae_core PUBLIC BRAE_WITH_NVSHMEM)
-        # Find libnvshmem_host.so.3 and the dlopen'd MPI bootstrap plugin at runtime.
-        list(APPEND CMAKE_BUILD_RPATH ${NVSHMEM_LIB_DIR})
-    else()
-        message(WARNING "cf NVSHMEM requested but not found; building the MPI backend only (single-GPU)")
-        set(BRAE_WITH_NVSHMEM OFF)
-    endif()
-endif()
 
 # ---------------------------------------------------------------------------
 # NCCL transport of ProcComm (multi-GPU interFoam, one process per GPU; src/parallel/proc_comm.cu). Default OFF:
@@ -395,6 +363,24 @@ foreach(_np 1 2 3 4 8)
                      $<TARGET_FILE:test_proc_comm> mpi)
     set_tests_properties(proc_comm_mpi_np${_np} PROPERTIES TIMEOUT 300)
 endforeach()
+
+# Reduction scratch/caches/counters are per loopback rank thread (finding 7): concurrent ranks use differently
+# sized buffers and check every host-read result against independent global arithmetic.
+add_executable(test_loopback_reduction_threads tests/test_loopback_reduction_threads.cu)
+target_include_directories(test_loopback_reduction_threads PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_loopback_reduction_threads PRIVATE brae_core)
+foreach(_np 2 4 8)
+    add_test(NAME loopback_reduction_threads_np${_np} COMMAND test_loopback_reduction_threads ${_np})
+    set_tests_properties(loopback_reduction_threads_np${_np} PROPERTIES TIMEOUT 300)
+endforeach()
+
+# Processor faces are stably grouped by pass at interface construction (finding 13): grouped contiguous-range
+# launches must be bit-identical to the old full-face/filter launches (A/B inside the test).
+add_executable(test_proc_pass_grouping tests/test_proc_pass_grouping.cu)
+target_include_directories(test_proc_pass_grouping PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_pass_grouping PRIVATE brae_core)
+add_test(NAME proc_pass_grouping COMMAND test_proc_pass_grouping)
+set_tests_properties(proc_pass_grouping PROPERTIES TIMEOUT 120)
 
 # Global Courant numbers / time steps and zero-cell-rank collective participation (findings 4 and 6).
 add_executable(test_courant_global tests/test_courant_global.cu)
@@ -512,12 +498,6 @@ foreach(_np 1 2 4 8)
                      ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily/constant/polyMesh)
 endforeach()
 
-# Multi-GPU Phase 1a: NVSHMEM bootstrap + symmetric heap (host-side) smoke test
-# ---------------------------------------------------------------------------------------------------
-# The multi-GPU (distributed) test suite lived here, guarded by if(BRAE_WITH_NVSHMEM). It moved to
-# legacy/tests/ along with the distributed solvers -- multi-GPU is OUT OF SCOPE. See legacy/README.md.
-# Nothing in legacy/ is built or registered; do not re-add it without an explicit decision to resume.
-# ---------------------------------------------------------------------------------------------------
 
 add_executable(test_mesh_topology tests/test_mesh_topology.cu)
 target_include_directories(test_mesh_topology PRIVATE ${BRAE_HEADER_DIRS})
@@ -2176,7 +2156,7 @@ set_tests_properties(komegasstlm_flatplate PROPERTIES LABELS slow TIMEOUT 600)
 # through the single-GPU device path AND the distributed path, then compare. This is the comparison that catches
 # real AMI-coupling bugs -- the bounded-div/deferred-rot/linearUpwind-grad fixes all lived in SHARED distributed
 # code, so a np2-vs-np1 oracle passes with both ranks wrong; only distributed-vs-single-GPU exposes them. np=1 is
-# bit-exact (tol 1e-6); np=2 exercises the cross-rank NVSHMEM AMI gather (tol 1e-3, the residualControl floor).
+# bit-exact (tol 1e-6); np=2 exercises the cross-rank AMI gather over ProcComm (tol 1e-3, the residualControl floor).
 # _np(N)$ names auto-pick up PROCESSORS=N + (N>1) RESOURCE_LOCK gpu_multirank from the block below.
 foreach(_np 1 2)
     if(_np EQUAL 1)
@@ -5415,7 +5395,7 @@ add_test(NAME gpu_crossover COMMAND test_gpu_crossover ${CMAKE_CURRENT_SOURCE_DI
 # slot and launches many concurrently -> on the self-hosted SINGLE-GPU runner that oversubscribes the GPU/CPU with
 # dozens of ranks at once, the cause of the flaky failures (parallel_spmv_np2, parallel_pcg_np8 under load; each
 # passes in isolation). Setting PROCESSORS=N makes the scheduler reserve N slots per test, so it never overcommits.
-# PROCESSORS alone still allowed TWO np=2 tests to run at once under -j4 (4 ranks -> 4 CUDA/NVSHMEM contexts on the
+# PROCESSORS alone still allowed TWO np=2 tests to run at once under -j4 (4 ranks -> 4 CUDA contexts on the
 # one GPU -> intermittent init/heap-contention crash, exit 8). RESOURCE_LOCK on the np>=2 tests makes them mutually
 # exclusive (at most one multi-rank GPU test at a time); the many np=1 / single-GPU tests still parallelise freely.
 get_property(_brae_all_tests DIRECTORY PROPERTY TESTS)
@@ -5454,8 +5434,8 @@ endif()
 # rather than at install time.
 # Keep the library search path on the way out. CMake strips the build RPATH at install time and replaces it
 # with INSTALL_RPATH, which is empty by default -- so the first `cmake --install` produced binaries that could
-# not find libnvshmem_host.so.3 and failed for every user, not only under sudo. USE_LINK_PATH carries the
-# directories of the libraries actually linked (NVSHMEM, OpenMPI) into the installed binary.
+# not find the MPI/NCCL shared libraries and failed for every user, not only under sudo. USE_LINK_PATH carries the
+# directories of the libraries actually linked into the installed binary.
 foreach(exe IN ITEMS brae brae-agent brae_pimpleFoam)
     if(TARGET ${exe})
         set_target_properties(${exe} PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)

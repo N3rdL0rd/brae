@@ -804,7 +804,7 @@ void assembleUEqn(
         DeviceBuffer<scalar> t[3];
         deviceDivDevReff(dm, dbU, Ux, Uy, Uz, *in.nuEffCell, *in.nuEffBndFace,
                          t[0], t[1], t[2],
-                         in.cyc, /*ami*/nullptr, nullptr, in.UbStored,
+                         in.cyc, /*ami*/nullptr, in.UbStored,
                          in.gradUSchemeLimitK,
                          in.gradUSchemeLeastSq,
                          in.gradUGivenTensor,
@@ -829,7 +829,7 @@ void assembleUEqn(
         // HbyA 5.3e-04 of 1.9e+00 at the pair's own cells and U 2.1e-04 by the end of the step.
         deviceDivDevReff(dm, dbU, Ux, Uy, Uz, *in.nuEffCell, *in.nuEffBndFace,
                          M.source[0], M.source[1], M.source[2],
-                         in.cyc, /*ami*/nullptr, nullptr, in.UbStored,
+                         in.cyc, /*ami*/nullptr, in.UbStored,
                          // The gradSchemes `grad(U)` entry, which linearViscousStress.C:114's fvc::grad(U)
                          // resolves. These five arguments fell through to their defaults, so the case's
                          // limiter never reached the dev2 term on this driver -- the legacy one has passed

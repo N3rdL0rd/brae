@@ -512,12 +512,10 @@ std::unique_ptr<HaloPlan> ProcComm::buildPlanFromPatches(int nCells, std::vector
             part[static_cast<std::size_t>(rank_)*size_ + p.nbrRank] = static_cast<int>(p.faceCells.size()) + 1;
             // +1 distinguishes "no patch" from "a patch with zero faces"
         }
-        std::vector<int> all(part.size());
-        MPI_Allreduce(part.data(), all.data(), static_cast<int>(part.size()), MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-        // all[] holds, per ordered pair, this rank's announced size; compare with the transpose by allgathering
-        // the rows instead: one allgather of the full matrix is the simplest symmetric form.
-        std::vector<int> matrix(static_cast<std::size_t>(size_)*part.size());
-        MPI_Allgather(part.data(), static_cast<int>(part.size()), MPI_INT, matrix.data(), static_cast<int>(part.size()), MPI_INT, MPI_COMM_WORLD);
+        // allgather through the backend's own (bounded, abort-aware) path: loopback answers locally, MPI-host
+        // and NCCL run the bounded nonblocking allgather on the status communicator.
+        std::vector<int> matrix;
+        allgatherInts(part, matrix);
         std::string bad;
         for (int a = 0; a < size_ && bad.empty(); ++a)
             for (int b = 0; b < size_; ++b)
@@ -538,7 +536,6 @@ std::unique_ptr<HaloPlan> ProcComm::buildPlanFromPatches(int nCells, std::vector
                 }
             }
         if (!bad.empty()) collectiveAbort("ProcComm::buildPlanFromPatches: " + bad);
-        (void)all;
     }
     std::vector<int> nbr;
     std::vector<std::vector<int>> send;
@@ -803,6 +800,22 @@ protected:
         g_->sync();
         for (std::size_t k = 0; k < nbr.size(); ++k) g_->mail[rank_][nbr[k]].clear();
         return recv;
+    }
+
+    void allgatherInts(const std::vector<int>& send, std::vector<int>& recv) override
+    {
+        // Every rank publishes its row in the mailbox, rendezvous, then reads all rows in rank order. recv is
+        // [rank][row-entry], exactly like the MPI backends' allgather.
+        g_->mail[rank_][rank_] = send;
+        g_->sync();
+        recv.clear();
+        for (int r = 0; r < size_; ++r)
+        {
+            const auto& row = g_->mail[r][r];
+            recv.insert(recv.end(), row.begin(), row.end());
+        }
+        g_->sync();
+        g_->mail[rank_][rank_].clear();
     }
 
     [[noreturn]] void doAbort(const std::string& msg) override
@@ -1177,6 +1190,9 @@ protected:
 
     void allgatherInts(const std::vector<int>& send, std::vector<int>& recv) override
     {
+        recv.resize(static_cast<std::size_t>(size_)*send.size());
+        if (statusComm_ == MPI_COMM_NULL)
+            throw std::runtime_error("ProcComm::allgatherInts: the status communicator was not initialized");
         MPI_Request req = MPI_REQUEST_NULL;
         mpiCheck(MPI_Iallgather(send.data(), static_cast<int>(send.size()), MPI_INT, recv.data(),
                                 static_cast<int>(send.size()), MPI_INT, statusComm_, &req), "Iallgather");
@@ -1362,6 +1378,11 @@ protected:
         side_->recv.resize(size_);
         mpiCheck(MPI_Comm_dup(MPI_COMM_WORLD, &sideComm_), "Comm_dup");
         mpiCheck(MPI_Comm_dup(MPI_COMM_WORLD, &statusComm_), "Comm_dup");
+        // The abort channel must never let OpenMPI kill the process: a peer that aborts mid-round leaves a
+        // truncated/incomplete nonblocking allgather behind, which is EXPECTED during failure propagation.
+        // Handle those errors as "channel is dead, stop polling" instead of MPI_ERRORS_ARE_FATAL.
+        MPI_Comm_set_errhandler(sideComm_, MPI_ERRORS_RETURN);
+        MPI_Comm_set_errhandler(statusComm_, MPI_ERRORS_RETURN);
         int provided = MPI_THREAD_SINGLE;
         MPI_Query_thread(&provided);
         sideThreadOk_ = provided >= MPI_THREAD_MULTIPLE;
@@ -1373,42 +1394,83 @@ protected:
         }
     }
 
+    // COLLECTIVE shutdown. Every rank calls it (the destructor, or explicitly before Pstream::finalize): finish
+    // the outstanding abort-record round, then run one final allgather so no rank enters MPI_Finalize with an
+    // NBC subrequest its peers still owe. An abort already delivered stays delivered; shutdown never revives a
+    // communicator, and a failed peer cannot hold the others past the watchdog.
+    void quiesceSideChannel()
+    {
+        if (!sideOn_ || sideQuiesced_) return;
+        sideQuiesced_ = true;
+        sideClosing_.store(true, std::memory_order_release);
+        for (;;)
+        {
+            bool active = false;
+            if (sideThreadOk_)
+            {
+                std::lock_guard<std::mutex> lk(side_->m);
+                active = side_->active;
+            }
+            else
+            {
+                sideRound(*side_);
+                active = side_->active;
+            }
+            if (!active) break;
+            usleep(200);
+            if (watchdogMs_ > 0 && ++sideShutdownSpins_ > watchdogMs_)
+                throw std::runtime_error("ProcComm: side channel did not finish its last abort round");
+        }
+        // One agreed, bounded round on the STATUS communicator (the side thread owns only sideComm_). This is
+        // the collective quiesce: after it every rank has left the channel, so Pstream::finalize cannot strand a
+        // nonblocking allgather and OpenMPI reports no NBC-subrequest error.
+        AbortRec mine;
+        std::memset(&mine, 0, sizeof(mine));
+        std::vector<AbortRec> all(size_);
+        MPI_Request req = MPI_REQUEST_NULL;
+        mpiCheck(MPI_Iallgather(&mine, sizeof(AbortRec), MPI_BYTE, all.data(), sizeof(AbortRec), MPI_BYTE,
+                                statusComm_, &req), "shutdown Iallgather");
+        const auto t0 = std::chrono::steady_clock::now();
+        for (;;)
+        {
+            int done = 0;
+            mpiCheck(MPI_Test(&req, &done, MPI_STATUS_IGNORE), "shutdown Test");
+            if (done) break;
+            if (watchdogMs_ > 0
+                && std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()
+                   > watchdogMs_)
+            {
+                dropCollective(req);
+                throw std::runtime_error("ProcComm: collective shutdown timed out (a rank skipped communicator destruction)");
+            }
+            usleep(200);
+        }
+        abortState_->stop.store(true, std::memory_order_release);
+        joinSideThread();
+    }
+
+    void joinSideThread()
+    {
+        if (sideThread_.joinable())
+        {
+            sideThread_.join();
+            side_->done.store(true, std::memory_order_release);
+        }
+    }
+
     void stopSideChannel()
     {
         if (!sideOn_) return;
         abortState_->stop.store(true, std::memory_order_release);
-        if (sideThread_.joinable())
-        {
-            // A healthy shutdown joins within one poll period. After a collective abort the peer processes may
-            // already be inside MPI_Finalize, whose progress machinery can block a concurrent MPI_Test: do not
-            // wait for ever. The thread owns a shared copy of the channel state and the backend stops touching
-            // it, so detaching is safe (no use-after-free); the communicator is NOT freed here in that case and
-            // MPI_Finalize reaps it.
-            auto sc = side_;
-            auto st = abortState_;
-            std::atomic<bool> left{false};
-            std::thread waiter([&] {
-                const auto t0 = std::chrono::steady_clock::now();
-                while (!left.load() && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5))
-                {
-                    if (sc->done.load()) { left.store(true); break; }
-                    usleep(1000);
-                }
-            });
-            waiter.join();
-            if (side_->done.load()) sideThread_.join();
-            else sideThread_.detach();   // never block the process teardown on an uncooperative MPI progress
-        }
-        if (side_->done.load() || !sideThreadOk_)
-        {
-            MPI_Comm_free(&sideComm_);
-            MPI_Comm_free(&statusComm_);
-        }
+        joinSideThread();
+        MPI_Comm_free(&sideComm_);
+        MPI_Comm_free(&statusComm_);
         sideOn_ = false;
     }
 
     struct SideChannel
     {
+        std::mutex m;                    // side thread's MPI round vs. collective shutdown
         std::vector<AbortRec> recv;
         MPI_Request req = MPI_REQUEST_NULL;
         bool active = false;
@@ -1437,13 +1499,16 @@ protected:
 
     MPI_Comm sideComm_ = MPI_COMM_NULL;
     MPI_Comm statusComm_ = MPI_COMM_NULL;
-    bool sideOn_ = false, sideThreadOk_ = false;
+    bool sideOn_ = false, sideThreadOk_ = false, sideQuiesced_ = false;
+    int sideShutdownSpins_ = 0;
+    std::atomic<bool> sideClosing_{false};
     std::thread sideThread_;
 
 private:
     void sideRound(SideChannel& sc)
     {
-        if (!sideOn_) return;
+        if (!sideOn_ || sideClosing_.load(std::memory_order_acquire)) return;
+        std::lock_guard<std::mutex> lk(sc.m);
         if (!sc.active)
         {
             AbortRec mine;
@@ -1455,13 +1520,26 @@ private:
                 std::strncpy(mine.msg, got.second.c_str(), sizeof(mine.msg) - 1);
             }
             const int rc = MPI_Iallgather(&mine, sizeof(AbortRec), MPI_BYTE, sc.recv.data(), sizeof(AbortRec), MPI_BYTE, sideComm_, &sc.req);
-            if (rc != MPI_SUCCESS) return;
+            if (rc != MPI_SUCCESS)
+            {
+                // A peer already left (abort/finalize): the channel cannot complete another round. Stop it
+                // rather than retrying forever -- the abort record has already been published to `abortState_`.
+                sideClosing_.store(true, std::memory_order_release);
+                return;
+            }
             sc.active = true;
             return;
         }
         int done = 0;
-        if (MPI_Test(&sc.req, &done, MPI_STATUS_IGNORE) != MPI_SUCCESS) { sc.active = false; return; }
-        if (!done) return;
+        if (MPI_Test(&sc.req, &done, MPI_STATUS_IGNORE) != MPI_SUCCESS)
+        {
+            // Truncated/incomplete round after a peer's abort: not a process-fatal error. The request is dropped
+            // (a collective cannot be cancelled) and the channel stops; the published record still propagates.
+            sc.req = MPI_REQUEST_NULL;
+            sc.active = false;
+            sideClosing_.store(true, std::memory_order_release);
+            return;
+        }
         sc.active = false;
         for (int r = 0; r < size_; ++r)
             if (sc.recv[r].flag) abortState_->publishRemote(r, sc.recv[r].msg);
@@ -1476,9 +1554,8 @@ private:
             if (st->pending.load(std::memory_order_acquire)) onSideAbort();
             usleep(1000);
         }
-        // Shutdown: abandon the outstanding round (a collective request is not cancellable; the handle is dropped
-        // and the operation finishes on the duplicated communicator, which MPI_Finalize reaps).
-        if (sc->active) { sc->req = MPI_REQUEST_NULL; sc->active = false; }
+        // quiesceSideChannel completed the last round collectively: no abandoned NBC request is left here, and
+        // the communicator is freed only after this thread has been joined.
         sc->done.store(true, std::memory_order_release);
     }
 
@@ -1512,6 +1589,8 @@ namespace {
 MpiHostComm::~MpiHostComm()
 {
     cancelLive();         // no pinned/device buffer may be released with an MPI request still pointing at it
+    try { quiesceSideChannel(); }
+    catch (const std::exception&) { stopSideChannel(); }   // destruction still joins the thread before freeing
     stopSideChannel();
 }
 } // namespace
@@ -1624,7 +1703,12 @@ public:
     ~NcclComm() override
     {
         if (size_ == 1) return;
+        // Every rank must arrive here together: finish the side channel's outstanding NBC round BEFORE freeing
+        // either NCCL or MPI communicators. The base destructor repeats this idempotently after NCCL teardown.
+        try { quiesceSideChannel(); }
+        catch (const std::exception&) { stopSideChannel(); }
         stopSideChannel();    // joins the watchdog before the communicators it polls are destroyed
+        std::lock_guard<std::mutex> lk(ncclM_);   // no watchdog abort may interleave with NCCL teardown
         cudaStreamSynchronize(wst_);
         // The two communicators are PROCESS-LIFETIME. They are deliberately NOT destroyed here: once conditional-WHILE
         // solver graphs have run on the graph communicator, ncclCommFinalize/Destroy/Abort all funnel into NCCL's
@@ -1744,6 +1828,11 @@ protected:
 
     void abortSeen() override
     {
+        // Once per communicator generation. The watchdog can publish and abort before the status phase; repeated
+        // throws on later ranks must not revoke a partially recovered generation a second time.
+        if (recoveryDone_) return;
+        recoveryDone_ = true;
+        std::lock_guard<std::mutex> lk(ncclM_);   // the watchdog's ncclCommAbort runs outside this whole recovery
         // Every rank passes through here at the same status phase. Peers may have NCCL kernels enqueued against
         // the failed rank that never complete: stop them, then rebuild both communicators collectively.
         // A LOCAL failure of revoke/quiesce/destroy must NEVER skip the collective barrier: the local outcome is
@@ -1843,11 +1932,14 @@ protected:
     void onSideAbort() override
     {
         if (abortedByWatchdog_.exchange(true)) return;
-        // ncclCommAbort leaves the handle dangling: NULL it here so the recovery below never revokes, polls or
-        // destroys an already-aborted communicator (a segfault in NCCL), and so no new work can be enqueued.
+        // NCCL is not re-entrant across threads: the watchdog must not run ncclCommAbort while the main thread
+        // is inside ncclCommRevoke / recovery / destruction (it deadlocks in commFree). Take the same lock the
+        // recovery and the destructor hold, so the abort happens between two main-thread NCCL phases.
+        std::lock_guard<std::mutex> lk(ncclM_);
         for (int c = 0; c < 2; ++c)
             if (comm_[c]) { ncclCommAbort(comm_[c]); comm_[c] = nullptr; }   // releases blocked NCCL kernels
     }
+    std::mutex ncclM_;                          // serializes NCCL calls: watchdog abort vs. recovery/destruction
 
 private:
     ncclComm_t comm_[2] = {nullptr, nullptr};   // 0 eager, 1 graph-only
@@ -1856,6 +1948,7 @@ private:
     std::size_t cap_ = 4096;                    // doubles per rank of one device reduction
     std::string broken_;                        // set when re-creating the communicators after an abort failed
     std::atomic<bool> abortedByWatchdog_{false};  // onSideAbort runs once per communicator generation
+    bool recoveryDone_ = false;                 // abortSeen runs once per communicator generation
     int opStatus_ = -1;                             // BRAE_NCCL_OP_STATUS=0: pure enqueue-only device ops
     cudaStream_t wst_ = nullptr;
 

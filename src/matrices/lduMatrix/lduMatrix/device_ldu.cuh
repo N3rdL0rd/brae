@@ -45,6 +45,10 @@ struct DeviceProcView
     const scalar* coeff = nullptr;      // [nFaces] see above
     const label*  rank = nullptr;       // [nFaces] place among the cell's processor faces (null: one launch)
     int nRanks = 1;
+    // Grouped launch plan, built with the interface: faces of pass p occupy the contiguous range
+    // [passFirst[p], passFirst[p+1]) of a pass-permuted copy of the face arrays. Null = legacy full-face filter.
+    const label*  passStart = nullptr;
+    int           passFirst[65] = {};   // host copy (nRanks <= 64), so a launch never downloads the ranges
     long long nGlobalCells = 0;         // sum of nCells over all ranks: the divisor of a global average (normFactor)
     bool active() const { return plan != nullptr; }
 };

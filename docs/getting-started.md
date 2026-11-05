@@ -56,7 +56,7 @@ Toolchain notes:
 - **One binary for several GPUs:** `-DCMAKE_CUDA_ARCHITECTURES="70;90;120"` (a fat build takes about 3 minutes longer).
 - **Run-time libraries:** the toolkit's `libnvrtc` must be found; if the toolkit is not installed system-wide, export
   `LD_LIBRARY_PATH=$CUDA_HOME/lib64`.
-- **NVSHMEM** is no longer used by the multi-GPU code; configure with `-DBRAE_WITH_NVSHMEM=OFF` on machines without it
+- **NVSHMEM** was removed: the multi-GPU code uses ProcComm (MPI-host or NCCL); no NVSHMEM installation or CMake option remains
   (a DGX-1 has no NVSwitch, and its unlinked GPU pairs cannot use it). See [Multi-GPU](multi-gpu.md).
 - A ready-made V100 benchmark (old build against new build on the tank case) is in `tools/bench_v100/`.
 

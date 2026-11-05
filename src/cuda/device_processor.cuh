@@ -2,7 +2,7 @@
 // brae::DeviceProcInterface, the multi-GPU interface of one rank's device mesh (InterFoamStep.md WP1/WP4).
 //
 // A processor patch lives TWICE on the device, on purpose:
-//   * as the LAST boundary faces of DeviceMesh (bcType 8, DeviceBoundary / DeviceProcStress), so that the sum-class
+//   * as the LAST boundary faces of DeviceMesh (bcType 8, DeviceBoundary), so that the sum-class
 //     operators (div, grad, reconstruct, Courant) add them in OpenFOAM's face order through the boundary-value
 //     slot: processor face j is boundary face dm.nBndFacesPhys + j;
 //   * as `cyc`, a DeviceCyclic (the translational interface kernels, the per-owner-cell CSR with its ifRank sum
