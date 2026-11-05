@@ -1540,6 +1540,11 @@ private:
             sideClosing_.store(true, std::memory_order_release);
             return;
         }
+        // MPI_Test only releases the request when done is true. An incomplete poll must
+        // leave both the request and its receive buffer owned by this round: starting the
+        // next allgather here leaks live requests and lets them overwrite one another (and
+        // eventually MPI's own teardown allocations).
+        if (!done) return;
         sc.active = false;
         for (int r = 0; r < size_; ++r)
             if (sc.recv[r].flag) abortState_->publishRemote(r, sc.recv[r].msg);
