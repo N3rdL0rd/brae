@@ -174,6 +174,7 @@ std::string readWhole(const std::string& path)
     return std::string(b.begin(), b.end());
 }
 
+
 std::string dirOf(const std::string& p)
 {
     const auto s = p.find_last_of('/');
@@ -657,7 +658,9 @@ TokenStream::TokenStream(const std::string& path, bool expandVars)
     // Then in-file $variable macros, if requested (field reader). Done AFTER includes so a var defined in an included
     // fragment is visible. expandDictVariables strips comments + substitutes $name/${name}; stripComments below is then
     // a no-op. polyMesh/non-field reads skip this entirely (expandVars=false).
-    if (expandVars) txt = expandDictVariables(txt);
+    // A binary G4 restart expands to hundreds of MB of numeric ASCII. Macro expansion must not scan that
+    // payload again when there is no '$' anywhere in the transcoded dictionary; with a '$' it stays exact.
+    if (expandVars && txt.find('$') != std::string::npos) txt = expandDictVariables(txt);
     txt = expandEvalDirectives(txt);   // after $macros: #eval bodies reference them
     std::vector<std::string> all = tokenize(stripComments(txt));
 

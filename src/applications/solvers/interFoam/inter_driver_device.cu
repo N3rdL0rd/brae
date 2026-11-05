@@ -8917,6 +8917,7 @@ RunReport runInterFoamDevice(
             }
             std::vector<scalar> prghW, pW, ux, uy, uz;
             // A function object may already have downloaded this step's final alpha; the writer shares it.
+            const brae::fo::FunctionObjectState foState = fos ? fos->state() : brae::fo::FunctionObjectState{};
             const std::vector<scalar>& aW = srcAlpha();
             syncPrghPatches();
             dPrgh.copyTo(prghW);
@@ -8999,9 +9000,51 @@ RunReport runInterFoamDevice(
             const std::vector<std::vector<scalar>> pB =
                 pPatchesFrozen ? pBFrozen : staticPressureBoundary(f.p_rgh, stepRhoBnd, f.ghfBoundary);
             InterWriteState ws;
+            // A processor patch's host field is an inert placeholder while the step runs. Bring its written
+            // values from the device's final state: p_rgh's fixed-gradient evaluate is already in dPVal
+            // (including the processor snGrad); U's coupled value is w*own + (1-w)*neighbour. Alpha's
+            // contact-angle download above has already done the same for its processor entries. This must
+            // happen AFTER syncPrghPatches(), whose physical-patch evaluate deliberately knows no halo.
+            if (procCtx)
+            {
+                std::vector<scalar> tail;
+                if (pDevicePatches)
+                {
+                    tail.resize(static_cast<std::size_t>(procCtx->nFaces()));
+                    cudaCheck(cudaMemcpy(tail.data(), dPVal.data() + procCtx->bndStart(),
+                                         tail.size()*sizeof(scalar), cudaMemcpyDeviceToHost),
+                              "the processor faces' p_rgh down for the writer");
+                    std::size_t at = 0;
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        if (!isProcessorType(fvp[pi].type)) continue;
+                        const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                        f.p_rgh.boundary[pi]->setStoredValues(
+                            std::vector<scalar>(tail.begin() + at, tail.begin() + at + n));
+                        at += n;
+                    }
+                }
+                DeviceBuffer<scalar> pv[3];
+                procExchange(*procCtx, {&dUx, &dUy, &dUz}, "U for the processor writer");
+                for (int k = 0; k < 3; ++k)
+                    deviceCyclicFaceValue(procCtx->cyc(), k == 0 ? dUx : k == 1 ? dUy : dUz, pv[k]);
+                std::vector<scalar> uv[3];
+                for (int k = 0; k < 3; ++k) pv[k].copyTo(uv[k]);
+                std::size_t at = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (!isProcessorType(fvp[pi].type)) continue;
+                    const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                    std::vector<vector> v(n);
+                    for (std::size_t j = 0; j < n; ++j) v[j] = vector{uv[0][at+j], uv[1][at+j], uv[2][at+j]};
+                    f.U.boundary[pi]->setStoredValues(std::move(v));
+                    at += n;
+                }
+            }
             ws.time = rep.time;
             ws.timeIndex = f.startTimeIndex + rep.steps;
             ws.deltaT = rep.deltaT;
+            ws.functionObjects = fos ? &foState : nullptr;
             ws.alpha1 = &f.alpha1;
             ws.U = &f.U;
             ws.p_rgh = &f.p_rgh;
@@ -9136,9 +9179,11 @@ RunReport runInterFoamDevice(
             lo = pg::min(lo);   // -parallel: the line is the whole run's range (identity without a communicator)
             hi = pg::max(hi);
             std::printf("   t = %.17g  dt = %.17g  Co %.3f  alphaCo %.3f  [device]  "
-                        "alpha [%.3e, %.15g]\n",
+                        "alpha [%.3e, %.15g]%s%d%s\n",
                         (double)rep.time, (double)rep.deltaT, (double)rep.CoNum,
-                        (double)rep.alphaCoNum, (double)lo, (double)hi);
+                        (double)rep.alphaCoNum, (double)lo, (double)hi,
+                        roots.parallel ? "  [rank " : "", roots.parallel ? roots.rank : 0,
+                        roots.parallel ? "]" : "");
         }
         if (foStop)
         {

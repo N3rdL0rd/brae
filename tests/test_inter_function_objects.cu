@@ -549,6 +549,44 @@ int main()
                   tk.size() >= 9 && near(std::stod(tk[3]), mn, 1e-9) && near(std::stod(tk[8]), mx, 1e-9));
         }
     }
+    Fixture stateFx;
+    const std::string stateDir = tmpDir("state");
+    FoamDict stateDict = dictOf(stateDir, withThreshold(1e30));
+    auto stateList = FunctionObjectList::read(stateDict, stateFx.services(stateDir));
+    for (label i = 1; i <= 12; ++i)
+    {
+        stateFx.setStep(i);
+        Step s; s.timeIndex = i; s.time = i*0.0005; s.deltaT = 0.0005; s.sinceStart = s.time;
+        stateList->execute(s);
+    }
+    const FunctionObjectState st = stateList->state();
+    {
+        const auto scalarOf = [&](const std::string& object, const std::string& key) -> const FunctionObjectState::Value&
+        {
+            return st.results.at(object).at("scalar").at(key);
+        };
+        check("volume result keys include the operation", scalarOf("liquid_total", "volIntegrate(alpha.water)").width >= 0
+              && scalarOf("liquid_zoneA", "volIntegrate(zoneA,alpha.water)").width >= 0);
+        check("surface result keys include the operation and patch",
+              scalarOf("windowCoverage", "areaAverage(left,alpha.water)").width >= 0
+              && scalarOf("windowMin", "min(left,alpha.water)").width >= 0);
+        check("the stop's live integral is saved", scalarOf("speedLive", "volIntegrate(alphaUz)").width >= 0);
+        check("probe and min/max results are saved", st.results.at("probes").at("scalar").count("average(alpha.water)")
+              && st.results.at("minMaxU").at("scalar").count("max(mag(U))"));
+        check("runTimeControl condition properties are saved", st.properties.at("__control_pulseStop").size() == 1
+              && st.properties.at("__control_pulseStop")[0].find("pulseStop\n{\n    speedReached") != std::string::npos);
+
+        const std::string savedDir = tmpDir("savedState");
+        const std::string saved = savedDir + "/uniform/functionObjects";
+        std::filesystem::create_directories(saved);
+        std::ofstream os(saved + "/functionObjectProperties");
+        os << "cdf7e925f5746741c316f5fbcf39ad0dfca90775 { speedLive { scalar { volIntegrate(alphaUz) 123.5; } } "
+              "liquid_zoneA { scalar { volIntegrate(zoneA,alpha.water) 7.25; } } }\n";
+        os.close();
+        FoamDict rd = dictOf(dir, withThreshold(1e30));
+        auto restarted = FunctionObjectList::read(rd, fx.services(dir), savedDir);
+        check("saved scalar results are available before their next monitor", restarted != nullptr);
+    }
     check("an object that is not ported (surfaces) wrote nothing", !std::filesystem::exists(pp + "/interface"));
     check("an exprField wrote no directory (autowrite false)", !std::filesystem::exists(pp + "/alphaUz"));
     check("speedLive wrote no file (writeToFile false)", !std::filesystem::exists(pp + "/speedLive"));

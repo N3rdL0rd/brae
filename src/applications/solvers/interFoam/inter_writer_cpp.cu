@@ -1529,7 +1529,8 @@ InterWriter::InterWriter(
   : outRoot_(roots.procDir),
     startDir_(startDir),
     patches_(patches),
-    phase1_(phase1Name)
+    phase1_(phase1Name),
+    parallel_(roots.parallel)
 {
     const FoamDict cd = readDict(roots.dictDir + "/system/controlDict");
 
@@ -1776,6 +1777,9 @@ bool InterWriter::binaryFile(const std::string& className) const
     //   BRAE_CONTROL_WRITE_V0_ASCII_HEADER=1: a gate's CONTROL, deliberately wrong -- `Field` alone.
     static const bool internalAsText = std::getenv("BRAE_CONTROL_WRITE_V0_ASCII_HEADER") != nullptr;
     const bool field = endsWith("Field") || (endsWith("Field::Internal") && !internalAsText);
+    // uniformDimensionedScalarField is regIOobject-written with the run's format too (the value is a scalar
+    // token, not a list). OpenFOAM's uniform/cumulativeContErr is labelled binary under writeFormat binary.
+    if (className == "uniformDimensionedScalarField") return true;
     const bool geometric = className.compare(0, 3, "vol") == 0 || className.compare(0, 7, "surface") == 0
                         || className.compare(0, 5, "point") == 0;
     return field && (geometric || className == "vectorField");
@@ -3434,8 +3438,8 @@ void InterWriter::write(const InterWriteState& s)
         emit(dir + "/uniform/" + object, os.str(), true);
     }
 
-    // uniform/cumulativeContErr (initContinuityErrs.H:40-52), and the function objects' state file,
-    // empty because brae runs none
+    // uniform/cumulativeContErr (initContinuityErrs.H:40-52), and the function objects' restart state
+    // (functionObjectList::write after the step's objects have run).
     {
         std::ostringstream os;
         os << header("uniformDimensionedScalarField", name + "/uniform", "cumulativeContErr");
@@ -3448,6 +3452,34 @@ void InterWriter::write(const InterWriteState& s)
     {
         std::ostringstream os;
         os << header("dictionary", name + "/uniform/functionObjects", "functionObjectProperties");
+        if (parallel_ && s.functionObjects)
+        {
+            const brae::fo::FunctionObjectState& st = *s.functionObjects;
+            for (const auto& prop : st.properties)
+            {
+                for (const std::string& line : prop.second) os << line << "\n";
+            }
+            if (!st.results.empty())
+            {
+                os << "\ncdf7e925f5746741c316f5fbcf39ad0dfca90775\n{\n";
+                for (const auto& object : st.results)
+                {
+                    os << "    " << object.first << "\n    {\n";
+                    for (const auto& type : object.second)
+                    {
+                        os << "        " << type.first << "\n        {\n";
+                        for (const auto& value : type.second)
+                        {
+                            os << "            " << std::left << std::setw(value.second.width) << value.first
+                               << " " << value.second.text << ";\n";
+                        }
+                        os << "        }\n";
+                    }
+                    os << "    }\n";
+                }
+                os << "}\n";
+            }
+        }
         os << "\n\n// ************************************************************************* //\n";
         emit(dir + "/uniform/functionObjects/functionObjectProperties", os.str(), true);
     }

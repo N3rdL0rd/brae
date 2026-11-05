@@ -267,8 +267,14 @@ int main(int argc, char** argv)
         }
     }
 
+    // The communicator is needed by the case reader as well as by the time loop (pRefPoint, deltaN and
+    // function-object setup). Guard the WHOLE invocation: a rank-local reader/start-up exception must be
+    // published, not turn into an anonymous timeout in another rank's first collective.
+    std::unique_ptr<brae::cpu::interFoam::InterProcComm> procComm;
     try
     {
+        try
+        {
         using namespace brae;
         using namespace brae::cpu::interFoam;
 
@@ -364,6 +370,10 @@ int main(int argc, char** argv)
             cpu::interFoam::refuseUnderParallel(roots, m.patches());
         }
         cpu::interFoam::refuseProcessorCoupling(roots, m.patches());
+        if (roots.parallel && onDevice)
+        {
+            procComm = std::make_unique<InterProcComm>(argc, argv, roots);
+        }
         FvGeometry g;
         g.build(m);
         // mirrorACMI: this loop couples a coincident cyclicACMI pair itself; the device loop, handed the
@@ -442,22 +452,22 @@ int main(int argc, char** argv)
         {
             throw std::runtime_error("BRAE_MGPU_STAGE_DUMP needs `-device` (serial for the np = 1 floor, or -parallel).");
         }
-        std::unique_ptr<InterProcComm> procComm;
-        if (roots.parallel && onDevice)
-        {
-            procComm = std::make_unique<InterProcComm>(argc, argv, roots);
-        }
 
         DeviceInterStepTaps stageTaps;
         DeviceInterStepTaps* const taps = mgpuStageDumpDir().empty() ? nullptr : &stageTaps;
         // ONE case translation and ONE time loop per path, both the ones the gates call. A private
         // copy here would be the defect this file's header names.
-        const RunReport r = onDevice
-            ? runInterFoamDevice(roots, startDir, m, g, patches, nSteps, /*verbose=*/true,
-                                 /*fieldsOut=*/nullptr, endTime, taps, &mutableMesh, &writer)
-            : runInterFoam(roots, startDir, m, g, patches, nSteps, /*verbose=*/true,
-                           /*fieldsOut=*/nullptr, endTime, /*pressureTaps=*/nullptr, &mutableMesh,
-                           /*alphaTaps=*/nullptr, &writer);
+        RunReport r;
+        const auto runLoop = [&]() {
+            r = onDevice
+                ? runInterFoamDevice(roots, startDir, m, g, patches, nSteps, /*verbose=*/true,
+                                     /*fieldsOut=*/nullptr, endTime, taps, &mutableMesh, &writer)
+                : runInterFoam(roots, startDir, m, g, patches, nSteps, /*verbose=*/true,
+                               /*fieldsOut=*/nullptr, endTime, /*pressureTaps=*/nullptr, &mutableMesh,
+                               /*alphaTaps=*/nullptr, &writer);
+        };
+        if (procComm) procComm->comm().guarded(runLoop);
+        else runLoop();
 
         if (r.steps >= nSteps && r.time < endTime - scalar(0.5)*r.deltaT)
         {
@@ -489,6 +499,16 @@ int main(int argc, char** argv)
         std::printf("End: t = %.6g, alpha in [%.3e, %.8f], max|U| %.4g m/s, worst |div(phi)| %.3e\n",
                     (double)r.time, (double)r.alphaMin, (double)r.alphaMax,
                     (double)r.maxU, (double)r.worstDivPhi);
+        }
+        catch (const brae::ProcCommAbort&)
+        {
+            throw;
+        }
+        catch (const std::exception& e)
+        {
+            if (procComm) procComm->comm().collectiveAbort(e.what());
+            throw;
+        }
         return 0;
     }
     catch (const std::exception& e)

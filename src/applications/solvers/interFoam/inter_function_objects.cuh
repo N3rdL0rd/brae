@@ -951,6 +951,12 @@ public:
         return o->second.at(key);
     }
 
+    bool hasResult(const std::string& object, const std::string& key) const
+    {
+        const auto o = results.find(object);
+        return o != results.end() && o->second.count(key) != 0;
+    }
+
     // Compile an expression once, after all exprFields have been read. An empty cached tree means the host
     // evaluator owns this field; no unsupported construct is silently approximated.
     const std::vector<DeviceExpr>* deviceExpression(const std::string& field)
@@ -1098,6 +1104,41 @@ private:
     }
 };
 
+// The uniform/functionObjects/functionObjectProperties file is a restart input as well as an output:
+// runTimeControl reads its condition properties and condition queries read these results. Keep the same
+// three-level result dictionary as OpenFOAM's functionObjects::properties (SHA1("results"), object,
+// value type), rather than a flat map that OpenFOAM would silently ignore.
+struct FunctionObjectState
+{
+    struct Value
+    {
+        std::string type;
+        std::string text;
+        int         width = 0;
+    };
+    std::map<std::string, std::map<std::string, std::map<std::string, Value>>> results;
+    std::map<std::string, std::vector<std::string>> properties;
+
+    void scalar(const std::string& object, const std::string& key, double value, int width = 0)
+    {
+        std::ostringstream os;
+        os.precision(16);
+        os << value;
+        results[object]["scalar"][key] = Value{"scalar", os.str(), width};
+    }
+    void vector(const std::string& object, const std::string& key, double x, double y, double z)
+    {
+        std::ostringstream os;
+        os.precision(12);
+        os << "( " << x << ' ' << y << ' ' << z << " )";
+        results[object]["vector"][key] = Value{"vector", os.str(), 0};
+    }
+    void label(const std::string& object, const std::string& key, long long value)
+    {
+        results[object]["label"][key] = Value{"label", std::to_string(value), 0};
+    }
+};
+
 // ---------------------------------------------------------------------------------------------------------------
 // the objects
 // ---------------------------------------------------------------------------------------------------------------
@@ -1118,6 +1159,8 @@ public:
     virtual bool evaluate(const Step&, Runtime&) { return false; }
     // Integrals that were queued during write() are emitted after the Source's one batched device call.
     virtual void afterDeviceBatch(const Step&, Runtime&) {}
+    // Latest values that OpenFOAM persists for a restart (not the time-series output).
+    virtual void saveState(FunctionObjectState&) const {}
 };
 
 inline void refuseKey(const FoamDict& d, const std::string& object, const char* key, const char* why)
@@ -1197,6 +1240,7 @@ struct CellRegion
     bool                all = true;
     std::vector<label>  cells;
     std::string         description;
+    std::string         zone;
     scalar              volume = 0;
     label               n = 0;
 };
@@ -1228,6 +1272,7 @@ inline CellRegion readCellRegion(const FoamDict& d, const std::string& object, R
         r.all = false;
         r.cells = it->second;
         r.description = "cellZone " + zone;
+        r.zone = zone;
         r.n = static_cast<label>(r.cells.size());
         for (label c : r.cells)
         {
@@ -1331,6 +1376,16 @@ public:
     }
 
 
+    void saveState(FunctionObjectState& st) const override
+    {
+        for (const auto& result : latest_)
+        {
+            const std::string key = op_ + "(" + (region_.all ? std::string() : region_.zone + ",")
+                                  + result.first + ")";
+            st.scalar(name, key, result.second);
+        }
+    }
+
     void afterDeviceBatch(const Step& s, Runtime& rt) override
     {
         if (deviceDue_) emit(s, rt);
@@ -1342,6 +1397,7 @@ private:
     CellRegion                region_;
     bool                      writeToFile_ = true;
     DatFile                   dat_;
+    std::map<std::string, scalar> latest_;
     std::vector<const std::vector<scalar>*> deviceResults_;
     std::vector<std::shared_ptr<void>>    devicePlans_;
     bool                      deviceDue_ = false;
@@ -1403,6 +1459,7 @@ private:
         for (std::size_t i = 0; i < fields_.size(); ++i)
         {
             rt.results[name][op_ + "(" + fields_[i] + ")"] = values[i];
+            latest_[fields_[i]] = values[i];
             line += "\t" + fmtNum(values[i], rt.svc.precision);
         }
         if (writeToFile_) dat_.row(line);
@@ -1533,6 +1590,11 @@ public:
         dat_.header(h);
     }
 
+    void saveState(FunctionObjectState& st) const override
+    {
+        for (const auto& result : latest_) st.scalar(name, op_ + "(" + patchName_ + "," + result.first + ")", result.second);
+    }
+
     void write(const Step& s, Runtime& rt) override
     {
         const std::vector<scalar>& a = (*rt.svc.patches)[static_cast<std::size_t>(patch_)].magSf;
@@ -1566,6 +1628,7 @@ public:
             if (op_ == "min") value = mn;
             if (op_ == "max") value = mx;
             rt.results[name][op_ + "(" + f + ")"] = value;
+            latest_[f] = value;
             line += "\t" + fmtNum(value, rt.svc.precision);
         }
         if (writeToFile_)
@@ -1582,6 +1645,7 @@ private:
     label                     nFaces_ = 0;
     bool                      writeToFile_ = true;
     DatFile                   dat_;
+    std::map<std::string, scalar> latest_;
 };
 
 // OpenFOAM's polyMesh::findCell with its default decomposition (CELL_TETS), for a handful of points. A cell is
@@ -1823,6 +1887,42 @@ public:
         }
     }
 
+    void saveState(FunctionObjectState& st) const override
+    {
+        for (const auto& item : latest_)
+        {
+            const std::string& f = item.first;
+            const std::vector<double>& v = item.second;
+            const int nComp = (f == "U") ? 3 : 1;
+            if (v.empty()) continue;
+            auto stat = [&](int component, bool wantMin, bool average)
+            {
+                double x = wantMin ? std::numeric_limits<double>::max()
+                                   : average ? 0.0 : -std::numeric_limits<double>::max();
+                for (std::size_t i = static_cast<std::size_t>(component); i < v.size(); i += static_cast<std::size_t>(nComp))
+                {
+                    if (average) x += v[i];
+                    else if (wantMin) x = std::min(x, v[i]);
+                    else x = std::max(x, v[i]);
+                }
+                return average ? x/static_cast<double>(v.size()/static_cast<std::size_t>(nComp)) : x;
+            };
+            st.label(name, "size(" + f + ")", static_cast<long long>(v.size()/static_cast<std::size_t>(nComp)));
+            if (nComp == 1)
+            {
+                st.scalar(name, "average(" + f + ")", stat(0, false, true), 17);
+                st.scalar(name, "min(" + f + ")", stat(0, true, false), 13);
+                st.scalar(name, "max(" + f + ")", stat(0, false, false), 13);
+            }
+            else
+            {
+                st.vector(name, "average(" + f + ")", stat(0, false, true), stat(1, false, true), stat(2, false, true));
+                st.vector(name, "min(" + f + ")", stat(0, true, false), stat(1, true, false), stat(2, true, false));
+                st.vector(name, "max(" + f + ")", stat(0, false, false), stat(1, false, false), stat(2, false, false));
+            }
+        }
+    }
+
     void write(const Step& s, Runtime& rt) override
     {
         const Services::Reduce& red = rt.svc.red;
@@ -1859,11 +1959,14 @@ public:
             const std::vector<std::vector<double>> all = red.gatherToMaster(mine);
             std::string line = fmtNum(s.time, rt.svc.precision);
             std::vector<std::size_t> cursor(all.size(), 0);
+            std::vector<double> stateValues;
+            stateValues.reserve(cells_.size()*static_cast<std::size_t>(nComp));
             for (std::size_t pi = 0; pi < cells_.size(); ++pi)
             {
                 const std::size_t r = static_cast<std::size_t>(owner_[pi]);
                 const double* v = all[r].data() + cursor[r];
                 cursor[r] += static_cast<std::size_t>(nComp);
+                for (int j = 0; j < nComp; ++j) stateValues.push_back(v[j]);
                 if (f == "U")
                 {
                     line += " (" + fmtNum(v[0], rt.svc.precision) + " " + fmtNum(v[1], rt.svc.precision) + " "
@@ -1874,6 +1977,7 @@ public:
                     line += " " + fmtNum(v[0], rt.svc.precision);
                 }
             }
+            latest_[f] = std::move(stateValues);
             files_[k].row(line);
         }
     }
@@ -1884,6 +1988,7 @@ private:
     std::vector<label>       cells_;     // this rank's cell of each kept probe, -1 when another rank owns it
     std::vector<int>         owner_;     // the owning rank of each kept probe
     std::vector<DatFile>     files_;
+    std::map<std::string, std::vector<double>> latest_;
 };
 
 class FieldMinMax : public Object
@@ -1914,6 +2019,23 @@ public:
                     "max             location(max)           processor");
     }
 
+    void saveState(FunctionObjectState& st) const override
+    {
+        for (const auto& item : latest_)
+        {
+            const std::string& f = item.first;
+            const std::vector<double>& v = item.second;
+            st.scalar(name, "min(" + f + ")", v[0], 13);
+            st.scalar(name, "max(" + f + ")", v[1], 13);
+            st.vector(name, "min(" + f + ")_position", v[2], v[3], v[4]);
+            st.vector(name, "max(" + f + ")_position", v[5], v[6], v[7]);
+            st.label(name, "min(" + f + ")_cell", static_cast<long long>(v[8]));
+            st.label(name, "max(" + f + ")_cell", static_cast<long long>(v[9]));
+            st.label(name, "min(" + f + ")_processor", static_cast<long long>(v[10]));
+            st.label(name, "max(" + f + ")_processor", static_cast<long long>(v[11]));
+        }
+    }
+
     void write(const Step& s, Runtime& rt) override
     {
         const std::vector<vector>& C = rt.svc.geom->C();
@@ -1924,6 +2046,13 @@ public:
         };
         for (const std::string& f : fields_)
         {
+            auto save = [&](const std::string& label, double mn, double mx,
+                            const vector& cmin, const vector& cmax, long long imin, long long imax, int pmin, int pmax)
+            {
+                latest_[label] = {mn, mx, cmin.x, cmin.y, cmin.z, cmax.x, cmax.y, cmax.z,
+                                  static_cast<double>(imin), static_cast<double>(imax),
+                                  static_cast<double>(pmin), static_cast<double>(pmax)};
+            };
             auto emit = [&](const std::string& label, const std::vector<scalar>& val)
             {
                 const Services::Reduce& red = rt.svc.red;
@@ -1937,13 +2066,14 @@ public:
                     }
                     dat_.row(fmtNum(s.time, rt.svc.precision) + "\t" + label + "\t" + fmtNum(val[imin], rt.svc.precision)
                              + "\t" + vec3(imin) + "\t0\t" + fmtNum(val[imax], rt.svc.precision) + "\t" + vec3(imax) + "\t0");
+                    save(label, val[imin], val[imax], C[imin], C[imax], imin, imax, 0, 0);
                     return;
                 }
                 // fieldMinMax::calcMinMaxFieldType: each rank's extremum (the FIRST cell on a tie; a rank with
                 // no cells offers +max / -max and the centre 0), gathered; the winner is the first rank in
                 // rank order whose value is STRICTLY better, and its value, location and rank are the row
                 const scalar big = std::numeric_limits<scalar>::max();
-                std::vector<double> mine = {big, 0, 0, 0, -big, 0, 0, 0};
+                std::vector<double> mine = {big, 0, 0, 0, -big, 0, 0, 0, -1, -1};
                 if (!val.empty())
                 {
                     std::size_t imin = 0, imax = 0;
@@ -1952,7 +2082,8 @@ public:
                         if (val[i] < val[imin]) imin = i;
                         if (val[i] > val[imax]) imax = i;
                     }
-                    mine = {val[imin], C[imin].x, C[imin].y, C[imin].z, val[imax], C[imax].x, C[imax].y, C[imax].z};
+                    mine = {val[imin], C[imin].x, C[imin].y, C[imin].z, val[imax], C[imax].x, C[imax].y, C[imax].z,
+                            static_cast<double>(imin), static_cast<double>(imax)};
                 }
                 const std::vector<std::vector<double>> all = red.gatherToMaster(mine);
                 std::size_t pmin = 0, pmax = 0;
@@ -1970,6 +2101,11 @@ public:
                          + "\t" + at(all[pmin], 1) + "\t" + std::to_string(pmin) + "\t"
                          + fmtNum(all[pmax][4], rt.svc.precision) + "\t" + at(all[pmax], 5) + "\t"
                          + std::to_string(pmax));
+                save(label, all[pmin][0], all[pmax][4],
+                     vector{all[pmin][1], all[pmin][2], all[pmin][3]},
+                     vector{all[pmax][5], all[pmax][6], all[pmax][7]},
+                     static_cast<long long>(all[pmin][8]), static_cast<long long>(all[pmax][8]),
+                     static_cast<int>(pmin), static_cast<int>(pmax));
             };
             if (f == "U")
             {
@@ -2011,6 +2147,7 @@ private:
     std::vector<std::string> fields_;
     std::string              mode_;
     DatFile                  dat_;
+    std::map<std::string, std::vector<double>> latest_;
 };
 
 class ExprField : public Object
@@ -2133,6 +2270,14 @@ public:
         }
     }
 
+    void saveState(FunctionObjectState& st) const override
+    {
+        std::string text = name + "\n{\n";
+        for (const Cond& c : conds_) text += "    " + c.name + "\n    {\n    }\n";
+        text += "}\n";
+        st.properties["__control_" + name] = {text};
+    }
+
     bool canEnd() const { return true; }
     bool evaluatesEveryStep() const override { return true; }
     void write(const Step&, Runtime&) override {}
@@ -2148,6 +2293,20 @@ public:
         bool met = true;
         for (const Cond& c : conds_)
         {
+            // minMaxCondition::apply skips an unavailable saved result (and warns), rather than applying
+            // the condition to zero. This matters on the first step of a restart whose monitor is not due.
+            bool available = true;
+            for (const std::string& f : c.fields) available = available && rt.hasResult(c.object, f);
+            if (!available)
+            {
+                met = false;
+                if (say)
+                {
+                    std::printf("    minMax: %s %s: saved result unavailable; condition not applied\n",
+                                c.maximum ? "maximum" : "minimum", c.fields.front().c_str());
+                }
+                continue;
+            }
             scalar value = c.maximum ? -std::numeric_limits<scalar>::max() : std::numeric_limits<scalar>::max();
             for (const std::string& f : c.fields)
             {
@@ -2191,7 +2350,8 @@ class FunctionObjectList
 {
 public:
     // Builds the list from controlDict `functions`; null when it has none that brae runs.
-    static std::shared_ptr<FunctionObjectList> read(const FoamDict& controlDict, Services svc)
+    static std::shared_ptr<FunctionObjectList> read(const FoamDict& controlDict, Services svc,
+                                                    const std::string& startDir = std::string())
     {
         const FoamDict* fns = controlDict.subDict("functions");
         if (!fns || fns->subs.empty())
@@ -2200,6 +2360,37 @@ public:
         }
         std::shared_ptr<FunctionObjectList> list(new FunctionObjectList(std::move(svc)));
         Runtime& rt = list->rt_;
+        // functionObjectList::createPropertiesDict reads the start time's file. Only scalar results are needed
+        // by the runTimeControl conditions brae runs; vector/label results are still persisted for OpenFOAM.
+        if (!startDir.empty())
+        {
+            const std::string statePath = startDir + "/uniform/functionObjects/functionObjectProperties";
+            if (std::filesystem::exists(statePath))
+            {
+                const FoamDict state = readDict(statePath);
+                if (const FoamDict* saved = state.subDict("cdf7e925f5746741c316f5fbcf39ad0dfca90775"))
+                {
+                    for (const auto& object : saved->subs)
+                    {
+                        if (const FoamDict* scalars = object.second.subDict("scalar"))
+                        {
+                            for (const auto& value : scalars->leaves)
+                            {
+                                const std::string& key = value.first;
+                                const std::size_t open = key.find('('), comma = key.find(','), close = key.rfind(')');
+                                if (open == std::string::npos || close == std::string::npos) continue;
+                                const std::string op = key.substr(0, open);
+                                const std::string field = comma == std::string::npos
+                                    ? key.substr(open + 1, close - open - 1)
+                                    : key.substr(comma + 1, close - comma - 1);
+                                rt.results[object.first][op + "(" + field + ")"] =
+                                    value.second.empty() ? scalar(0) : std::strtod(value.second[0].c_str(), nullptr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         std::vector<std::string> notRun;
         for (const auto& e : fns->subs)
         {
@@ -2310,6 +2501,15 @@ public:
         return stop;
     }
 
+    // Latest results and runTimeControl properties for the time directory's restart state. Values are already
+    // globally reduced / owner-selected, so every rank holds identical state and every rank writes it.
+    FunctionObjectState state() const
+    {
+        FunctionObjectState st;
+        for (const auto& o : objects_) o->saveState(st);
+        return st;
+    }
+
 private:
     explicit FunctionObjectList(Services svc) : rt_(std::move(svc)) {}
 
@@ -2346,7 +2546,7 @@ inline std::shared_ptr<FunctionObjectList> createFunctionObjects(
     s.src = src;
     s.isMaster = isMaster;
     s.red = Services::Reduce::procComm();   // identity without a multi-rank communicator
-    std::shared_ptr<FunctionObjectList> list = FunctionObjectList::read(controlDict, s);
+    std::shared_ptr<FunctionObjectList> list = FunctionObjectList::read(controlDict, s, startDir);
     if (list && meshChanges)
     {
         throw std::runtime_error(

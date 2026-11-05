@@ -1989,10 +1989,13 @@ RunReport runInterFoam(
                     {
                         const std::vector<std::vector<scalar>> pB =
                             pPatchesFrozen ? pBFrozen : staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
+                        const brae::fo::FunctionObjectState foState =
+                            fos ? fos->state() : brae::fo::FunctionObjectState{};
                         InterWriteState ws;
                         ws.time = rep.time;
                         ws.timeIndex = f.startTimeIndex + rep.steps;
                         ws.deltaT = rep.deltaT;
+                        ws.functionObjects = fos ? &foState : nullptr;
                         ws.alpha1 = &f.alpha1;
                         ws.U = &f.U;
                         ws.p_rgh = &f.p_rgh;

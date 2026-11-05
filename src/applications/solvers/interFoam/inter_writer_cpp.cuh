@@ -26,6 +26,7 @@
 #include "cf_types.cuh"
 #include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "foam_dict.cuh"
+#include "inter_function_objects.cuh"
 #include "fv_patch.cuh"
 #include "fvc.cuh"
 #include "geometric_field.cuh"
@@ -128,6 +129,9 @@ struct InterWriteState
     const std::vector<scalar>* rAU = nullptr;
     // CrankNicolson on a moving mesh; null under any other scheme
     const InterWriteCrankNicolson* cn = nullptr;
+    // functionObjects::properties as it stood after this step: scalar/vector/label results and the
+    // runTimeControl condition dictionaries. Null means no function objects (an empty dictionary).
+    const brae::fo::FunctionObjectState* functionObjects = nullptr;
 };
 
 class InterWriter
@@ -288,6 +292,7 @@ private:
     std::string startDir_;
     const std::vector<FvPatch>& patches_;
     std::string phase1_;
+    bool        parallel_ = false;   // function-object state output is new to the decomposed path only
 
     std::string control_;
     scalar interval_ = 0;
