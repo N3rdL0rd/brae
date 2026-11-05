@@ -182,6 +182,7 @@ scalar deviceAlphaPreSolve(
         proc->cyc().ifCoeff.resize(static_cast<std::size_t>(proc->nFaces()));
         ckP(cudaMemset(proc->cyc().ifCoeff.data(), 0, sizeof(scalar)*proc->nFaces()), "processor upwind coefficients");
         deviceCyclicAddConvection(proc->cyc(), *phiCNIf, rawDiag);
+        if (sc.matrixProcCoeffOut) deviceCopy(*sc.matrixProcCoeffOut, proc->cyc().ifCoeff);
     }
 
     DeviceBuffer<scalar> source(static_cast<std::size_t>(nC));
@@ -217,7 +218,13 @@ scalar deviceAlphaPreSolve(
     {
         deviceFold(dm, rawDiag, source, *icPtr, *bcPtr, diagC, b);
     }
+    if (sc.matrixDiagOut) deviceCopy(*sc.matrixDiagOut, diagC);
+    if (sc.matrixSourceOut) deviceCopy(*sc.matrixSourceOut, b);
+    if (sc.matrixUpperOut) deviceCopy(*sc.matrixUpperOut, upper);
+    if (sc.matrixLowerOut) deviceCopy(*sc.matrixLowerOut, lower);
 
+    if (sc.matrixICOut) deviceCopy(*sc.matrixICOut, *icPtr);
+    if (sc.matrixBCOut) deviceCopy(*sc.matrixBCOut, *bcPtr);
     DeviceLduView A = (cyc && cyc->n > 0)
         ? deviceLduViewPair(dm, diagC, upper, lower, *cyc)
         : deviceLduView(dm, diagC, upper, lower);

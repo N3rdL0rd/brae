@@ -118,8 +118,31 @@
          ==
             Su + fvm::Sp(Sp + divU, alpha1)
         );
+        if (getenv("BRAE_STAGE_ALPHA"))
+        {
+            volScalarField rg
+            (
+                IOobject("sAlphaRefGradInitial.dump", runTime.timeName(), alpha1.mesh(), IOobject::NO_READ, IOobject::NO_WRITE),
+                alpha1.mesh(), dimensionedScalar(dimless, Zero)
+            );
+            forAll(alpha1.boundaryField(), pi)
+            {
+                const auto* ca = dynamic_cast<const constantAlphaContactAngleFvPatchScalarField*>(&alpha1.boundaryField()[pi]);
+                if (ca) rg.boundaryFieldRef()[pi] == ca->gradient();
+            }
+            rg.write();
+        }
 
         alpha1Eqn.solve();
+        if (getenv("BRAE_STAGE_ALPHA"))
+        {
+            forAll(alpha1.boundaryField(), pi)
+            {
+                const auto* ca = dynamic_cast<const constantAlphaContactAngleFvPatchScalarField*>(&alpha1.boundaryField()[pi]);
+                if (ca && ca->gradient().size()) Info<< "oracle pre-solve gradient[0] " << ca->gradient()[0] << endl;
+            }
+        }
+        if (getenv("BRAE_STAGE_ALPHA")) braeDumpMatrix("sAlphaEqn", alpha1Eqn);
 
         Info<< "Phase-1 volume fraction = "
             << alpha1.weightedAverage(mesh.Vsc()).value()
