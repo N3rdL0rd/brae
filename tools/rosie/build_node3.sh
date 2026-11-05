@@ -136,7 +136,6 @@ fi
 binaries=()
 for binary in "${targets[@]}"; do binaries+=("$BUILD/$binary"); done
 binaries+=("${spikes[@]}")
-version_ge() { [[ $(printf '%s\n%s\n' "$2" "$1" | sort -V | awk 'NR == 1') == "$2" ]]; }
 status=0
 for binary in "${binaries[@]}"; do
     [[ -x $binary ]] || { echo "missing built binary: $binary" >&2; status=1; continue; }
@@ -145,7 +144,7 @@ for binary in "${binaries[@]}"; do
     echo "$binary: newest GLIBC symbol ${max_glibc}"
     if [[ $max_glibc != GLIBC_none ]]; then
         version=${max_glibc#GLIBC_}
-        if ! version_ge "$version" 2.31; then
+        if [[ $(printf '2.31\n%s\n' "$version" | sort -V | awk 'END { print }') != 2.31 ]]; then
             echo "ERROR: $binary needs $max_glibc (> 2.31)" >&2; status=1
         fi
     fi
@@ -163,9 +162,14 @@ for binary in "${binaries[@]}"; do
     if grep -Fq "$ROOT/compat" <<<"$dynamic"; then
         echo "ERROR: compat directory leaked into dynamic tags of $binary" >&2; status=1
     fi
-    if ! grep -Eq '(RPATH|RUNPATH).*\[\]' <<<"$dynamic"; then
-        echo "$dynamic" | grep -E 'RPATH|RUNPATH' || echo "  (no rpath/runpath tag)"
-    fi
+    rpaths=$dynamic
+    rpaths=$(grep -E 'RPATH|RUNPATH' <<<"$rpaths" || true)
+    printf '%s\n' "$rpaths"
+    for required_path in "$ENV_PREFIX/lib" "$NCCL_ROOT/lib" "$RT"; do
+        if ! grep -Fq "$required_path" <<<"$rpaths"; then
+            echo "ERROR: required rpath $required_path missing from $binary" >&2; status=1
+        fi
+    done
 done
 ((status == 0)) || exit "$status"
 echo "BUILD OK: $BUILD (source $SRC; incremental NJ=$NJ)"
