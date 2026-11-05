@@ -364,7 +364,9 @@ inline void readUniformOrList(
         ts.expect("(");
         vals.resize(n);
         for (label i = 0; i < n; ++i)
+        {
             vals[i] = readFoamValue<T>(ts);
+        }
         ts.expect(")");
     }
 }
@@ -790,7 +792,7 @@ inline FieldData<T> readField(const std::string& path)
         if (t == "internalField")
         {
             readUniformOrList(ts, fd.internalUniform, fd.internalUniformValue, fd.internalField);
-            ts.expect(";");
+            if (ts.peek() == ";") ts.next();   // OpenFOAM's nonuniform internalField list has no trailing ';'
         }
         else if (t == "boundaryField")
         {
@@ -1249,7 +1251,7 @@ inline FieldData<T> readField(const std::string& path)
                     {
                         readValueOrInternal(ts, fd, p.valueUniform, p.uniformValue, p.values);   // uniform/nonuniform/$internalField
                         p.hasValue = true;
-                        ts.expect(";");
+                        if (ts.peek() == ";") ts.next();   // a binary processor value list has no trailing ';'
                     }
                     else if (key == "intensity")   // turbulentIntensityKineticEnergyInlet
                     {
