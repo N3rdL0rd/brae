@@ -15,6 +15,8 @@ set -eo pipefail
 BRAE=${1:?usage: step_gate.sh <brae_interFoam> <gate dir> [tolU tolP tolPhi tolAlpha]}
 DIR=$(readlink -f "${2:?gate dir}")
 TU=${3:-1e-3}; TP=${4:-5e-4}; TPHI=${5:-5e-3}; TA=${6:-1e-6}
+# STEPS=3|10 floors (measured np 2 / np 4, 3 steps; 10 steps: U 1.25e-3, p 9e-7 / 1.9e-6, phi 3.0e-3 / 3.2e-3 against OpenFOAM: U 6.0e-4 / 9.0e-4, p_rgh 9e-6 / 7e-6, phi 1.2e-3 / 1.8e-3, alpha 1.9e-7 / 6.3e-7)
+[ "${STEPS:-1}" = 3 -o "${STEPS:-1}" = 10 ] && { TU=${3:-3e-3}; TP=${4:-5e-4}; TPHI=${5:-1e-2}; TA=${6:-1e-5}; }
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 ORACLE_ROOT=${ORACLE_ROOT:-/mnt/storage/brae-scratch/oracle}
 source "$ORACLE_ROOT/of_env.sh"
@@ -23,10 +25,12 @@ export LD_LIBRARY_PATH=/usr/lib64/openmpi/lib:${LD_LIBRARY_PATH:-}
 NP=$(ls -d "$DIR"/of/processor* | wc -l)
 cd "$DIR"
 rm -rf step_of step_bd
+# STEPS=1 (default): one step; STEPS=3: three (endTime 0.0006 ends the third step of the tank, dt 1.44e-4, 1.73e-4, 2.07e-4)
+STEPS=${STEPS:-1}; ENDT=0.0002; [ "$STEPS" = 3 ] && ENDT=0.0006; [ "$STEPS" = 10 ] && ENDT=0.002
 for side in of bd; do
     cp -r $side step_$side
     for p in step_$side/processor*; do rm -f $p/*/*.dump; done
-    sed -i 's/^startFrom .*/startFrom       latestTime;/; s/^endTime .*/endTime         0.0002;/; s/^writeInterval .*/writeInterval   1;/' step_$side/system/controlDict
+    sed -i "s/^startFrom .*/startFrom       latestTime;/; s/^endTime .*/endTime         $ENDT;/; s/^writeInterval .*/writeInterval   1;/" step_$side/system/controlDict
 done
 unset BRAE_STAGE_PRESSURE BRAE_MGPU_STAGE_DUMP BRAE_STAGE_DUMP BRAE_DUMP_ITER
 ( cd step_of && mpirun --bind-to none -np "$NP" "$ORACLE_ROOT/bin/dumpInterFoam" -parallel > ../log.step_of 2>&1 )
