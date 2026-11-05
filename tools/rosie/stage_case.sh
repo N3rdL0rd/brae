@@ -17,7 +17,7 @@ STEPS=60
 DT=1e-4
 ADAPTIVE=0
 MAKE_TAR=0
-DISABLE_UNPORTED_FO=${DISABLE_UNPORTED_FO:-1}
+DISABLE_PULSE_STOP=${DISABLE_PULSE_STOP:-1}
 REFERENCE_POINT=${REFERENCE_POINT:-0,0,0.2}
 SKIP_CENTRE_CHECK=${SKIP_CENTRE_CHECK:-0}
 TAR_DIR=${TAR_DIR:-}
@@ -33,7 +33,7 @@ Usage: stage_case.sh [options]
   --tar           write OUT/g4_npN.tar.zst (one top-level g4_npN/ per archive)
   --ref-point X,Y,Z
                   choose the cell centre nearest this point (default: 0,0,0.2)
-Environment: CASE (case dir or sketch), OUT, OF_ENV, TAR_DIR, ZST_LEVEL (3),
+             DISABLE_UNPORTED_FO=0, DISABLE_PULSE_STOP=0 (retain early stop).
              DISABLE_UNPORTED_FO=0 (leave unported FOs enabled for OpenFOAM).
 The source case is copied before every dictionary change. 0/ is used, never
 0.orig/. For G4, 0/alpha.water must be a nonuniform initialized field. The
@@ -55,7 +55,7 @@ while (($#)); do
         --adaptive) ADAPTIVE=1 ;;
         --tar) MAKE_TAR=1 ;;
         --ref-point) REFERENCE_POINT=$2; shift ;;
-        --disable-unported-fo) DISABLE_UNPORTED_FO=1 ;;
+        --disable-pulse-stop) DISABLE_PULSE_STOP=1 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -135,6 +135,10 @@ if count != 1:
     raise SystemExit(f"{path}: expected exactly one pRefPoint, found {count}")
 path.write_text(updated)
 PY
+    if [[ $DISABLE_PULSE_STOP == 1 ]] && foamDictionary -entry functions.pulseStop "$dir/system/controlDict" >/dev/null 2>&1; then
+        # speedLive still records the per-step global momentum for comparison.
+        foamDictionary -entry functions.pulseStop.enabled -set false "$dir/system/controlDict" >/dev/null
+    fi
     if [[ $DISABLE_UNPORTED_FO == 1 ]]; then
         # These are the only types that current brae silently ignores. If a
         # different CASE contains one, fail rather than silently dropping it.
@@ -165,9 +169,10 @@ if not dt > 0:
 if adaptive:
     print(format(steps * dt, ".17g"))
 else:
-    # Brae's fixed-step loop stops at endTime - 0.5*deltaT. The midpoint of
-    # the final interval gives exactly N steps, without rounding at N*dt.
-    print(format((steps - 0.5) * dt, ".17g"))
+    # Brae computes an integer budget round(4*(endTime-startTime)/dt + .5)
+    # before its half-step end check. N+.25 gives exactly N steps: the next
+    # iteration is beyond the half-step threshold and the integer budget is 4N+2.
+    print(format((steps + 0.25) * dt, ".17g"))
 PY
 )
 CELL_CENTRE=${CELL_CENTRE_OVERRIDE:-}
@@ -240,7 +245,7 @@ Decomposition: scotch, np=$np, OpenFOAM v2606
 Pressure reference: $CELL_CENTRE (cell centre nearest $REFERENCE_POINT, inside one cell)
 Timing control: steps=$STEPS dt=$DT endTime=$END_TIME adjustTimeStep=$( ((ADAPTIVE)) && echo yes || echo no )
 Write control: timeStep, interval=$STEPS, purgeWrite=1, binary, compression off
-Function objects: preserved. Unported surfaces disabled when DISABLE_UNPORTED_FO=1.
+Function objects: preserved. Unported surfaces disabled when DISABLE_UNPORTED_FO=1; pulseStop disabled for fixed timing when DISABLE_PULSE_STOP=1.
 Archives exclude triSurface, 0.orig, previous output and temporary cell centres.
 EOF
     bytes=$(du -sb "$dest" | awk '{print $1}')
