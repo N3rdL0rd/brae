@@ -5,10 +5,18 @@ split by OpenFOAM's `decomposePar` (`processorN/` directories), processor patche
 builds its own preconditioner, and reductions are global. The aim is a result that can be checked against OpenFOAM
 `-parallel` on the same decomposition. Single-GPU runs are unchanged (byte for byte, checked on every commit).
 
-**Status: not usable for a split case yet.** A decomposed case with processor faces stops at start-up with
-`processor patches need the multi-GPU coupling, not yet implemented`. A one-rank `decomposePar` case (`-parallel`, np = 1)
-runs and is byte-identical to the serial run. The operators, MULES and the momentum/pressure assembly across a processor
-face are not ported yet; see [roadmap](roadmap.md).
+**Status (2026-11-05): execution and I/O are implemented, but numerical parity is not
+accepted for the real G4 case.** A scotch decomposition of the initialized `case/0` (not the dry
+`0.orig`) completed 51 time steps at np = 2 on the MPI-host backend with matching rank Courant/deltaT
+lines and reconstructable processor output. That run still drifted severely from serial brae/OpenFOAM
+(alpha maxrel 0.4301, U 1.109, p_rgh 1.547 at t = 0.004); it is not evidence of a valid multi-GPU
+solution. The ordinary small tank is the local regression case.
+
+The one-rank decomposed case (`-parallel`, np = 1) remains byte-identical to the serial run. The old
+blanket refusal `processor patches need the multi-GPU coupling, not yet implemented` is gone: explicit
+alpha/MULES, momentum/pressure assembly, distributed AMG-PCG and global time controls now run across
+processor faces. G4 parity, np = 4/8 acceptance, NCCL, and the 233-step hot-path identity remain to be
+measured; no solver run on distinct physical GPUs has been performed.
 
 ## What is in
 
@@ -38,6 +46,36 @@ Command line (`brae_interFoam`; the `brae` launcher forwards them):
 
 Refused by name under `-parallel`: `processorCyclic`, `cyclicAMI`/`cyclicACMI`, dynamic refinement, topology change and
 moving meshes, MRF zones, `fvOptions`, any turbulence model but laminar.
+
+## Running a decomposed case
+
+```bash
+# Work on a COPY. The G4 sketch's 0/ is the initialised liquid pool; 0.orig is the dry pre-setAlphaField state.
+cp -r ~/code/sketches/g4_tank_refill_interfoam/case /scratch/g4-np2
+cd /scratch/g4-np2
+sed -i 's/^numberOfSubdomains .*/numberOfSubdomains 2;/' system/decomposeParDict
+decomposePar -force                    # OpenFOAM v2606; scotch/simple/hierarchical dictionaries are accepted
+
+export BRAE_GS_HOST_SMOOTHER=0 BRAE_INTER_PHASE_TIME=1
+mpirun --bind-to none -np 2 brae_interFoam -case . -parallel -device
+reconstructPar -latestTime             # writes the global time directory from processor0..N
+
+# Host-driven distributed-solver loops (also the fallback on a V100 driver):
+BRAE_COND_GRAPH=0 mpirun --bind-to none -np 2 brae_interFoam -case . -parallel -device
+# NCCL, when built with BRAE_WITH_NCCL=ON and each rank has a GPU:
+BRAE_COMM=nccl BRAE_GPU_MAP=0,1 mpirun --bind-to none -np 2 brae_interFoam -case . -parallel -device
+```
+
+`startFrom latestTime` resolves against processor0 and every rank reads its own
+`processor<rank>/<latestTime>` (including `uniform/time` and `uniform/cumulativeContErr`). Set `writeInterval`
+small enough to produce a restart time in a short test. `BRAE_COMM=mpi` is the default on this build; the
+loopback backend is for the test fixtures, not a multi-process `mpirun` run.
+
+For the G4 function objects, `volFieldValue` and `surfaceFieldValue` are globally reduced, probes use the
+lowest owning rank, `fieldMinMax` reports the winning rank, and `pulseStop` reads the globally reduced
+`volIntegrate(alphaUz)` so all ranks stop together. Only rank 0 writes `postProcessing/`; every rank writes
+its own `uniform/`. The `surfaces` object remains noticed but not run. `writeFields true` on a field-value
+object and `exprField autowrite true` remain refusals (the shipped G4 dictionaries set both false).
 
 Run-time environment:
 
