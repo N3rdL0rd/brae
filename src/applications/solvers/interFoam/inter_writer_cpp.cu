@@ -1530,7 +1530,7 @@ InterWriter::InterWriter(
     startDir_(startDir),
     patches_(patches),
     phase1_(phase1Name),
-    parallel_(roots.parallel)
+    parallel_(roots.parallel && roots.nProcs > 1)
 {
     const FoamDict cd = readDict(roots.dictDir + "/system/controlDict");
 
