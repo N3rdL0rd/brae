@@ -1165,11 +1165,14 @@ protected:
         }
     }
 
-    // A nonblocking COLLECTIVE (the status/side allgathers) must NOT be MPI_Cancel'd: the standard allows
-    // cancellation only for send/receive requests and OpenMPI raises MPI_ERR_REQUEST. A completed nonblocking
-    // collective is already freed by MPI_Test (REQUEST_NULL), so the safe action is to drop the handle; the
-    // operation finishes by itself on the duplicated communicator and collides with nothing.
+    // A nonblocking COLLECTIVE cannot be cancelled. If a peer aborts, its send/receive
+    // buffers must remain alive while MPI progresses/finalizes the request. The caller moves
+    // them into these members before throwing; stopSideChannel leaves a communicator with
+    // outstanding work for MPI_Finalize rather than explicitly destroying it a second time.
     static void dropCollective(MPI_Request& r) { r = MPI_REQUEST_NULL; }
+    AbortRec abortedSend_{};
+    std::vector<AbortRec> abortedRecv_;
+    bool abortedCollective_ = false;
 
     struct Live { std::vector<MPI_Request> reqs; };
     std::vector<Live> live_;                    // requests of the exchange(s) currently in flight on this rank
@@ -1296,6 +1299,9 @@ protected:
                 // the peers still need this allgather. With no raise, any side-channel abort releases the wait.
                 if (sideAborted(msg, origin) && (!raise || origin != rank_))
                 {
+                    abortedCollective_ = true;
+                    abortedRecv_ = std::move(all);
+                    abortedSend_ = mine;
                     dropCollective(req);
                     abortSeen();
                     throw ProcCommAbort(msg, origin);
@@ -1304,6 +1310,9 @@ protected:
             if (watchdogMs_ > 0
                 && std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() > watchdogMs_)
             {
+                abortedCollective_ = true;
+                abortedRecv_ = std::move(all);
+                abortedSend_ = mine;
                 dropCollective(req);
                 if (raise) { abortSeen(); throw ProcCommAbort(*raise, rank_); }
                 const std::string msg = "ProcComm: status phase timed out (a rank left the collective sequence)";
@@ -1440,6 +1449,9 @@ protected:
                 && std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()
                    > watchdogMs_)
             {
+                abortedCollective_ = true;
+                abortedRecv_ = std::move(all);
+                abortedSend_ = mine;
                 dropCollective(req);
                 throw std::runtime_error("ProcComm: collective shutdown timed out (a rank skipped communicator destruction)");
             }
@@ -1463,8 +1475,15 @@ protected:
         if (!sideOn_) return;
         abortState_->stop.store(true, std::memory_order_release);
         joinSideThread();
-        MPI_Comm_free(&sideComm_);
-        MPI_Comm_free(&statusComm_);
+        // OpenMPI's duplicated-communicator free is collective: do not let one rank
+        // release it while another is still leaving its final status round. If a peer
+        // cannot rendezvous after an abort, leave both communicators to MPI_Finalize.
+        const bool joined = MPI_Barrier(MPI_COMM_WORLD) == MPI_SUCCESS;
+        if (joined && !abortedCollective_)
+        {
+            MPI_Comm_free(&sideComm_);
+            MPI_Comm_free(&statusComm_);
+        }
         sideOn_ = false;
     }
 
@@ -1535,11 +1554,17 @@ private:
         {
             // Truncated/incomplete round after a peer's abort: not a process-fatal error. The request is dropped
             // (a collective cannot be cancelled) and the channel stops; the published record still propagates.
+            sideComm_ = MPI_COMM_NULL;   // MPI owns the failed request until finalize; sc owns its buffer
             sc.req = MPI_REQUEST_NULL;
             sc.active = false;
             sideClosing_.store(true, std::memory_order_release);
             return;
         }
+        // MPI_Test only releases the request when done is true. An incomplete poll must
+        // leave both the request and its receive buffer owned by this round: starting the
+        // next allgather here leaks live requests and lets them overwrite one another (and
+        // eventually MPI's own teardown allocations).
+        if (!done) return;
         sc.active = false;
         for (int r = 0; r < size_; ++r)
             if (sc.recv[r].flag) abortState_->publishRemote(r, sc.recv[r].msg);

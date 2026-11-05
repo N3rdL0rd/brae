@@ -363,6 +363,21 @@ foreach(_np 1 2 3 4 8)
                      $<TARGET_FILE:test_proc_comm> mpi)
     set_tests_properties(proc_comm_mpi_np${_np} PROPERTIES TIMEOUT 300)
 endforeach()
+# A side-channel nonblocking allgather is live until MPI_Test reports completion. These small
+# tests cover both driver branches; the repeated REAL interFoam explicit-stage launch is the
+# regression for the np=8 PMIx/glibc teardown corruption (a prepared case avoids oracle setup).
+add_executable(test_proc_comm_teardown tests/test_proc_comm_teardown.cu)
+target_include_directories(test_proc_comm_teardown PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_comm_teardown PRIVATE brae_core)
+add_test(NAME proc_comm_teardown_unit_np8
+         COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 8 $<TARGET_FILE:test_proc_comm_teardown>)
+set_tests_properties(proc_comm_teardown_unit_np8 PROPERTIES TIMEOUT 180)
+add_test(NAME proc_comm_teardown_serialized_np8
+         COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 8 $<TARGET_FILE:test_proc_comm_teardown> serialized)
+set_tests_properties(proc_comm_teardown_serialized_np8 PROPERTIES TIMEOUT 180)
+add_test(NAME proc_comm_teardown_np8
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/proc_comm_teardown.sh $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(proc_comm_teardown_np8 PROPERTIES TIMEOUT 3600 SKIP_RETURN_CODE 77)
 
 # Reduction scratch/caches/counters are per loopback rank thread (finding 7): concurrent ranks use differently
 # sized buffers and check every host-read result against independent global arithmetic.
