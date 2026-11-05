@@ -224,12 +224,27 @@ scalar deviceInterPressureStep(
         procExchange(*proc, {const_cast<DeviceBuffer<scalar>*>(&rAU),
                              const_cast<DeviceBuffer<scalar>*>(in.rho)}, "rAU and rho");
         deviceCyclicFaceValue(proc->cyc(), rAU, procRhoRAU);
-        procScatter(*proc, procRhoRAU, const_cast<DeviceBuffer<scalar>&>(*in.rAUfAll));
+        // rAUfAll is a full-face array: the processor segment is behind the nIf internal faces
+        procScatter(*proc, procRhoRAU, const_cast<DeviceBuffer<scalar>&>(*in.rAUfAll).data() + nIf);
         // phig's three face fields were formed by interfaceForces on the processor faces already.
         DeviceBuffer<scalar> stfP, ghfP, snRhoP;
-        procGather(*proc, *in.stf, stfP);
-        procGather(*proc, *in.ghf, ghfP);
-        procGather(*proc, *in.snGradRho, snRhoP);
+        // stf, ghf and snGrad(rho) are full-face arrays (the internal faces first): the processor segment sits
+        // at nIf + bndStart
+        const auto gatherFull = [&](const DeviceBuffer<scalar>& full, DeviceBuffer<scalar>& out)
+        {
+            out.resize(static_cast<std::size_t>(proc->nFaces()));
+            if (proc->nFaces() == 0) return;
+            if (full.size() < static_cast<std::size_t>(nIf) + static_cast<std::size_t>(proc->bndStart() + proc->nFaces()))
+            {
+                throw std::runtime_error("brae interFoam pressure step: a full-face array has no processor segment.");
+            }
+            ckS(cudaMemcpyAsync(out.data(), full.data() + nIf + proc->bndStart(),
+                                static_cast<std::size_t>(proc->nFaces())*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                                cudaStreamPerThread), "gather from a full-face array");
+        };
+        gatherFull(*in.stf, stfP);
+        gatherFull(*in.ghf, ghfP);
+        gatherFull(*in.snGradRho, snRhoP);
         deviceBuoyancyFlux(proc->nFaces(), stfP, ghfP, snRhoP, procRhoRAU,
                            proc->cyc().magSf, procPhig);
     }

@@ -1418,6 +1418,14 @@ RunReport runInterFoamDevice(
         }
         return c;
     };
+    DeviceMesh dm = buildDeviceMesh(m, g, anyProcessorFaces ? fvpCoupled : fvp);
+    if (procCoupling)
+    {
+        dProc = buildDeviceProcInterface(dm, g, fvpCoupled, *procCoupling);
+        procCtx.emplace(dProc, *procComm);
+        DeviceProcCtx::setCurrent(&*procCtx);
+        procCtx->setGlobalCells(static_cast<long long>(procComm->allReduce(static_cast<double>(m.nCells()), ReduceOp::Sum)));
+    }
     {
         // the same controls the host driver and the mesh update take, grad(pcorr)'s entry included
         const CorrectPhiControls cpc = withDevicePcorr(correctPhiControlsOf(f, meshAgglomeration));
@@ -1453,14 +1461,6 @@ RunReport runInterFoamDevice(
         // does, and what the `both` profile of tests/interfoam_gamg_vs_openfoam.sh holds.)
     }
 
-    DeviceMesh dm = buildDeviceMesh(m, g, anyProcessorFaces ? fvpCoupled : fvp);
-    if (procCoupling)
-    {
-        dProc = buildDeviceProcInterface(dm, g, fvpCoupled, *procCoupling);
-        procCtx.emplace(dProc, *procComm);
-        DeviceProcCtx::setCurrent(&*procCtx);
-        procCtx->setGlobalCells(static_cast<long long>(procComm->allReduce(static_cast<double>(m.nCells()), ReduceOp::Sum)));
-    }
     // how many times dm's GEOMETRY has been made: a build or a refresh after a move. What a cache of
     // geometry-derived boundary arrays keys on where it leaves the empty patches' faces out of its own key
     // (the momentum hook's device boundary).
@@ -6504,14 +6504,17 @@ RunReport runInterFoamDevice(
                         solverAfter.exchanges - solverBefore.exchanges,
                         solverAfter.reductions - solverBefore.reductions);
         }
-        std::printf("brae interFoam: stage dump rank %d: %s (sNHatf sSigmaK sStf sRho sSnGradRho sPhic sPhir sAlphaPhiUn)\n",
-                    roots.rank, dump.dir().c_str());
-        std::fflush(stdout);
-        if (procComm) procComm->barrier();
-        RunReport stageReport;
-        stageReport.time = rep.time;
-        stageReport.deltaT = rep.deltaT;
-        return stageReport;
+        if (!std::getenv("BRAE_STAGE_PRESSURE"))
+        {
+            std::printf("brae interFoam: stage dump rank %d: %s (sNHatf sSigmaK sStf sRho sSnGradRho sPhic sPhir sAlphaPhiUn)\n",
+                        roots.rank, dump.dir().c_str());
+            std::fflush(stdout);
+            if (procComm) procComm->barrier();
+            RunReport stageReport;
+            stageReport.time = rep.time;
+            stageReport.deltaT = rep.deltaT;
+            return stageReport;
+        }
     }
     // interFoam.C:81-85, BEFORE the time loop and not under LTS: CourantNo.H on the flux the start has (the
     // pair's faces in the sum, as in the loop), then setInitialDeltaT.H -- see time_controls.cuh and the host
@@ -8379,6 +8382,53 @@ RunReport runInterFoamDevice(
                             dPhiI, dPhiB, dPhiOI, dPhiOB, dUFixes, dPrgh, dP,
                             dNH, dNHB, dABnd, dK, dAFixes, dAFlag, dbU,
                             dRho, dMu, dNu, dRpI, dRpB, tapsOut);
+            if (tapsOut && !mgpuStageDumpDir().empty())
+            {
+                // the step's own time, as OpenFOAM names the directory its dumps of this step go to
+                char timeBuf[64];
+                std::snprintf(timeBuf, sizeof(timeBuf), "%.10g", static_cast<double>(rep.time + rep.deltaT));
+                const std::string timeName = timeBuf;
+                StageDumper dump(mgpuStageDumpDir(), roots.rank, roots.parallel, timeName, fvp);
+                const auto surf = [&](const char* name, const DeviceBuffer<scalar>& i,
+                                      const DeviceBuffer<scalar>& b)
+                {
+                    dump.surface(name, i.host(), b.host());
+                };
+                const auto full = [&](const DeviceBuffer<scalar>& a, std::vector<scalar>& i,
+                                      std::vector<scalar>& b)
+                {
+                    const std::vector<scalar> h = a.host();
+                    i.assign(h.begin(), h.begin() + nIf);
+                    b.assign(h.begin() + nIf, h.end());
+                };
+                const std::size_t nStageBnd = static_cast<std::size_t>(dm.nBndFaces);
+                std::vector<scalar> hi, hb;
+                dump.vol("UEqnDiag", tapsOut->UEqnDiag.host());
+                dump.vol("UEqnSourceX", tapsOut->UEqnSourceX.host());
+                dump.surface("UEqnUpper", tapsOut->UEqnUpper.host(), std::vector<scalar>(nStageBnd, scalar(0)));
+                dump.surface("UEqnLower", tapsOut->UEqnLower.host(), std::vector<scalar>(nStageBnd, scalar(0)));
+                dump.vol("rAU", tapsOut->rAU.host());
+                dump.vol("HbyAX", tapsOut->HbyA[0].host());
+                dump.vol("HbyAY", tapsOut->HbyA[1].host());
+                dump.vol("HbyAZ", tapsOut->HbyA[2].host());
+                full(tapsOut->rAUfAllTap, hi, hb); dump.surface("rAUf", hi, hb);
+                full(tapsOut->phigIntTap, hi, hb);
+                dump.surface("phig", tapsOut->phigIntTap.host(), std::vector<scalar>(static_cast<std::size_t>(dm.nBndFaces), scalar(0)));
+                surf("phiHbyA", tapsOut->phiHbyAInt, tapsOut->phiHbyABnd);
+                dump.vol("pDiag", tapsOut->pDiag.host());
+                dump.vol("pSource", tapsOut->pSource.host());
+                dump.surface("pUpper", tapsOut->pUpper.host(), std::vector<scalar>(nStageBnd, scalar(0)));
+                dump.surface("pLower", tapsOut->pLower.host(), std::vector<scalar>(nStageBnd, scalar(0)));
+                dump.surface("pIC", std::vector<scalar>(static_cast<std::size_t>(nIf), scalar(0)), tapsOut->pIC.host());
+                dump.surface("pBC", std::vector<scalar>(static_cast<std::size_t>(nIf), scalar(0)), tapsOut->pBC.host());
+                dump.vol("pSolved", tapsOut->pSolved.host());
+                dump.vol("divPhiHbyA", tapsOut->divPhiHbyA.host());
+                dump.vol("oU", dUx.host());
+                dump.vol("oPrgh", dPrgh.host());
+                surf("oPhi", dPhiI, dPhiB);
+                std::printf("brae interFoam: momentum/pressure stage dump rank %d: %s\n",
+                            roots.rank, dump.dir().c_str());
+            }
             interPhase::mark("5 pressure correctors");
             adjustPhiFlush();
             contErrFlush();

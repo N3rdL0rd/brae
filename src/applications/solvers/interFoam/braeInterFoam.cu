@@ -448,11 +448,13 @@ int main(int argc, char** argv)
             procComm = std::make_unique<InterProcComm>(argc, argv, roots);
         }
 
+        DeviceInterStepTaps stageTaps;
+        DeviceInterStepTaps* const taps = mgpuStageDumpDir().empty() ? nullptr : &stageTaps;
         // ONE case translation and ONE time loop per path, both the ones the gates call. A private
         // copy here would be the defect this file's header names.
         const RunReport r = onDevice
             ? runInterFoamDevice(roots, startDir, m, g, patches, nSteps, /*verbose=*/true,
-                                 /*fieldsOut=*/nullptr, endTime, /*tapsOut=*/nullptr, &mutableMesh, &writer)
+                                 /*fieldsOut=*/nullptr, endTime, taps, &mutableMesh, &writer)
             : runInterFoam(roots, startDir, m, g, patches, nSteps, /*verbose=*/true,
                            /*fieldsOut=*/nullptr, endTime, /*pressureTaps=*/nullptr, &mutableMesh,
                            /*alphaTaps=*/nullptr, &writer);

@@ -319,6 +319,15 @@ void deviceInterStep(
     // 3. THE MOMENTUM MATRIX
     DeviceBuffer<scalar> ub[3];
     hooks.updateUBoundary(UX, UY, UZ, dbU, ub, DeviceUBoundaryCall::assembly);
+    // A PROCESSOR face's value is the two cells' interpolation (what coupledFvPatchField::evaluate leaves), not the
+    // hook's placeholder: every gradient and the matrix read the stored values, so they are set here, once, from
+    // the halo of this iteration's U.
+    if (DeviceProcCtx::active(dm))
+    {
+        DeviceProcCtx& pcU = *DeviceProcCtx::current();
+        procExchange(pcU, {&UX, &UY, &UZ}, "U");
+        for (int k = 0; k < 3; ++k) procFaceValue(pcU, k == 0 ? UX : k == 1 ? UY : UZ, ub[k]);
+    }
     // pressureInletOutletVelocity's updateCoeffs, from the flux registered NOW: an inflow face fixes
     // its tangential components, an outflow face is zeroGradient. The hook rebuilds dbU from the host
     // patches' categories, which carry no flux, so without this every such face stayed zeroGradient for
@@ -691,7 +700,10 @@ void deviceInterStep(
         deviceInterpolateFull(dm, st.rAU, rAUfAll);
         if (DeviceProcCtx::active(dm))
         {
-            procFaceValue(*DeviceProcCtx::current(), st.rAU, rAUfAll);
+            // rAUfAll is a full-face array (the internal faces first): the processor segment is behind them
+            DeviceBuffer<scalar> rAUfProc;
+            deviceCyclicFaceValue(DeviceProcCtx::current()->cyc(), st.rAU, rAUfProc);
+            procScatter(*DeviceProcCtx::current(), rAUfProc, rAUfAll.data() + dm.nInternalFaces);
         }
 
         // fvc::ddtCorr(U, phi), Euler. The coefficient is OpenFOAM's DEFAULT LIMITER

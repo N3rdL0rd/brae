@@ -260,6 +260,7 @@ void assembleUEqn(
     {
         procExchange(*proc, {const_cast<DeviceBuffer<scalar>*>(&Ux), const_cast<DeviceBuffer<scalar>*>(&Uy),
                              const_cast<DeviceBuffer<scalar>*>(&Uz)}, "U");
+        procExchange(*proc, {const_cast<DeviceBuffer<scalar>*>(in.nuEffCell)}, "nuEff");
         // The shared memo owns these arrays. Refresh the processor values in place; its fingerprint still
         // its fingerprint still sees the same boundary buffer and the same cell state.
         GradUMemo& memo = const_cast<GradUMemo&>(deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored));
@@ -768,6 +769,20 @@ void assembleUEqn(
         deviceAxpy(-1.0, lIC, M.iC[k]);
         deviceAxpy(-1.0, lBC, M.bC[k]);
     }
+    // A PROCESSOR PATCH is a boundary patch with a placeholder field here: its convection coefficient phi_b*1 would
+    // be folded into the diagonal (A(), the solve) on top of the interface's own terms, which the processor
+    // assembly (addProcessor...) already put into diag/ifCoeff. Its true boundary coefficients are zero.
+    if (DeviceProcCtx::active(dm) && DeviceProcCtx::current()->nFaces() > 0)
+    {
+        const DeviceProcCtx& pc = *DeviceProcCtx::current();
+        for (int k = 0; k < 3; ++k)
+        {
+            if (M.iC[k].size() < static_cast<std::size_t>(pc.bndStart() + pc.nFaces()) || M.bC[k].size() < static_cast<std::size_t>(pc.bndStart() + pc.nFaces()))
+                throw std::runtime_error("UEqn(cuda): the boundary coefficients have no processor segment.");
+            cudaCheck(cudaMemsetAsync(M.iC[k].data() + pc.bndStart(), 0, static_cast<std::size_t>(pc.nFaces())*sizeof(scalar), cudaStreamPerThread), "zero processor iC");
+            cudaCheck(cudaMemsetAsync(M.bC[k].data() + pc.bndStart(), 0, static_cast<std::size_t>(pc.nFaces())*sizeof(scalar), cudaStreamPerThread), "zero processor bC");
+        }
+    }
 
     // ---- `bounded`: - fvm::Sp(fvc::div(phi), U) ---------------------------------------------
     // Before relax, as OpenFOAM does. deviceDiv returns the per-volume divergence, so the extensive
@@ -896,8 +911,11 @@ void assembleUEqn(
     // is the same as the cyclic assembly's: Apsi[own] += coeff*psi[halo].
     if (proc)
     {
+        // the convecting flux of the processor faces, in the interface's own face order (phiBnd is the boundary array)
+        DeviceBuffer<scalar> procConvFlux;
+        procGather(*proc, *in.phiBnd, procConvFlux);
         deviceCyclicAssembleMomentum(proc->cyc(), *in.nuEffCell, M.diag, nullptr,
-                                     in.cycCorrected || in.cycNonOrth, in.phiBnd);
+                                     in.cycCorrected || in.cycNonOrth, &procConvFlux);
         deviceCopy(M.procIfCoeff, proc->cyc().ifCoeff);
     }
 
