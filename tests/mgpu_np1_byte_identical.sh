@@ -42,7 +42,7 @@ diff -r serial/postProcessing np1/postProcessing >/dev/null || { echo "FAIL: pos
 echo "np=1: $n entries of $T and postProcessing byte-identical"
 for N in 2 4; do for r in $(seq 0 $((N-1))); do
     set +e
-    if [ "$N" = 2 ] && command -v mpirun >/dev/null 2>&1; then
+    if command -v mpirun >/dev/null 2>&1; then
         mpirun --bind-to none --oversubscribe -np "$N" "$BRAE" -case np$N -parallel -device > log.np${N}_$r 2>&1
     else
         "$BRAE" -case np$N -parallel -rank $r -nprocs $N -device > log.np${N}_$r 2>&1
@@ -50,7 +50,7 @@ for N in 2 4; do for r in $(seq 0 $((N-1))); do
     rc=$?; set -e
     [ $rc = 0 ] || { echo "FAIL: np=$N rank $r exit $rc, expected the processor run to start"; exit 1; }
     grep -q "processor patch(es)" log.np${N}_$r || { echo "FAIL: np=$N rank $r: no per-rank table"; exit 1; }
-    grep -q "alpha pre-solve\|Solving for p_rgh\|Time =\|stage dump" log.np${N}_$r \
+    grep -q "^   t = .*\[device\]" log.np${N}_$r \
         || { echo "FAIL: np=$N rank $r did not reach a numerical stage"; exit 1; }
     break
 done; done
