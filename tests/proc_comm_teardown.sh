@@ -12,8 +12,10 @@ export MALLOC_CHECK_=3
 for i in $(seq 1 "$LAUNCHES"); do
     export MALLOC_PERTURB_=$((40 + i))
     log=$OUT/$(printf '%02d' "$i").log
+    mode=
+    if ((i % 2 == 0)); then mode=serialized; fi
     timeout 180 "$MPIEXEC" --oversubscribe -np 8 \
-        -x MALLOC_CHECK_ -x MALLOC_PERTURB_ "$TEST" >"$log" 2>&1
+        -x MALLOC_CHECK_ -x MALLOC_PERTURB_ "$TEST" $mode >"$log" 2>&1
     rc=$?
     if [ "$rc" -ne 0 ]; then
         cat "$log"

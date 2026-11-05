@@ -372,6 +372,9 @@ target_link_libraries(test_proc_comm_teardown PRIVATE brae_core)
 add_test(NAME proc_comm_teardown_unit_np8
          COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 8 $<TARGET_FILE:test_proc_comm_teardown>)
 set_tests_properties(proc_comm_teardown_unit_np8 PROPERTIES TIMEOUT 180)
+add_test(NAME proc_comm_teardown_serialized_np8
+         COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 8 $<TARGET_FILE:test_proc_comm_teardown> serialized)
+set_tests_properties(proc_comm_teardown_serialized_np8 PROPERTIES TIMEOUT 180)
 add_test(NAME proc_comm_teardown_np8
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/proc_comm_teardown.sh
                  $<TARGET_FILE:test_proc_comm_teardown>)
