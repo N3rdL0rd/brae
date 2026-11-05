@@ -3,6 +3,8 @@
 // mistaken for a completed MPI_Test and abandoned with another collective targeting its buffer.
 #include "proc_comm.cuh"
 #include "cf_pstream.cuh"
+#include <mpi.h>
+
 
 #include <chrono>
 #include <cstdio>

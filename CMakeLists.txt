@@ -363,6 +363,19 @@ foreach(_np 1 2 3 4 8)
                      $<TARGET_FILE:test_proc_comm> mpi)
     set_tests_properties(proc_comm_mpi_np${_np} PROPERTIES TIMEOUT 300)
 endforeach()
+# The side channel must keep exactly one pending nonblocking allgather per rank, including
+# rank-staggered construction/destruction. A nonzero rank (including glibc's heap-integrity
+# abort) fails the whole launch; repeated fresh jobs cover process teardown as well.
+add_executable(test_proc_comm_teardown tests/test_proc_comm_teardown.cu)
+target_include_directories(test_proc_comm_teardown PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_comm_teardown PRIVATE brae_core)
+add_test(NAME proc_comm_teardown_unit_np8
+         COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 8 $<TARGET_FILE:test_proc_comm_teardown>)
+set_tests_properties(proc_comm_teardown_unit_np8 PROPERTIES TIMEOUT 180)
+add_test(NAME proc_comm_teardown_np8
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/proc_comm_teardown.sh
+                 $<TARGET_FILE:test_proc_comm_teardown>)
+set_tests_properties(proc_comm_teardown_np8 PROPERTIES TIMEOUT 900)
 
 # Reduction scratch/caches/counters are per loopback rank thread (finding 7): concurrent ranks use differently
 # sized buffers and check every host-read result against independent global arithmetic.
