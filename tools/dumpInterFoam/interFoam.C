@@ -53,6 +53,7 @@ Description
 #include "CorrectPhi.H"
 #include "fvcSmooth.H"
 #include "processorFvPatch.H"
+#include "twoPhaseProperties/alphaContactAngle/constantAlphaContactAngle/constantAlphaContactAngleFvPatchScalarField.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -347,6 +348,20 @@ int main(int argc, char *argv[])
                 surfaceScalarField("oRhoPhi.dump", rhoPhi).write();
                 volScalarField("oRhoEnd.dump", rho).write();
                 surfaceScalarField("oPhiEntry.dump", phi).write();
+            }
+            if (getenv("BRAE_STAGE_ALPHA"))
+            {
+                volScalarField rg
+                (
+                    IOobject("sAlphaRefGrad.dump", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+                    mesh, dimensionedScalar(dimless, Zero)
+                );
+                forAll(alpha1.boundaryField(), pi)
+                {
+                    const auto* ca = dynamic_cast<const constantAlphaContactAngleFvPatchScalarField*>(&alpha1.boundaryField()[pi]);
+                    if (ca) rg.boundaryFieldRef()[pi] == ca->gradient();
+                }
+                rg.write();
             }
             if (getenv("BRAE_STAGE_ALPHA"))
             {

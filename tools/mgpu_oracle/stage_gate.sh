@@ -45,6 +45,10 @@ cp -r "$CASE_SRC" state
   rm -f system/decomposeParDict.*
 
   blockMesh > ../log.blockMesh 2>&1; topoSet > ../log.topoSet 2>&1
+  sed -i 's/^writeFormat .*/writeFormat ascii;/' system/controlDict
+  if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then
+    sed -i '/^PIMPLE$/,/^}/s/pRefPoint .*/pRefPoint (0.01 0.005 0.01);/' system/fvSolution
+  fi
   cp -r 0.orig 0; mv 0/alpha.water.orig 0/alpha.water; rm -rf 0.orig
   setFields > ../log.setFields 2>&1 )
 if [ "$NP" != 1 ]; then
@@ -78,9 +82,11 @@ if [ -d ofExplicit ]; then sed -i 's/^startFrom .*/startFrom       latestTime;/'
 # OpenFOAM: first the alpha step in alpha-stage mode, then the explicit stages from the unchanged input.
 if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then export BRAE_STAGE_ALPHA=1; fi
 if [ "$BRAE_STAGE_ALPHA" = 1 ]; then
+    export BRAE_ORACLE_ITERS=2
     if [ "$NP" = 1 ]; then ( cd of && "$SOLVER" > ../log.of 2>&1 )
     else ( cd of && mpirun --bind-to none -np "$NP" "$SOLVER" -parallel > ../log.of 2>&1 ); fi
 fi
+    unset BRAE_ORACLE_ITERS
 ORUN=of; [ -d ofExplicit ] && ORUN=ofExplicit
 if [ "$BRAE_STAGE_ALPHA_REQUESTED" != 1 ]; then
     export BRAE_STAGE_DUMP=1
@@ -112,6 +118,21 @@ if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then
     if [ "$NP" = 1 ]; then
         AT=$(find of -name sAlphaAfter.dump -printf '%h\n' | head -n 1)
         [ "$AT" = "of/$T" ] || { mkdir -p "of/$T"; cp "$AT"/sAlphaAfter.dump "$AT"/sAlphaPhi.dump "$AT"/sRhoAfter.dump "of/$T/"; }
+    fi
+fi
+if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then
+    for D in of/processor*; do
+        [ -d "$D" ] || continue
+        for F in sAlphaPredictor.dump sAlphaCorr0.dump sAlphaCorr1.dump; do
+            AT=$(find "$D" -name "$F" -print -quit 2>/dev/null)
+            [ -n "$AT" ] && cp "$AT" "$D/$T/"
+        done
+    done
+    if [ "$NP" = 1 ]; then
+        for F in sAlphaPredictor.dump sAlphaCorr0.dump sAlphaCorr1.dump; do
+            AT=$(find of -name "$F" -print -quit 2>/dev/null)
+            [ -n "$AT" ] && cp "$AT" "of/$T/"
+        done
     fi
 fi
 if [ "$BRAE_STAGE_ALPHA_REQUESTED" = 1 ]; then

@@ -302,12 +302,14 @@ void deviceInterAlphaStep(
                 DeviceBuffer<scalar> procPhiCN;
                 DeviceProcCtx* proc = DeviceProcCtx::active(dm) ? DeviceProcCtx::current() : nullptr;
                 if (proc) procGather(*proc, *li.phiCNBnd, procPhiCN);
+                if (ctl.procPhiCNOut && proc) deviceCopy(*ctl.procPhiCNOut, procPhiCN);
                 const DeviceBuffer<scalar>* prePhiIf = proc ? &procPhiCN
                     : ((preRawPhi && pairHere) ? &li.cyc->phi : li.phiCNIf);
                 deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
                                     alphaPhiInt, alphaPhiBnd, &pre, li.cyc, li.alphaPhiIf,
                                     li.Vsc, li.Vsc0, li.rDeltaT, prePhiIf);
             }
+            if (ctl.preSolveAlphaPhiBndOut) deviceCopy(*ctl.preSolveAlphaPhiBndOut, alphaPhiBnd);
             if (ctl.preSolveLog)
             {
                 ctl.preSolveLog->push_back(pre);

@@ -1596,6 +1596,22 @@ RunReport runInterFoamDevice(
     // patches look phi up whenever they update; brae's are told, and the device path holds the only
     // current copy. See pushFluxToPatches for what not telling them cost on capillaryRise.
     DeviceBuffer<scalar> dPhiB(flattenPatches(f.phi.boundary, fvp));
+    if (procCtx)
+    {
+        const std::vector<CyclicInterface> procIfs = buildProcessorInterfaces(g, fvpCoupled);
+        const std::vector<scalar> procFlux = coupledFace(f.phi, procIfs);
+        if (procFlux.size() == static_cast<std::size_t>(procCtx->nFaces()))
+            std::printf("brae interFoam: processor layout bndStart %d nFaces %d nBnd %d\n",
+                        procCtx->bndStart(), procCtx->nFaces(), dm.nBndFaces);
+        {
+            scalar seedMax = 0;
+            for (const scalar v : procFlux) seedMax = std::fmax(seedMax, std::fabs(v));
+            std::printf("brae interFoam: processor flux seed max %.17g\n", (double)seedMax);
+            cudaCheck(cudaMemcpy(dPhiB.data() + procCtx->bndStart(), procFlux.data(),
+                                 procFlux.size()*sizeof(scalar), cudaMemcpyHostToDevice),
+                      "seed processor flux");
+        }
+    }
     // rhoPhi, which the alpha step writes. Declared HERE because pushFlux reads its boundary: a
     // condition may name `phi rhoPhi;` (three tutorials' totalPressure top does), and the device holds
     // the only current copy. Empty until the first alpha step, when the host's -- built at rest by
@@ -3002,6 +3018,11 @@ RunReport runInterFoamDevice(
             // the host's evaluate here leaves an empty patch alone where its entries are kept on the GPU
             deviceContactAngleEvaluate(dContact, a, !hooksEmptyPlan().kept);
             deviceContactAngleDivCoeffs(dContact, phiCNBnd ? *phiCNBnd : dPhiB, iC, bC);
+            if (std::getenv("BRAE_STAGE_ALPHA"))
+            {
+                const std::vector<scalar> rg = dContact.refGrad.host();
+                std::printf("brae interFoam: pre-solve refGrad[0] %.17g\n", rg.empty() ? 0.0 : (double)rg[0]);
+            }
             return;
         }
         a.copyTo(f.alpha1.internal);
@@ -6446,6 +6467,29 @@ RunReport runInterFoamDevice(
         }
         if (std::getenv("BRAE_STAGE_ALPHA"))
         {
+            if (procCtx)
+            {
+                const std::vector<CyclicInterface> procIfs = buildProcessorInterfaces(g, fvpCoupled);
+                const std::vector<scalar> procFlux = coupledFace(f.phi, procIfs);
+                if (procFlux.size() == static_cast<std::size_t>(procCtx->nFaces()))
+                    cudaCheck(cudaMemcpy(dPhiB.data() + procCtx->bndStart(), procFlux.data(),
+                                         procFlux.size()*sizeof(scalar), cudaMemcpyHostToDevice),
+                              "seed processor flux before alpha");
+            }
+            if (procCtx)
+            {
+                const std::vector<scalar> chk = dPhiB.host();
+                scalar mx = 0;
+                for (std::size_t j = procCtx->bndStart(); j < chk.size(); ++j) mx = std::fmax(mx, std::fabs(chk[j]));
+                std::printf("brae interFoam: processor flux copied suffix max %.17g\n", (double)mx);
+            }
+            const std::vector<scalar> seededPhi = dPhiB.host();
+            dump.surface("sDevicePhi", dPhiI.host(), seededPhi);
+            const std::vector<scalar> beforeAlphaPhi = dPhiB.host();
+            scalar beforeMax = 0;
+            for (std::size_t j = procCtx ? procCtx->bndStart() : 0; j < beforeAlphaPhi.size(); ++j)
+                beforeMax = std::fmax(beforeMax, std::fabs(beforeAlphaPhi[j]));
+            std::printf("brae interFoam: processor flux before alpha step max %.17g\n", (double)beforeMax);
             const DeviceProcCommCounts commBefore = deviceProcCommCountsRef();
             const ProcHookCounts solverBefore = procHookCounts();
             if (!f.lts && f.timeCtl.base.adjustTimeStep)
@@ -6466,6 +6510,11 @@ RunReport runInterFoamDevice(
             ai.phiCNBnd = &dPhiB;
             ai.deltaT = rep.deltaT;
             ai.cyc = C.cyc;
+            if (contactAngleDevice)
+            {
+                const std::vector<scalar> rg0 = dContact.refGrad.host();
+                dump.vol("sAlphaRefGradInitial", std::vector<scalar>(dm.nCells, 0), &rg0);
+            }
             ai.phiCNIf = C.cyc ? &C.cyc->phi : nullptr;
             ai.alphaPhiIf = C.alphaPhiIf;
             ai.rho1 = props.rho1;
@@ -6477,7 +6526,25 @@ RunReport runInterFoamDevice(
             DeviceBuffer<scalar> alpha2BeforeFinalMixture;
             ac.alpha2BeforeFinalMixtureOut = &alpha2BeforeFinalMixture;
             DeviceBuffer<scalar> preSolveStage;
+            const std::vector<scalar> afterAlphaPhi = dPhiB.host();
+            scalar afterMax = 0;
+            for (std::size_t j = procCtx ? procCtx->bndStart() : 0; j < afterAlphaPhi.size(); ++j)
+                afterMax = std::fmax(afterMax, std::fabs(afterAlphaPhi[j]));
+            std::printf("brae interFoam: processor flux after alpha step max %.17g\n", (double)afterMax);
             ac.preSolveAlphaOut = &preSolveStage;
+            DeviceBuffer<scalar> preFluxStage;
+            ac.preSolveAlphaPhiBndOut = &preFluxStage;
+            DeviceBuffer<scalar> procPhiStage;
+            ac.procPhiCNOut = &procPhiStage;
+            DeviceBuffer<scalar> matrixD, matrixS, matrixU, matrixL, matrixP;
+            DeviceBuffer<scalar> matrixIC, matrixBC;
+            ac.preSolve.matrixICOut = &matrixIC;
+            ac.preSolve.matrixBCOut = &matrixBC;
+            ac.preSolve.matrixDiagOut = &matrixD;
+            ac.preSolve.matrixSourceOut = &matrixS;
+            ac.preSolve.matrixUpperOut = &matrixU;
+            ac.preSolve.matrixLowerOut = &matrixL;
+            ac.preSolve.matrixProcCoeffOut = &matrixP;
             std::vector<DeviceBuffer<scalar>> correctorStages;
             ac.correctorAlphaOut = &correctorStages;
             std::vector<DeviceBuffer<scalar>> correctorBndStages;
@@ -6495,6 +6562,11 @@ RunReport runInterFoamDevice(
                 std::printf("brae interFoam: alpha pre-solve residual %.17g -> %.17g, iterations %d\n",
                             (double)p.initialResidual, (double)p.finalResidual, p.nIterations);
             dAlphaPhiWriteI.copyTo(hi);
+            if (contactAngleDevice)
+            {
+                const std::vector<scalar> rg = dContact.refGrad.host();
+                dump.vol("sAlphaRefGrad", std::vector<scalar>(dm.nCells, 0), &rg);
+            }
             dAlphaPhiWriteB.copyTo(hb);
             dump.surface("sAlphaPhi", hi, hb);
             const std::vector<scalar> finalAB = contactAngleDevice ? dContact.stored.host() : dABnd.host();
@@ -6510,12 +6582,39 @@ RunReport runInterFoamDevice(
             }
             dump.vol("sRhoAfter", dRho.host(), &finalRB);
             if (preSolveStage.size()) dump.vol("sAlphaPredictor", preSolveStage.host());
+            if (preFluxStage.size())
+            {
+                std::vector<scalar> full(dm.nBndFaces, 0);
+                const std::vector<scalar> pf = preFluxStage.host();
+                for (std::size_t j = 0; j < pf.size(); ++j) full[j] = pf[j];
+                dump.surface("sAlphaPreFlux", std::vector<scalar>(nIf, 0), full);
+            }
+            if (procPhiStage.size())
+            {
+                std::vector<scalar> full(dm.nBndFaces, 0);
+                const std::vector<scalar> pf = procPhiStage.host();
+                for (std::size_t j = 0; j < pf.size(); ++j) full[dm.nBndFacesPhys + j] = pf[j];
+                dump.surface("sProcPhiCN", std::vector<scalar>(nIf, 0), full);
+            }
             for (std::size_t k = 0; k < correctorStages.size(); ++k)
                 dump.vol("sAlphaCorr" + std::to_string(k), correctorStages[k].host());
             for (std::size_t k = 0; k < correctorBndStages.size(); ++k)
             {
                 const std::vector<scalar> bh = correctorBndStages[k].host();
                 dump.vol("sAlphaBndCorr" + std::to_string(k), std::vector<scalar>(dm.nCells, 0), &bh);
+            }
+            dump.vol("sAlphaEqnDiag", matrixD.host());
+            dump.vol("sAlphaEqnSource", matrixS.host());
+            dump.surface("sAlphaEqnUpper", matrixU.host(), std::vector<scalar>(dm.nBndFaces, 0));
+            dump.surface("sAlphaEqnLower", matrixL.host(), std::vector<scalar>(dm.nBndFaces, 0));
+            dump.surface("sAlphaEqnIC", std::vector<scalar>(nIf, 0), matrixIC.host());
+            dump.surface("sAlphaEqnBC", std::vector<scalar>(nIf, 0), matrixBC.host());
+            if (matrixP.size())
+            {
+                std::vector<scalar> full(dm.nBndFaces, 0);
+                const std::vector<scalar> pc = matrixP.host();
+                for (std::size_t j = 0; j < pc.size(); ++j) full[dm.nBndFacesPhys + j] = pc[j];
+                dump.surface("sAlphaEqnProcCoeff", std::vector<scalar>(nIf, 0), full);
             }
             std::printf("brae interFoam: alpha stage dump rank %d: %s\n", roots.rank, dump.dir().c_str());
             const DeviceProcCommCounts commAfter = deviceProcCommCountsRef();

@@ -194,6 +194,8 @@ struct DeviceInterAlphaControls
     // implicit half against the corrector. Null in every production run.
     DeviceBuffer<scalar>* preSolveAlphaOut = nullptr;
     DeviceBuffer<scalar>* preSolveAlphaPhiIfOut = nullptr;
+    DeviceBuffer<scalar>* preSolveAlphaPhiBndOut = nullptr;
+    DeviceBuffer<scalar>* procPhiCNOut = nullptr;
     std::vector<DeviceBuffer<scalar>>* correctorAlphaOut = nullptr;
     DeviceBuffer<scalar>* alphaBeforeFinalMixtureOut = nullptr;
     std::vector<DeviceBuffer<scalar>>* correctorAlphaBndOut = nullptr;
