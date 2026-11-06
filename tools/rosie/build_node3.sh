@@ -25,7 +25,7 @@ BUILD_SPIKES=1
 usage() {
     cat <<'EOF'
 Usage: build_node3.sh [--reconfigure] [--no-spikes]
-Environment: SRC, ROOT, BUILD, ENV_PREFIX, CONDA, NCCL_ROOT, RT, CUDA, NJ, GCC_VER (conda gcc major, 14 for CUDA 12.9; nvcc 12.1 needs <= 12).
+Environment: CUDA_FLAGS_EXTRA (default --compress-mode=none: nvcc 12.8+ compresses fatbins by default, which drivers older than 550 cannot load), SRC, ROOT, BUILD, ENV_PREFIX, CONDA, NCCL_ROOT, RT, CUDA, NJ, GCC_VER (conda gcc major, 14 for CUDA 12.9; nvcc 12.1 needs <= 12).
   --reconfigure  remove only CMake's cache/configuration, preserving objects
   --no-spikes    skip the optional nccl_while_graph standalone test programs
 Incremental by default. SRC can be any brae source checkout (including a
@@ -107,7 +107,7 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
     -DMPI_CXX_COMPILER="$ENV_PREFIX/bin/mpicxx" -DMPIEXEC_EXECUTABLE="$ENV_PREFIX/bin/mpiexec" \
     -DBRAE_WITH_NCCL=ON -DNCCL_ROOT="$NCCL_ROOT" "-DBRAE_NCCL_TEST_NP=1;2;4;8" \
     -DCMAKE_INCLUDE_PATH="$ENV_PREFIX/include" -DCMAKE_LIBRARY_PATH="$ENV_PREFIX/lib" \
-    "-DCMAKE_CXX_FLAGS=-I$ENV_PREFIX/include" "-DCMAKE_CUDA_FLAGS=-I$ENV_PREFIX/include" \
+    "-DCMAKE_CXX_FLAGS=-I$ENV_PREFIX/include" "-DCMAKE_CUDA_FLAGS=-I$ENV_PREFIX/include ${CUDA_FLAGS_EXTRA---compress-mode=none}" \
     "-DCMAKE_EXE_LINKER_FLAGS=$LINK_FLAGS"
 
 targets=(brae_interFoam test_proc_comm test_proc_comm_graph test_proc_topology proc_topology_tool)

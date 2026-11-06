@@ -189,6 +189,8 @@ if [[ $BRAE_MODE == dgx ]]; then
     export PATH="$ROOT/env/bin:$PATH" OPAL_PREFIX="$ROOT/env"
     # COMPAT_DIR="" runs without the forward-compatibility libraries (nodes whose kernel driver is older than 535, e.g. dh-dgx1-2 with 525, refuse them: error 803)
     COMPAT_DIR=${COMPAT_DIR-$ROOT/compat/12-9}
+    # drivers older than 530 default to eager module loading, which fails on the whole-solver fatbin
+    export CUDA_MODULE_LOADING=${CUDA_MODULE_LOADING:-LAZY}
     export LD_LIBRARY_PATH="${COMPAT_DIR:+$COMPAT_DIR:}$ROOT/env/lib:$ROOT/nccl/nvidia/nccl/lib:$ROOT/cuda12rt:/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 else
     # Never inherit a job's Slurm context in the laptop regression either.
