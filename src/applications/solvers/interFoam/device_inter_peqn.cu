@@ -250,6 +250,28 @@ __global__ void setReferenceKernel(int cell, const scalar* __restrict__ pRgh,
     }
 }
 
+// OF setReference precedes the solver's addBoundaryDiag. Our processor share is already in
+// P.diag, so exclude it for the reference operation and restore it immediately afterwards.
+__global__ void adjustReferenceInterfaceKernel(int cell, scalar share, scalar* diag)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0) diag[cell] += share;
+}
+
+static void adjustReferenceInterface(const DeviceCyclic& cyc, int cell, scalar sign,
+                                     DeviceBuffer<scalar>& diag)
+{
+    if (cell < 0) return;
+    const std::vector<label> own = cyc.ownCell.host();
+    const std::vector<scalar> coeff = cyc.ifCoeff.host();
+    scalar share = 0;
+    for (std::size_t j = 0; j < own.size(); ++j) if (own[j] == cell) share += coeff[j];
+    if (share != scalar(0))
+    {
+        adjustReferenceInterfaceKernel<<<1, 1>>>(cell, sign*share, diag.data());
+        ckP(cudaGetLastError(), "reference processor diagonal fold");
+    }
+}
+
 // applyPressureReference (inter_peqn_cpp.cu:179-196), pEqn.H:74-83: p += pRefValue - p[pRefCell], and
 // p_rgh is REBUILT from the shifted p rather than keeping what the solve gave it. Two passes, because
 // every cell reads p[pRefCell] and the reference cell's own thread writes it.
@@ -601,6 +623,12 @@ void deviceInterAssemblePEqn(
         deviceCyclicAssembleLaplacian(pc.cyc(), *rAUCell, P.diag, /*addToDiag=*/true,
                                       corrected || nonOrthCoeffs);
     }
+    DeviceCyclic* const procCyc = DeviceProcCtx::active(dm) ? &DeviceProcCtx::current()->cyc() : nullptr;
+    if (needReference && pRefCell >= 0)
+    {
+        if (cyc && cyc->n > 0) adjustReferenceInterface(*cyc, pRefCell, scalar(1), P.diag);
+        if (procCyc) adjustReferenceInterface(*procCyc, pRefCell, scalar(1), P.diag);
+    }
 
     if (needReference)
     {
@@ -620,6 +648,11 @@ void deviceInterAssemblePEqn(
             setReferenceKernel<<<1, 1>>>(pRefCell, pRghForRef->data(), P.diag.data(), P.source.data());
             ckP(cudaGetLastError(), "setReference");
         }
+    }
+    if (needReference && pRefCell >= 0)
+    {
+        if (cyc && cyc->n > 0) adjustReferenceInterface(*cyc, pRefCell, scalar(-1), P.diag);
+        if (procCyc) adjustReferenceInterface(*procCyc, pRefCell, scalar(-1), P.diag);
     }
 }
 
