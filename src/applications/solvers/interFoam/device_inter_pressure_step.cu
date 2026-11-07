@@ -810,7 +810,9 @@ scalar deviceInterPressureStep(
         procScatter(*proc, procFlux, fluxBnd);
         if (in.correctedLaplacian && ffcIf.size() == static_cast<std::size_t>(proc->nFaces()))
         {
-            deviceAxpy(scalar(1), ffcIf, fluxBnd);
+            // The correction belongs to the processor patch, not boundary face zero.
+            deviceAxpy(scalar(1), ffcIf, procFlux);
+            procScatter(*proc, procFlux, fluxBnd);
         }
     }
     DeviceBuffer<scalar> ffProc, rAUfProc;
