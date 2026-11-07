@@ -533,6 +533,7 @@ scalar deviceInterPressureStep(
         if (proc)
         {
             A.proc = proc->interfaceView();
+            A.proc.coeff = P.procIfCoeff.data();
         }
         // THE PRESSURE RULE: brae's AMG-PCG whatever the entry names, with the entry's own stopping controls.
         // BRAE_PRESSURE_CASE_SOLVER=1 runs the case's own entry as ported instead -- what the exact gates
@@ -806,7 +807,7 @@ scalar deviceInterPressureStep(
     if (proc)
     {
         DeviceBuffer<scalar> procFlux;
-        deviceCyclicPressureFlux(proc->cyc(), p_rgh, procFlux);
+        deviceCyclicPressureFlux(proc->cyc(), p_rgh, procFlux, nullptr, &P.procIfCoeff);
         procScatter(*proc, procFlux, fluxBnd);
         if (in.correctedLaplacian && ffcIf.size() == static_cast<std::size_t>(proc->nFaces()))
         {

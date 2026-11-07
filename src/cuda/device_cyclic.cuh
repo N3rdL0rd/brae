@@ -629,7 +629,8 @@ void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
 // reconstruct((phig - p_rghEqn.flux())/rAUf) reads the flux and not the corrected phi.
 void deviceCyclicPressureFlux(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
                               DeviceBuffer<scalar>& out,
-                              const DeviceBuffer<scalar>* jump = nullptr);
+                              const DeviceBuffer<scalar>* jump = nullptr,
+                              const DeviceBuffer<scalar>* coeff = nullptr);
 // gaussGrad contribution: grad[own] += Sf_j * (w*psi[own]+(1-w)*psi[nbr]) / V[own].
 // fvc::snGrad ON THE PAIR'S FACES (fvc.cu, snGradScheme.C's coupled branch): dc*(pnf - psi[own]) with the
 // scheme's delta coefficient -- nonOrthDeltaCoeffs under `corrected` and `uncorrected`, the plain 1/|delta| under

@@ -3,6 +3,7 @@
 #include "device_fvc_reconstruct.cuh"
 #include "device_processor_ops.cuh"
 #include "device_mesh.cuh"
+#include "device_blas.cuh"
 #include "device_ldu.cuh"
 #include "device_simple.cuh"
 #include "proc_globals.cuh"
@@ -622,6 +623,7 @@ void deviceInterAssemblePEqn(
         DeviceProcCtx& pc = *DeviceProcCtx::current();
         deviceCyclicAssembleLaplacian(pc.cyc(), *rAUCell, P.diag, /*addToDiag=*/true,
                                       corrected || nonOrthCoeffs);
+        deviceCopy(P.procIfCoeff, pc.cyc().ifCoeff);
     }
     DeviceCyclic* const procCyc = DeviceProcCtx::active(dm) ? &DeviceProcCtx::current()->cyc() : nullptr;
     if (needReference && pRefCell >= 0)
