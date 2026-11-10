@@ -5,8 +5,10 @@ split by OpenFOAM's `decomposePar` (`processorN/` directories), processor patche
 builds its own preconditioner, and reductions are global. The aim is a result that can be checked against OpenFOAM
 `-parallel` on the same decomposition. Single-GPU runs are unchanged (byte for byte, checked on every commit).
 
-**Status (2026-11-10): on the coarse G4-like case brae `-parallel` agrees with OpenFOAM v2606 `-parallel` on the
-same decomposition at np = 2 and 4. The full 2.48M-cell G4 case has not been re-run at np > 1 since.** The case is a
+**Status (2026-11-10): the full 2.48M-cell G4 case runs at np = 1, 2, 4 and 8 on Rosie's V100 DGX-1 (one GPU per
+rank, NCCL), the decomposed runs agree with the undecomposed one to OpenFOAM's own floor, and 8 GPUs take a step in
+a quarter of one GPU's time** (measurements under "Running on Rosie" below). On a coarse G4-like case brae
+`-parallel` also agrees with OpenFOAM v2606 `-parallel` on the same decomposition at np = 2 and 4. That case is a
 31,192-cell snappyHexMesh version of G4 (same schemes, contact-angle walls, `nNonOrthogonalCorrectors 0`), scotch
 decompositions, MPI-host backend with the ranks sharing one GPU, every linear solve converged (tolerance 1e-12,
 relTol 0). Largest difference over the field's largest value:
@@ -28,7 +30,7 @@ Compare with converged solves. At the case's own tolerances (`p_rgh` 1e-7, relTo
 of this case differ from each other by 7.8e-2 to 3.1e-1 of U after 12 steps, so a comparison at those tolerances
 says nothing about the operators.
 
-Two defects stood between the earlier runs and this, both in cells on a processor face:
+Three defects stood between the earlier runs and this. Two were numerical, both in cells on a processor face:
 
 - grad(p_rgh), read by the pressure corrector's non-orthogonal correction, took the patch's own evaluate on a
   processor face where `fvc::grad` takes the interpolated value (1.2e-3 of U at np 2 after one step);
@@ -37,10 +39,15 @@ Two defects stood between the earlier runs and this, both in cells on a processo
   on the device now, before the first step. The stage gates took that pass on the device already, which is why they
   passed.
 
-The earlier full-size G4 run at np = 2 (51 steps, alpha 0.43 and U 1.1 from serial at t = 0.004) predates both fixes
+The third stopped every np > 1 run on the V100s and never showed on the laptop: the queued continuity sums were
+reduced from a host `std::vector` through the device-resident `ProcComm::allReduce`. The laptop's driver lets the GPU
+read ordinary host memory (HMM), so the copy worked there; on the V100 nodes (driver 535) the MPI-host backend's copy
+failed with `D2H: invalid argument` and NCCL with an illegal memory access and a hang. The sums now go through
+`allReduceHost`, and the device-resident entry points refuse host memory by name on every machine.
+
+The earlier full-size G4 run at np = 2 (51 steps, alpha 0.43 and U 1.1 from serial at t = 0.004) predates these fixes
 and ran at the case's loose tolerances; it is evidence of neither parity nor its absence. The one-rank decomposed
-case (`-parallel`, np = 1) remains byte-identical to the serial run. NCCL solver runs, np = 8, and any solver run on
-distinct physical GPUs remain to be measured.
+case (`-parallel`, np = 1) remains byte-identical to the serial run.
 
 ## What is in
 
@@ -150,8 +157,9 @@ global quiescence (measured at np=2 on one shared GPU), so the captured graphs a
   second defect does not show at all (1.2e-8), which is why the gate moves it there. They need OpenFOAM v2606 and a
   GPU, the last one `mpirun` as well, and skip otherwise.
 
-What has not run: any real multi-GPU NCCL run across distinct physical GPUs, NVLink behaviour, and sm_70 execution of
-this code.
+Not yet measured: an OpenFOAM `-parallel` reference of the full-size case (parity there is against brae's own np = 1,
+which the single-GPU gates hold to OpenFOAM), and the solver's conditional-graph loops versus the host-driven ones on
+the V100s.
 
 ## Running on Rosie (MSOE), the V100 DGX-1 nodes
 
@@ -175,7 +183,11 @@ NVIDIA's `cuda-compat` package fixes it without root: a newer user-mode `libcuda
 | `nccl_spike` (single process, N GPUs) | still fails at `cudaGraphInstantiate` ("operation not permitted when stream is capturing") at 2, 4, 8 GPUs; its eager test, which showed reduction mismatches without compat, now has none |
 | `nvidia-smi` | unchanged: kernel driver 535.161.08 (its CUDA field shows 12.9) |
 
-Not run: any brae solver or benchmark with the compat libraries. `cudaDriverGetVersion` reports 12090 with them, so `braeCondGraphsAvailable()` accepts the graph loops.
+With them `cudaDriverGetVersion` reports 12090, so `braeCondGraphsAvailable()` accepts the graph loops (the solver runs
+below left that choice to it; their logs do not record which loops ran). They only work on a 535 kernel driver: on `dh-dgx1-1` and `dh-dgx1-2` (525.105.17, an end-of-life
+branch NVIDIA's forward compatibility does not support) every CUDA call fails with error 803, "unsupported display
+driver / cuda driver combination", and this build does not run there at all. Request the node with
+`--exclude=dh-dgx1-1,dh-dgx1-2`.
 
 ```bash
 ROOT="$HOME/brae-mgpu"; export PATH="$ROOT/env/bin:$PATH" OPAL_PREFIX="$ROOT/env" CUDA_DEVICE_ORDER=PCI_BUS_ID
@@ -184,6 +196,33 @@ export LD_LIBRARY_PATH="$ROOT/compat/12-9:$ROOT/env/lib:$ROOT/nccl/nvidia/nccl/l
 
 The compat directory is about 300 MB and NVIDIA's proprietary libraries: keep it in your own home, do not redistribute it or commit it. The clean fix is a driver of 550 or newer on the nodes (a request to the administrators).
 
-**Job etiquette on Rosie.** One allocation at a time. Hold the node with `sbatch -p dgx --nodelist=dh-dgx1-3 --gres=gpu:v100:8 --exclusive --time=... --wrap='sleep N'`, run steps with `srun --jobid=<id> --overlap ...` one at a time, release with `scancel <id>` when done.
+**Job etiquette on Rosie.** One allocation at a time, released as soon as it is done. `tools/rosie/session_dgx.sh` is the
+whole measurement as one batch job (checks, converged-solve parity, timings; tools/rosie/README.md section 3e), so the
+node goes back the moment it ends.
 
-**Measured on the V100s so far:** `test_proc_comm` with NCCL passes at np 2, 4 and 8 on distinct GPUs, including all abort tests. No solver run has happened there yet.
+**Measured on the V100s (2026-11-10, `dh-dgx1-3`, compat 12.9, NCCL 2.32.3, the placement tool's GPU map).** The G4
+case of `tools/rosie/stage_case.sh`: 2,483,933 cells, scotch decompositions, fixed deltaT 1e-4, the case's own
+solver tolerances, 60 steps. Per-step time is the slowest rank's `ALL PHASES` (startup and output excluded; phase
+timing on, which synchronises at phase boundaries):
+
+| np | ms per step | speedup | parallel efficiency | alpha at the end |
+|---|---|---|---|---|
+| 1 | 398.9 | 1.00 | 100% | [-3.54e-7, 1.0000002] |
+| 2 | 280.8 | 1.42 | 71% | [-3.49e-7, 1.0000004] |
+| 4 | 164.0 | 2.43 | 61% | [-3.49e-7, 1.0000003] |
+| 8 | 101.8 | 3.92 | 49% | [-3.49e-7, 1.0000003] |
+
+Parity, five fixed steps with every linear solve converged (tolerance 1e-12, relTol 0), largest difference from np 1
+over the field's largest value:
+
+| np | U | p_rgh | phi | alpha |
+|---|---|---|---|---|
+| 2 | 4.3e-10 | 1.8e-10 | 2.3e-9 | 8.7e-11 |
+| 4 | 1.7e-10 | 2.3e-10 | 7.8e-10 | 1.1e-12 |
+| 8 | 3.4e-9 | 4.2e-10 | 1.7e-8 | 3.1e-10 |
+
+The two-step checks also pass at np 2 on the MPI-host backend (1560 ms a step against NCCL's 1600, both including the
+first step's setup). NCCL logs `ipcHandleMultiSegmentRegistration ... Cuda failure 1 'invalid argument'` warnings at
+np > 1 on these nodes; the runs complete and agree, so they are a lead for the performance work, not a correctness
+issue. The scaling is below the estimate in "What is in" (4.7-5.9x at 8 GPUs); the AMG-PCG iteration growth and the
+per-iteration collectives are where to look first.
