@@ -268,6 +268,25 @@ The `End` alpha range is a smoke/correctness indicator, **not** a proof of
 physical correctness. Check `alpha=[min,max]`, unexpected early `pulseStop`, NaNs,
 large divergence, per-rank AMG iterations, and G4 zero-degree contact-angle issues.
 
+### 3e. The whole allocation as one job
+
+`session_dgx.sh` runs sections 3b to 3c in order as the batch job itself, so the node is released when it ends: the
+driver and GPU count, fresh extractions, the two-step checks (np 1, np 2 on MPI-host, np 2/4/8 on NCCL with MPI-host
+as the fallback), the parity step below, then the 60-step timings. A step runs only if what it needs passed; every
+run's logs and a `summary.txt` land in `results/session_<tag>/`.
+
+```bash
+sbatch -p dgx -N1 --gres=gpu:v100:8 --exclusive -t 03:00:00 --job-name=g4brae \
+  --output=$HOME/brae-mgpu/results/session.%j.log \
+  --wrap='$HOME/brae-mgpu/src/tools/rosie/session_dgx.sh'
+```
+
+**Parity** is `run_dgx.sh --parity N`: N fixed steps with every linear solve converged (tolerance 1e-12, relTol 0),
+the case copy kept as `<case>.parity_<comm>`, and each np compared with np 1 by `compare_fields.py`. Compare
+converged runs only: at the case's own tolerances OpenFOAM's np 1, 2 and 4 runs of a G4-like case differ from each
+other by 7.8e-2 to 3.1e-1 of U (docs/multi-gpu.md), so a loose comparison says nothing. Laptop rehearsal on the staged
+tank, np 2 against np 4, three steps: U 2.3e-8.
+
 ## 4. Correctness collection
 
 For each successful np, retain `postProcessing/` (rank-0 global FO files) and the

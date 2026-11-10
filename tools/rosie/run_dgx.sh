@@ -20,6 +20,7 @@ NP=
 RESULTS=
 BACKEND=nccl
 CHECK=0
+PARITY_STEPS=0
 TOPO=0
 GPU_MAP=${BRAE_GPU_MAP:-}
 COND_GRAPH=${BRAE_COND_GRAPH:-}
@@ -34,6 +35,9 @@ usage() {
 Usage: run_dgx.sh --case DIR --np N [options]
   --comm nccl|mpi      communication backend (default nccl)
   --check             copy the case's dictionaries and run exactly two fixed steps
+  --parity N          N fixed steps with every linear solve converged (tolerance 1e-12,
+                      relTol 0); the case copy is KEPT beside the input as
+                      <case>.parity_<comm> for tools/mgpu_oracle/compare_fields.py
   --topo              obtain BRAE_GPU_MAP with proc_topology_tool --topology probe
   --gpu-map 0,3,...   explicit comma-separated node-local rank -> GPU map
   --no-cond-graph     force BRAE_COND_GRAPH=0 (default: unset/driver decision)
@@ -60,6 +64,7 @@ while (($#)); do
         --np) NP=$2; shift ;;
         --comm) BACKEND=$2; shift ;;
         --check) CHECK=1 ;;
+        --parity) CHECK=1; PARITY_STEPS=$2; shift ;;
         --topo) TOPO=1 ;;
         --gpu-map) GPU_MAP=$2; TOPO=0; shift ;;
         --no-cond-graph) COND_GRAPH=0 ;;
@@ -76,6 +81,7 @@ BRAE_MODE=${BRAE_MODE:-dgx}
 [[ $BRAE_MODE == dgx || $BRAE_MODE == laptop ]] || { echo "BRAE_MODE must be dgx or laptop" >&2; exit 2; }
 [[ $BACKEND == nccl || $BACKEND == mpi ]] || { echo "--comm must be nccl or mpi" >&2; exit 2; }
 [[ $NP =~ ^[1-9][0-9]*$ ]] || { echo "--np must be a positive integer" >&2; exit 2; }
+[[ $PARITY_STEPS =~ ^[0-9]+$ ]] || { echo "--parity needs a step count" >&2; exit 2; }
 [[ $TIMEOUT_SECONDS =~ ^[1-9][0-9]*$ ]] || { echo "--timeout must be a positive integer" >&2; exit 2; }
 [[ $GPU_SAMPLE_SECONDS =~ ^[1-9][0-9]*$ ]] || { echo "GPU_SAMPLE_SECONDS must be an integer" >&2; exit 2; }
 [[ -d $CASE ]] || { echo "staged case does not exist: $CASE" >&2; exit 1; }
@@ -135,10 +141,19 @@ if ((CHECK)); then
     # because /tmp and the case can be on different filesystems. Only system/
     # timing controls change; the input case remains pristine.
     CASE_INPUT=$CASE
-    CASE=$(mktemp -d "$(dirname "$CASE")/.brae-check-${NP}.XXXXXX")
-    # shellcheck disable=SC2329 # called by the combined EXIT trap
-    cleanup_check_case() { rm -rf "$CASE"; }
-    trap cleanup_check_case EXIT
+    if ((PARITY_STEPS)); then
+        # kept: its last time directory is what the decompositions are compared on
+        CASE=${CASE_INPUT}.parity_${BACKEND}
+        [[ ! -e $CASE ]] || { echo "refusing to reuse parity case: $CASE" >&2; exit 1; }
+        mkdir "$CASE"
+        # shellcheck disable=SC2329 # called by the combined EXIT trap
+        cleanup_check_case() { :; }
+    else
+        CASE=$(mktemp -d "$(dirname "$CASE")/.brae-check-${NP}.XXXXXX")
+        # shellcheck disable=SC2329 # called by the combined EXIT trap
+        cleanup_check_case() { rm -rf "$CASE"; }
+        trap cleanup_check_case EXIT
+    fi
     for item in "$CASE_INPUT"/*; do
         name=${item##*/}
         [[ $name == system || $name == constant || $name == postProcessing ]] && continue
@@ -146,21 +161,36 @@ if ((CHECK)); then
     done
     cp -a "$CASE_INPUT/system" "$CASE/system"
     cp -a "$CASE_INPUT/constant" "$CASE/constant"
-    python3 - "$CASE/system/controlDict" "$DELTA_T" <<'PY'
+    CHECK_STEPS=2; ((PARITY_STEPS == 0)) || CHECK_STEPS=$PARITY_STEPS
+    python3 - "$CASE/system/controlDict" "$DELTA_T" "$CHECK_STEPS" "$PARITY_STEPS" "$CASE/system/fvSolution" <<'PY'
 import pathlib, re, sys
 path = pathlib.Path(sys.argv[1])
+steps, parity = int(sys.argv[3]), int(sys.argv[4])
 text = path.read_text()
-end_time = format(2.25 * float(sys.argv[2]), ".17g")
+end_time = format((steps + 0.25) * float(sys.argv[2]), ".17g")
 values = {"deltaT": sys.argv[2], "adjustTimeStep": "no", "writeControl": "timeStep",
-          "writeInterval": "2", "purgeWrite": "1", "endTime": end_time}
+          "writeInterval": str(steps), "purgeWrite": "0" if parity else "1", "endTime": end_time}
 for key, value in values.items():
     pattern = r"(?m)^(\s*" + re.escape(key) + r"\s+)[^;]+;"
     text, count = re.subn(pattern, r"\g<1>" + value + ";", text, count=1)
     if count != 1:
         raise SystemExit(f"{path}: missing timing entry {key}")
 path.write_text(text)
+if parity:
+    # Every solver entry converged: at the case's own tolerances two decompositions of one case differ by
+    # percents of U in OpenFOAM itself, and nothing can be read off a comparison of them.
+    sol = pathlib.Path(sys.argv[5])
+    text = sol.read_text()
+    text, nt = re.subn(r"(\btolerance\s+)[^;]+;", r"\g<1>1e-12;", text)
+    text, nr = re.subn(r"(\brelTol\s+)[^;]+;", r"\g<1>0;", text)
+    if nt == 0 or nr == 0:
+        raise SystemExit(f"{sol}: no tolerance/relTol entries to tighten")
+    sol.write_text(text)
 PY
-    END_TIME=$(python3 -c 'import sys; print(format(2.25*float(sys.argv[1]), ".17g"))' "$DELTA_T")
+    END_TIME=$(python3 -c 'import sys; print(format((int(sys.argv[2]) + 0.25)*float(sys.argv[1]), ".17g"))' "$DELTA_T" "$CHECK_STEPS")
+    # the fixed preset above is what the copy runs, whatever the input's adjustTimeStep
+    ADJUST_DT=no
+    ((PARITY_STEPS == 0)) || export BRAE_PCG_CHECK_EVERY=1
 fi
 EXPECTED_STEPS=$(python3 - "$END_TIME" "$DELTA_T" "$ADJUST_DT" <<'PY'
 import sys
