@@ -6319,7 +6319,8 @@ RunReport runInterFoamDevice(
                   "the queued continuity sums");
         if (procComm && !r.empty())
         {
-            procComm->allReduce(r.data(), static_cast<int>(r.size()), ReduceOp::Sum, cudaStreamPerThread);
+            // host data: the host-resident reduction (the device-resident one refuses a host vector)
+            procComm->allReduceHost(r.data(), static_cast<int>(r.size()), ReduceOp::Sum);
         }
         for (std::size_t k = 0; k < r.size(); ++k)
         {

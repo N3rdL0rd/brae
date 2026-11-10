@@ -262,7 +262,22 @@ public:
     {
         if (size_ == 1) return;
         checkPlan(plan);
+        requireDeviceMemory(arr, "exchangeFaces");
         doExchangeFaces(plan, arr, op, stream, ch);
+    }
+
+    // THE DEVICE-RESIDENT ENTRY POINTS TAKE GPU MEMORY. Ordinary (pageable) host memory handed to one of them works
+    // where the driver lets the GPU read pageable memory (HMM: the laptop's) and fails everywhere else -- MEASURED on
+    // the V100 nodes (driver 535): the MPI-host copy "D2H: invalid argument", NCCL an illegal memory access and a hang,
+    // from one host std::vector given to allReduce. Refused here by name on every machine; allReduceHost takes host data.
+    static void requireDeviceMemory(const void* p, const char* what)
+    {
+        cudaPointerAttributes a{};
+        const cudaError_t e = cudaPointerGetAttributes(&a, p);
+        if (e != cudaSuccess) (void)cudaGetLastError();
+        if (e != cudaSuccess || a.type == cudaMemoryTypeUnregistered)
+            throw std::invalid_argument(std::string("ProcComm::") + what + ": the data is not GPU memory "
+                                        "(ordinary host memory; the host-resident overload takes that)");
     }
 
     // ---- collectives ----------------------------------------------------------------------------------------
@@ -271,6 +286,7 @@ public:
     void allReduce(double* dData, int n, ReduceOp op, cudaStream_t stream, CommChannel ch = CommChannel::Eager)
     {
         if (size_ == 1) return;
+        if (n > 0) requireDeviceMemory(dData, "allReduce (device-resident)");
         doAllReduceDevice(dData, n, op, stream, ch);
     }
     // Host-resident, in place, blocking.
@@ -285,6 +301,7 @@ public:
     void bcastDevice(double* dData, int n, int root, cudaStream_t stream, CommChannel ch = CommChannel::Eager)
     {
         if (size_ == 1) return;
+        if (n > 0) requireDeviceMemory(dData, "bcastDevice");
         doBcastDevice(dData, n, root, stream, ch);
     }
     void bcastHost(double* hData, int n, int root)
