@@ -5490,3 +5490,9 @@ set_tests_properties(mgpu_stage_gate PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600
 add_test(NAME mgpu_alpha_stage_gate
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_alpha_stage_gate.sh $<TARGET_FILE:brae_interFoam>)
 set_tests_properties(mgpu_alpha_stage_gate PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400)
+# Whole steps across processor faces: np = 2 and 4 against the undecomposed run with every solve converged, on the
+# sheared, graded tank with a contact angle (the wall cells and the non-orthogonal correction the stage gates do not
+# reach). Needs a GPU, mpirun and OpenFOAM v2606 (skips, exit 77, without them).
+add_test(NAME mgpu_step_parity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_step_parity.sh $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(mgpu_step_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
