@@ -433,6 +433,15 @@ scalar deviceInterPressureStep(
         {
             DeviceBuffer<scalar> bval, gx, gy, gz;
             hooks.boundaryValues(p_rgh, bval);
+            // ...AND A PROCESSOR FACE IS A COUPLED FACE: fvc::grad's Gauss sum takes the INTERPOLATED value there,
+            // w*p[own] + (1-w)*p[nbr] (surfaceInterpolationScheme.C:186-191; gaussGrad::correctBoundaryConditions
+            // leaves a coupled patch alone, gaussGrad.C:218), where the hook's entry is the patch's own evaluate.
+            // Taking that evaluate put ~p[nbr] on the face, a gradient wrong in every cell on the interface.
+            if (proc)
+            {
+                procExchange(*proc, {&p_rgh}, "p_rgh for grad(p_rgh)'s processor faces");
+                procFaceValue(*proc, p_rgh, bval);
+            }
             // THE CASE'S OWN gradSchemes ENTRY, through deviceGradOf. A leastSquares fit takes the pair
             // INSIDE it (deviceLeastSquaresGrad's `cyc` argument, leastSquaresVectors.C:131-140) where the
             // Gauss path adds the pair's faces AFTERWARDS -- so the two are wired differently below, and a
