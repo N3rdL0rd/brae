@@ -2389,9 +2389,17 @@ InterFields buildInterFields(const CaseRoots&            roots,
     // pass is what leaves alpha's wall gradient non-zero for the second one to build on.
     // UNDER THE STAGE DUMP (inter_parallel.cuh) alpha's patches stay as READ: the device's stage pass is this
     // constructor pass (taken there with the processor faces), and a host pass first would make it the second one.
-    const bool stageDump = !mgpuStageDumpDir().empty();
+    // ...AND ON A RANK WITH PROCESSOR PATCHES, stage dump or not: this host pass has no neighbour rank behind a
+    // processor patch (its patch field is an inert placeholder), so the gradient it takes in every cell on one --
+    // and with it the wall gradient and value the contact angle leaves there, which every later pass builds on --
+    // is not the mesh's. The device loop takes the constructor pass before its first step, with the processor faces
+    // (inter_driver_device.cu), from the patches as read here.
+    bool hasProcessorPatch = false;
+    // (the predicate the device driver builds its processor context on: a processor patch that has faces)
+    for (const FvPatch& q : patches) hasProcessorPatch = hasProcessorPatch || (isProcessorType(q.type) && q.size > 0);
+    const bool devicePass = !mgpuStageDumpDir().empty() || hasProcessorPatch;
     std::vector<std::vector<scalar>> stageVal(patches.size()), stageGrad(patches.size());
-    if (stageDump)
+    if (devicePass)
     {
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
@@ -2400,7 +2408,7 @@ InterFields buildInterFields(const CaseRoots&            roots,
         }
     }
     interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
-    if (stageDump)
+    if (devicePass)
     {
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {

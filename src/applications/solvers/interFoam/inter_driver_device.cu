@@ -6657,6 +6657,19 @@ RunReport runInterFoamDevice(
             return stageReport;
         }
     }
+    // interfaceProperties' CONSTRUCTOR PASS ACROSS PROCESSOR FACES (interfaceProperties.C:196-210). On a single mesh the
+    // host takes it while it builds the fields and this loop starts from its normal, curvature and wall gradient; a
+    // rank with processor patches cannot -- the host has no neighbour rank -- so buildInterFields left alpha's patches
+    // as read (inter_case_cpp.cu) and the pass is taken here, through the hook and the operator every later
+    // mixture.correct() of the loop goes through. Seeding from the host's pass instead left the contact angle's wall
+    // gradient wrong in every wall cell on a processor face, and each pass after it builds on the one before.
+    if (procCtx)
+    {
+        H.alpha.mixtureCorrect(dA, dABnd, dNHB);
+        procAlphaTail(dA, dABnd);
+        deviceInterfaceCorrect(dm, dA, dABnd, dNHB, f.interface.deltaN, f.interface.nHatGrad.leastSquares,
+                               f.interface.nHatGrad.cellLimitK, dNH, dK, nullptr, nullptr);
+    }
     // interFoam.C:81-85, BEFORE the time loop and not under LTS: CourantNo.H on the flux the start has (the
     // pair's faces in the sum, as in the loop), then setInitialDeltaT.H -- see time_controls.cuh and the host
     // loop (inter_driver_cpp.cu).
