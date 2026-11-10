@@ -5,18 +5,42 @@ split by OpenFOAM's `decomposePar` (`processorN/` directories), processor patche
 builds its own preconditioner, and reductions are global. The aim is a result that can be checked against OpenFOAM
 `-parallel` on the same decomposition. Single-GPU runs are unchanged (byte for byte, checked on every commit).
 
-**Status (2026-11-05): execution and I/O are implemented, but numerical parity is not
-accepted for the real G4 case.** A scotch decomposition of the initialized `case/0` (not the dry
-`0.orig`) completed 51 time steps at np = 2 on the MPI-host backend with matching rank Courant/deltaT
-lines and reconstructable processor output. That run still drifted severely from serial brae/OpenFOAM
-(alpha maxrel 0.4301, U 1.109, p_rgh 1.547 at t = 0.004); it is not evidence of a valid multi-GPU
-solution. The ordinary small tank is the local regression case.
+**Status (2026-11-10): on the coarse G4-like case brae `-parallel` agrees with OpenFOAM v2606 `-parallel` on the
+same decomposition at np = 2 and 4. The full 2.48M-cell G4 case has not been re-run at np > 1 since.** The case is a
+31,192-cell snappyHexMesh version of G4 (same schemes, contact-angle walls, `nNonOrthogonalCorrectors 0`), scotch
+decompositions, MPI-host backend with the ranks sharing one GPU, every linear solve converged (tolerance 1e-12,
+relTol 0). Largest difference over the field's largest value:
 
-The one-rank decomposed case (`-parallel`, np = 1) remains byte-identical to the serial run. The old
-blanket refusal `processor patches need the multi-GPU coupling, not yet implemented` is gone: explicit
-alpha/MULES, momentum/pressure assembly, distributed AMG-PCG and global time controls now run across
-processor faces. G4 parity, np = 4/8 acceptance, NCCL, and the 233-step hot-path identity remain to be
-measured; no solver run on distinct physical GPUs has been performed.
+| pair | steps | U | p_rgh | phi | alpha |
+|---|---|---|---|---|---|
+| OpenFOAM np 1 vs brae np 1 | 100 | 1.9e-9 | 3.1e-10 | 4.1e-9 | 1.8e-11 |
+| OpenFOAM np 2 vs brae np 2 | 12 | 9.5e-10 | 2.3e-9 | 6.5e-9 | 8.5e-14 |
+| OpenFOAM np 4 vs brae np 4 | 100 | 5.5e-9 | 4.3e-10 | 6.1e-9 | 1.8e-11 |
+| brae np 1 vs brae np 2 | 100 | 4.4e-7 | 1.4e-7 | 4.7e-7 | 1.5e-7 |
+| brae np 1 vs brae np 4 | 100 | 6.849e-3 | 8.2e-5 | 5.5e-3 | 3.2e-7 |
+| OpenFOAM np 1 vs OpenFOAM np 4 | 100 | 6.849e-3 | 8.2e-5 | 5.5e-3 | 3.2e-7 |
+
+(100 steps end at t = 0.0093 with max|U| 0.078 m/s; 12 steps at t = 0.00047.) The np 4 scotch split cuts the free
+surface (320 processor faces with an alpha jump), the np 2 split does not. A decomposed run differs from the
+undecomposed one by OpenFOAM's own amount.
+
+Compare with converged solves. At the case's own tolerances (`p_rgh` 1e-7, relTol 0.05) OpenFOAM's np 1, 2 and 4 runs
+of this case differ from each other by 7.8e-2 to 3.1e-1 of U after 12 steps, so a comparison at those tolerances
+says nothing about the operators.
+
+Two defects stood between the earlier runs and this, both in cells on a processor face:
+
+- grad(p_rgh), read by the pressure corrector's non-orthogonal correction, took the patch's own evaluate on a
+  processor face where `fvc::grad` takes the interpolated value (1.2e-3 of U at np 2 after one step);
+- the interfaceProperties constructor pass ran on the host, which has no neighbour rank, and the device loop
+  started from its normal, curvature and contact-angle wall gradient (0.31 of U at np 4 after one step). It is taken
+  on the device now, before the first step. The stage gates took that pass on the device already, which is why they
+  passed.
+
+The earlier full-size G4 run at np = 2 (51 steps, alpha 0.43 and U 1.1 from serial at t = 0.004) predates both fixes
+and ran at the case's loose tolerances; it is evidence of neither parity nor its absence. The one-rank decomposed
+case (`-parallel`, np = 1) remains byte-identical to the serial run. NCCL solver runs, np = 8, and any solver run on
+distinct physical GPUs remain to be measured.
 
 ## What is in
 
@@ -120,7 +144,11 @@ global quiescence (measured at np=2 on one shared GPU), so the captured graphs a
 - `tools/proc_comm_nccl/` — run instructions for the NCCL backend and the placement tool on 2, 4 and 8 GPUs.
 - `tools/bench_v100/` — a single-V100 benchmark of the tank case.
 - ctest: `proc_comm*` (loopback, MPI, NCCL, graph capture), `dist_solvers_np{2,4,8}`, `mgpu_proc_geometry`,
-  `processor_patch_reader`, `mgpu_np1_byte_identical` (needs OpenFOAM v2606 and a GPU; skips otherwise).
+  `processor_patch_reader`, `mgpu_np1_byte_identical`, and `mgpu_step_parity` — np 2 and 4 against the undecomposed
+  run on the sheared, graded tank with converged solves and the pool's surface on the processor cut, bound 1e-6 of U.
+  Measured: 1.2e-9; 3.0e-5 without the second fix above; 4.4e-1 without either. With the surface off the cut the
+  second defect does not show at all (1.2e-8), which is why the gate moves it there. They need OpenFOAM v2606 and a
+  GPU, the last one `mpirun` as well, and skip otherwise.
 
 What has not run: any real multi-GPU NCCL run across distinct physical GPUs, NVLink behaviour, and sm_70 execution of
 this code.

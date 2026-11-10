@@ -27,7 +27,7 @@ cd yourTwoPhaseCase && brae
 | **Sources** | `explicitPorositySource` (Darcy-Forchheimer), MRF |
 | **I/O** | standard OpenFOAM case in, standard time directories out, ASCII or binary |
 | **Function objects** | `volFieldValue`, `surfaceFieldValue`, `probes`, `fieldMinMax`, `exprField` and `runTimeControl` (see below); their `adjustableRunTime` write times also trim the time step, as in OpenFOAM |
-| **Not yet** | the other function objects (`surfaces`, `forces`, `fieldAverage`, ... are noticed and not run), multi-GPU (in progress: [Multi-GPU](../multi-gpu.md); `-parallel` reads a `decomposePar` case and runs on one rank, a split with processor faces is refused by name) |
+| **Not yet** | the other function objects (`surfaces`, `forces`, `fieldAverage`, ... are noticed and not run), multi-GPU as a validated feature (in progress: [Multi-GPU](../multi-gpu.md); `-parallel -device` runs a `decomposePar` case across processor faces and agrees with OpenFOAM `-parallel` on a coarse case at np 2 and 4, but the full-size case and distinct physical GPUs are not validated) |
 
 A setting this solver does not carry stops the run at start-up and names itself; it is never replaced by a
 default.
