@@ -404,7 +404,11 @@ scalar deviceInterPressureStep(
     // constructor's updateCoeffs (pressureCoeffs), the laplacian, its explicit correction from the p_rgh
     // the last pass left, the solve, and p_rgh.correctBoundaryConditions(). The LAST pass's matrix and
     // correction flux make p_rghEqn.flux().
-    DevicePressureMatrix P;
+    // THE MATRIX'S BUFFERS OUTLIVE THE CALL, one set a rank thread (leaked, like the other device caches): a captured
+    // V-cycle is keyed on where the matrix lives (amgGraphViewMoved), and buffers made afresh at every corrector came
+    // back from the pool at other addresses, so the graph was captured and instantiated again at nearly every solve.
+    // Every entry is written below before it is read, as it always had to be: the pool's blocks are not cleared.
+    static thread_local DevicePressureMatrix& P = *new DevicePressureMatrix;
     DeviceBuffer<scalar> iC, bC;
     // p_rgh's jump on the pair, refreshed by the hook at every assembly; empty = no jump there
     DeviceBuffer<scalar> cycJump;
@@ -530,7 +534,8 @@ scalar deviceInterPressureStep(
         const bool pcgDIC = lastPass ? in.pcgDIC : in.pcgDICInner;
         const GamgControls* gamg = lastPass ? in.gamg : in.gamgInner;
         const GamgPreconditionerControls* pcgGamg = lastPass ? in.pcgGamg : in.pcgGamgInner;
-        DeviceBuffer<scalar> diagC, b;
+        static thread_local DeviceBuffer<scalar>& diagC = *new DeviceBuffer<scalar>;
+        static thread_local DeviceBuffer<scalar>& b = *new DeviceBuffer<scalar>;
         deviceFold(dm, P.diag, P.source, iC, bC, diagC, b);
         // ...and the periodic pair's off-diagonal, which deviceAmul applies as
         // Apsi[own] += ifCoeff*psi[nbr] (device_ldu.cuh:28-33). Without it the solve is a different
