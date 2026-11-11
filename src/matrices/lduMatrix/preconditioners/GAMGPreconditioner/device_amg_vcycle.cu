@@ -1512,24 +1512,13 @@ void amgCastFP32(
     }
 }
 // FP32 recursive V-cycle. topoG = grid g's FP64 view (topology + the FP64 coarsest solve); Ag = grid g's FP32 matrix.
-// FP-12 TRIED FUSING THE COARSE HIERARCHY INTO ONE KERNEL AND IT IS SLOWER. The idea was the one that
-// worked for device_dilu.cu's level walk: from the first level small enough for a single block, do the
-// whole rest of the V-cycle -- down, the coarsest LU solve, and back up -- in ONE kernel with
-// __syncthreads where the launches were. It was written, and it is exactly bit-identical (every
-// residual line over 100 iterations of gasMixing/injectorPipe matched the separate-launch path). It
-// was also measured, and every threshold lost: fusing below 64 / 128 / 256 / 512 / 1024 / 2048 cells
-// gives a pressure phase of 6.7 / 6.7 / 6.9 / 6.9 / 7.1 / 7.0 ms per iteration against 6.5 for the
-// separate launches.
-//
-// WHY, and this is the part worth keeping: these kernels are ALREADY graph nodes, so the node-to-node
-// overhead is not what the V-cycle is paying. Fusing below 64 cells removes a dozen node boundaries on
-// levels where one block of 256 threads is more than enough parallelism, and it still gained nothing --
-// so the boundaries are cheap. What the coarse levels actually pay is the DEVICE-SIDE duration of a
-// scattered indirect gather: the FP32 SpMV takes 4.2 us on a level under 1,000 cells where zeroT on the
-// same grid takes 0.76, because owner/losort indirection with few threads has no parallelism to hide
-// the latency. One block makes that strictly worse. The lever that remains is the coarse operator's
-// LAYOUT -- a per-level CSR whose inner loop is one contiguous read instead of two indirections -- not
-// the launch structure.
+// THE COARSE GRIDS RUN AS ONE KERNEL (device_amg_fused.cu, BRAE_AMG_FUSE_BELOW). FP-12 tried that first, bit-identical,
+// and measured it SLOWER at every threshold on gasMixing/injectorPipe (74,650 cells, 11 levels): fusing below 64 ...
+// 2048 cells gave a pressure phase of 6.7-7.1 ms an iteration against 6.5 for the separate launches, because the
+// products then still went through two indirections each and one block made that gather slower. The coarse
+// products are contiguous rows since (amulCsrFK, FP-12's own result), and tests/test_amg_fused_coarse.cu measures
+// the captured cycle 1.14-1.33x faster on an RTX 5090 at 1024 cells (graph nodes 62 -> 31 on pitzDaily), the
+// fusion bit-identical; above a few thousand cells one block's throughput loses (the sweep in that test).
 // The FP32 SpMV for grid g: the contiguous-row form where that grid has one, the face form otherwise.
 // Same sum, same order, same bits either way (see amgBuildCsrFP32).
 static inline void amgSpmvF(AMGData& amg, int g, const LduF& Ag, const float* x, float* y)
