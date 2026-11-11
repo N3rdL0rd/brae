@@ -187,7 +187,8 @@ void deviceNormFactorInto(
     // The summand is >= 0, so sum(|x|) is the plain sum of it.
     normFactorSummandK<<<(nC + 255)/256, 256>>>(nC, Apsi.data(), b.data(), tmp.data(), t.data());
     deviceSumMagInto(t, dN1.data());
-    dN2.copyFrom(std::vector<scalar>{scalar(0)});
+    // the zero queued behind the reduction: a blocking upload of it from the host waited for the whole queue first
+    cudaCheck(cudaMemsetAsync(dN2.data(), 0, sizeof(scalar), cudaStreamPerThread), "normFactor zero");
     deviceScalarAdd2(dN1.data(), dN2.data(), 1e-20, dNorm.data());                    // sum + 0 + small
 }
 
