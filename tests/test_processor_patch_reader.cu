@@ -100,8 +100,7 @@ int main(int argc, char** argv)
             CHECK(has(table, "procBoundary1to3") && has(table, "rank 1 <-> rank 3") && has(table, "1728 processor face"),
                   "table:\n%s", table.c_str());
             const std::string why = thrown([&] { cpu::interFoam::refuseProcessorCoupling(r, P); });
-            CHECK(has(why, "processor patches need the multi-GPU coupling, not yet implemented") && has(why, "procBoundary1to0"),
-                  "refusal: %s", why.c_str());
+            CHECK(why.empty(), "-parallel couples processor patches, it does not refuse them: %s", why.c_str());
             const std::string serial = thrown([&] { cpu::interFoam::refuseProcessorCoupling(CaseRoots("case"), P); });
             CHECK(has(serial, "-parallel") && has(serial, "ordinary wall"), "serial refusal: %s", serial.c_str());
         }
@@ -204,7 +203,9 @@ int main(int argc, char** argv)
         CaseRoots r;
         r.parallel = true; r.rank = rank; r.nProcs = 2; r.dictDir = "c"; r.procDir = "c/processor" + std::to_string(rank);
         const std::string why = thrown([&] { cpu::interFoam::refuseProcessorCoupling(r, m.patches()); });
-        CHECK(has(why, "processor patches need the multi-GPU coupling, not yet implemented"), "refusal: %s", why.c_str());
+        CHECK(why.empty(), "-parallel couples processor patches, it does not refuse them: %s", why.c_str());
+        const std::string serial = thrown([&] { cpu::interFoam::refuseProcessorCoupling(CaseRoots("c"), m.patches()); });
+        CHECK(has(serial, "ordinary wall") && has(serial, "-parallel"), "serial refusal: %s", serial.c_str());
     }
 
     // ---- 6. every tracked boundary parses as it did before ------------------------------------------------

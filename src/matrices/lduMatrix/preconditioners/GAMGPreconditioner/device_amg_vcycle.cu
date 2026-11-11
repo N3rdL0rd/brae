@@ -1332,7 +1332,10 @@ bool amgPrepareFineCsr64(
     // view of the same size is made into them in place (DeviceBuffer::copyFrom keeps a block of the same size), a view of another
     // size keeps amulKernel. Dropping the graphs here instead hid the one-off-diagonal gate's control and crashed interFoam's
     // captured cycle, whose solves hold the cache across this call (public suite on Arrhenius, job 4977432)
-    if (!amgFineCsrOn() || A.nCyc > 0 || A.nAmi > 0 || A.nInternalFaces <= 0)
+    // A DECOMPOSED MESH keeps amulKernel: its V-cycle is the rank-local block's preconditioner. With the rows the plain distributed
+    // loop's solve was no longer the fused loop's (MEASURED np 2, 40^3 Poisson: 20 iterations, the monolithic count, against the
+    // fused loop's 33), so the two stopped being bit-identical (tests/test_dist_solvers.cu).
+    if (!amgFineCsrOn() || A.proc.active() || A.nCyc > 0 || A.nAmi > 0 || A.nInternalFaces <= 0)
     {
         // a view the rows cannot serve: its products take amulKernel, and the rows stay as they are
         amg.csr64FineKey = nullptr;

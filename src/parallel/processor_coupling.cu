@@ -102,7 +102,7 @@ ProcessorCoupling attach(std::vector<FvPatch>& patches, const FvGeometry& g, lab
     {
         FvPatch& p = patches[static_cast<std::size_t>(idx[k])];
         const HaloNeighbour& nb = pd.nbrs[k];
-        if (nb.rank != p.neighbProcNo || nb.faceCount != p.size)
+        if (p.neighbProcNo != nb.rank || nb.faceCount != p.size)
         {
             throw std::runtime_error("brae: the halo plan's neighbour " + std::to_string(k) + " is not processor patch '"
                                      + p.name + "'.");
