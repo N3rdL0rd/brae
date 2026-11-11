@@ -10,8 +10,11 @@
 #include <string>
 #include <vector>
 #include <map>          // BRAE_POOL_STATS: allocation-size histogram
+#include <set>          // BRAE_POOL_POISON: the take numbers to poison
 #include <algorithm>    // sort, for the histogram report
 #include <unordered_map>
+#include <dlfcn.h>      // BRAE_POOL_STATS: the large-block ledger's frame offsets
+#include <execinfo.h>
 #include <cstdlib>
 #include <cstdio>
 
@@ -50,8 +53,21 @@ public:
     :
         enabled_(std::getenv("BRAE_NO_DEVICE_POOL") == nullptr),
         exact_(std::getenv("BRAE_CONTROL_POOL_EXACT") != nullptr),
-        short_(std::getenv("BRAE_CONTROL_POOL_SHORT_CLASS") != nullptr)
+        short_(std::getenv("BRAE_CONTROL_POOL_SHORT_CLASS") != nullptr),
+        stats_(std::getenv("BRAE_POOL_STATS") != nullptr)
     {
+        // BRAE_POOL_BIG_MIB: the smallest block the census tracks one by one (64 MiB unless set); a mesh of a few
+        // million cells has its cell fields below 64 MiB, so a lifetime audit there needs it lower
+        if (const char* m = std::getenv("BRAE_POOL_BIG_MIB"))
+        {
+            const long mib = std::atol(m);
+            if (mib < 1)
+            {
+                throw std::runtime_error(std::string("brae: BRAE_POOL_BIG_MIB=") + m + " is not a size of 1 MiB or more.");
+            }
+            big_ = static_cast<std::size_t>(mib) << 20;
+        }
+        readPoison();
         const char* e = std::getenv("BRAE_POOL_KEEP_STEPS");
         const long asked = e ? std::atol(e) : 0;
         if (e && asked < 1)
@@ -109,6 +125,7 @@ public:
                 void* p = it->second.back().p;
                 it->second.pop_back();
                 heldBytes_ -= cls;
+                countTake(p, cls, true);
                 return p;
             }
         }
@@ -118,13 +135,26 @@ public:
         mallocSeconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         mallocBytes_ += cls;
         ++mallocs_;
+        // the footprint only grows here, so its peak is taken here (BRAE_MEMORY_PROBE)
+        if (mallocBytes_ - freedBytes_ > peakFootprint_)
+        {
+            peakFootprint_ = mallocBytes_ - freedBytes_;
+        }
         hist_[cls].first += cls;
         ++hist_[cls].second;
+        if (stats_) mallocByPhase_[phase_] += cls;
+        countTake(p, cls, false);
         return p;
     }
     void give(void* p, std::size_t bytes)
     {
         if (!p) return;
+        if (stats_)
+        {
+            liveBytes_ -= classOf(bytes);
+            --classStat_[classOf(bytes)].live;
+            bigLive_.erase(p);
+        }
         if (enabled_ && bytes)
         {
             const std::size_t cls = classOf(bytes);
@@ -135,6 +165,35 @@ public:
         {
             cudaFree(p);
         }
+    }
+    // BRAE_POOL_STATS=1: the part of the caller's loop that is running, for the report's attribution of the
+    // bytes cudaMalloc'ed and of the peak of the bytes in use. A string literal; nothing but the report reads it.
+    void phase(const char* name)
+    {
+        phase_ = name;
+        // a class's blocks alive when a phase begins count as that phase's too, though it takes none
+        if (stats_)
+        {
+            for (auto& kv : classStat_)
+            {
+                std::size_t& inPhase = kv.second.maxByPhase[name];
+                if (kv.second.live > inPhase) inPhase = kv.second.live;
+            }
+        }
+        if (poisonPhase_.empty() || poisonPhase_ != name) return;
+        // BRAE_POOL_POISON: the chosen blocks overwritten at this phase's entry, from its poisonFrom_-th entry on.
+        // A block whose value here is never read before it is written again leaves every field as it was.
+        if (++poisonEntries_ < poisonFrom_) return;
+        std::size_t n = 0, bytes = 0;
+        for (const auto& kv : bigLive_)
+        {
+            if (!poisonIds_.count(kv.second.seq) && !takenAtPoisonSite(kv.second)) continue;
+            cudaCheck(cudaMemset(kv.first, poisonByte_, kv.second.cls), "pool poison");
+            ++n;
+            bytes += kv.second.cls;
+        }
+        std::fprintf(stderr, "[poison] %s entry %lu: %zu blocks, %.3f GB, byte 0x%02x\n", name, poisonEntries_, n,
+                     bytes/1073741824.0, poisonByte_);
     }
     // A STEP OF THE CALLER'S LOOP HAS ENDED: a block that has sat idle for `keep` steps is handed back to the
     // driver. A step's own temporaries are taken and given at every step, so what stays idle that long is a size
@@ -157,6 +216,7 @@ public:
             }
             if (n == 0) continue;
             idle.erase(idle.begin(), idle.begin() + static_cast<std::ptrdiff_t>(n));
+            if (stats_) classStat_[kv.first].trimmed += n;
             heldBytes_ -= n*kv.first;
             freedBytes_ += n*kv.first;
             frees_ += n;
@@ -193,6 +253,16 @@ public:
     {
         return freedBytes_;
     }
+    // the most the pool has held from the driver at once (cudaMalloc less what endOfStep handed back)
+    std::size_t peakFootprint() const
+    {
+        return peakFootprint_;
+    }
+    // false under BRAE_NO_DEVICE_POOL=1, where a give is a cudaFree that the footprint does not see
+    bool enabled() const
+    {
+        return enabled_;
+    }
     bool exactKeys() const
     {
         return exact_;
@@ -208,6 +278,29 @@ public:
             "[pool] %-10s cudaMalloc %8.3f GB in %zu calls | idle in free list %8.3f GB "
             "(%zu distinct sizes, %zu blocks)\n",
             when, mallocBytes_/1073741824.0, mallocs_, heldBytes_/1073741824.0, sizes, blocks);
+        // The footprint is what the driver holds for the pool (what an out-of-memory is about); in use is what
+        // the buffers alive now span, and its peak is the most the run has needed at once. The footprint less
+        // the peak is what reuse leaves on the table: blocks idle in one size class while another class asked
+        // the driver for more. Idle since start-up: the classes no request has taken since the loop began.
+        std::size_t idleStartup = 0;
+        for (const auto& kv : free_)
+        {
+            const auto lt = lastTakePhase_.find(kv.first);
+            if (lt != lastTakePhase_.end() && std::string(lt->second) == "start-up")
+            {
+                idleStartup += kv.second.size()*kv.first;
+            }
+        }
+        std::fprintf(stderr,
+            "[pool] %-10s footprint %8.3f GB | in use %8.3f GB | peak in use %8.3f GB (in %s) | idle in classes "
+            "last taken at start-up %8.3f GB\n",
+            when, (mallocBytes_ - freedBytes_)/1073741824.0, liveBytes_/1073741824.0, peakLive_/1073741824.0,
+            peakPhase_, idleStartup/1073741824.0);
+        for (const auto& kv : mallocByPhase_)
+        {
+            std::fprintf(stderr, "[pool]   cudaMalloc in %-12s %8.3f GB | peak in use in it %8.3f GB\n", kv.first.c_str(),
+                         kv.second/1073741824.0, peakByPhase_.count(kv.first) ? peakByPhase_.at(kv.first)/1073741824.0 : 0.0);
+        }
         // The biggest consumers, by total bytes. Sizes are the attribution: a buffer is sized by what it
         // spans, so nCells*8 is a cell field, nFaces*8 a face field, and the tail of odd sizes is the
         // AMG hierarchy's coarse levels. Cheaper and more honest than guessing at call sites.
@@ -221,25 +314,242 @@ public:
                          v[i].second.first/1048576.0, v[i].second.second, v[i].first/1048576.0);
         }
     }
+    // BRAE_POOL_STATS=1: the footprint BY SIZE CLASS. A freed block serves only a later take of its own class, so
+    // a class's share of the footprint is the most of its blocks ever alive at once (less those handed back), and
+    // freeing a buffer earlier lowers the footprint only if it lowers that most. "at peak" is how many were alive
+    // when the bytes in use peaked; the rest of the class's blocks sat idle then. Classes of 1 MiB or more.
+    void reportClasses(const char* when) const
+    {
+        if (!stats_) return;
+        std::vector<std::pair<std::size_t, ClassStat>> v(classStat_.begin(), classStat_.end());
+        std::sort(v.begin(), v.end(),
+                  [](const auto& a, const auto& b) { return a.first*a.second.maxLive > b.first*b.second.maxLive; });
+        std::fprintf(stderr, "[class] %s: class MB | most alive (MB) | alive at the peak in use | takes | "
+                     "from the free list | handed back\n", when);
+        for (const auto& kv : v)
+        {
+            if (kv.first < (std::size_t(1) << 20)) continue;
+            const ClassStat& c = kv.second;
+            std::fprintf(stderr, "[class] %10.2f | %5zu (%9.2f) | %5zu | %7zu | %7zu | %5zu\n", kv.first/1048576.0,
+                         c.maxLive, c.maxLive*(kv.first/1048576.0), c.atPeak, c.takes, c.reused, c.trimmed);
+        }
+        // The pool asks the driver for a block only when its class has none idle, so a class's cudaMalloc count is
+        // its most alive at once: while nothing has been handed back, the two sums over every class agree.
+        std::size_t most = 0;
+        std::size_t back = 0;
+        for (const auto& kv : classStat_)
+        {
+            most += kv.first*kv.second.maxLive;
+            back += kv.first*kv.second.trimmed;
+        }
+        std::fprintf(stderr, "[class] %s: the classes' most alive sum to %.3f GB, cudaMalloc %.3f GB, handed back %.3f GB\n",
+                     when, most/1073741824.0, mallocBytes_/1073741824.0, back/1073741824.0);
+        // ...and, for the classes of 64 MiB of footprint or more, the most alive in each phase: the phases at the
+        // class's most are where a release can lower it
+        for (const auto& kv : v)
+        {
+            const ClassStat& c = kv.second;
+            if (kv.first*c.maxLive < (std::size_t(64) << 20)) continue;
+            std::fprintf(stderr, "[class] %10.2f MB by phase:", kv.first/1048576.0);
+            for (const auto& ph : c.maxByPhase)
+            {
+                std::fprintf(stderr, " %s %zu", ph.first.c_str(), ph.second);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+    // BRAE_POOL_STATS=1: every live block of 64 MiB or more, with the phase of its last take and that take's
+    // call stack as offsets into the executable (resolve with addr2line -f -C -e <brae> <offset>...)
+    void reportLive(const char* when) const
+    {
+        if (!stats_) return;
+        std::fprintf(stderr, "[live] %s: %zu blocks of %zu MiB or more; at the peak in use %zu\n", when,
+                     bigLive_.size(), big_ >> 20, peakBig_.size());
+        printBig("now", bigLive_);
+        printBig("peak", peakBig_);
+        // ...and what was alive at each phase's own peak, so the overlap of lifetimes is visible per phase
+        for (const auto& kv : peakBigByPhase_)
+        {
+            printBig(("@" + kv.first).c_str(), kv.second);
+        }
+    }
 private:
+    // a template so that it may precede Big's declaration below
+    template <typename BigMap>
+    static void printBig(const char* tag, const BigMap& m)
+    {
+        for (const auto& kv : m)
+        {
+            const auto& b = kv.second;
+            std::fprintf(stderr, "[live] %-4s #%-6zu %8.2f MB  %-12s", tag, b.seq, b.cls/1048576.0, b.phase);
+            for (int i = 0; i < b.nFrames; ++i)
+            {
+                Dl_info info;
+                if (dladdr(b.frames[i], &info) && info.dli_fbase)
+                {
+                    std::fprintf(stderr, " %lx", static_cast<unsigned long>(
+                        reinterpret_cast<char*>(b.frames[i]) - reinterpret_cast<char*>(info.dli_fbase)));
+                }
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
     struct Idle
     {
         void*         p = nullptr;
         unsigned long step = 0;
     };
+    void countTake(
+        void* p,
+        std::size_t cls,
+        bool fromFreeList)
+    {
+        if (!stats_) return;
+        liveBytes_ += cls;
+        lastTakePhase_[cls] = phase_;
+        ClassStat& c = classStat_[cls];
+        ++c.takes;
+        if (fromFreeList) ++c.reused;
+        if (++c.live > c.maxLive) c.maxLive = c.live;
+        std::size_t& inPhase = c.maxByPhase[phase_];
+        if (c.live > inPhase) inPhase = c.live;
+        if (cls >= big_)
+        {
+            Big& b = bigLive_[p];
+            b.cls = cls;
+            b.phase = phase_;
+            b.seq = ++seq_;
+            b.nFrames = backtrace(b.frames, 16);
+        }
+        std::size_t& ph = peakByPhase_[phase_];
+        if (liveBytes_ > ph)
+        {
+            ph = liveBytes_;
+            peakBigByPhase_[phase_] = bigLive_;
+        }
+        if (liveBytes_ > peakLive_)
+        {
+            peakLive_ = liveBytes_;
+            peakPhase_ = phase_;
+            peakBig_ = bigLive_;
+            for (auto& kv : classStat_) kv.second.atPeak = kv.second.live;
+        }
+    }
     std::unordered_map<std::size_t, std::vector<Idle>> free_;
     std::size_t mallocBytes_ = 0, heldBytes_ = 0, mallocs_ = 0;
     std::size_t frees_ = 0;
     std::size_t freedBytes_ = 0;
+    std::size_t peakFootprint_ = 0;
     double mallocSeconds_ = 0;
     double freeSeconds_ = 0;
     unsigned long step_ = 0;
     // steps a block may sit idle before it goes back to the driver (BRAE_POOL_KEEP_STEPS)
     unsigned long keep_ = 4;
     std::map<std::size_t, std::pair<std::size_t, std::size_t>> hist_;   // size -> {total bytes, count}
+    // BRAE_POOL_STATS only: the bytes in use and their peak, where they peaked, cudaMalloc by phase, and the
+    // phase of each size class's last take
+    std::size_t liveBytes_ = 0;
+    std::size_t peakLive_ = 0;
+    const char* phase_ = "start-up";
+    const char* peakPhase_ = "start-up";
+    std::map<std::string, std::size_t> mallocByPhase_;
+    std::map<std::string, std::size_t> peakByPhase_;   // the most in use while each phase ran
+    std::unordered_map<std::size_t, const char*> lastTakePhase_;
+    // per size class: blocks alive now, the most alive at once, alive at the moment of the peak in use, takes, the
+    // takes the free list served, and blocks handed back to the driver (reportClasses)
+    struct ClassStat
+    {
+        std::size_t live = 0;
+        std::size_t maxLive = 0;
+        std::size_t atPeak = 0;
+        std::size_t takes = 0;
+        std::size_t reused = 0;
+        std::size_t trimmed = 0;
+        std::map<std::string, std::size_t> maxByPhase;   // the most alive while each phase ran
+    };
+    std::map<std::size_t, ClassStat> classStat_;
+    // every live block of big_ or more: its class, the phase and the call stack of its last take, and the take's
+    // number among the tracked ones (the same from run to run of one binary on one case, so a poison names it)
+    std::size_t big_ = std::size_t(64) << 20;
+    struct Big
+    {
+        std::size_t cls = 0;
+        const char* phase = "";
+        std::size_t seq = 0;
+        void*       frames[16] = {};
+        int         nFrames = 0;
+    };
+    std::size_t seq_ = 0;
+    std::unordered_map<void*, Big> bigLive_;
+    std::unordered_map<void*, Big> peakBig_;   // bigLive_ at the moment of the peak in use
+    std::map<std::string, std::unordered_map<void*, Big>> peakBigByPhase_;   // ...and at each phase's own peak
+    // BRAE_POOL_POISON=<phase>:<nan|big>:<ids>, ids a comma list of take numbers, a-b ranges and x<offset> sites
+    // (every live block one of whose frames is that offset): at every entry to
+    // <phase> from the second on (BRAE_POOL_POISON_FROM), the live blocks of those takes are filled with 0xff
+    // bytes (a NaN in double and in float) or 0x7f bytes (finite and huge in both). A lifetime audit's tool.
+    void readPoison()
+    {
+        const char* e = std::getenv("BRAE_POOL_POISON");
+        if (!e) return;
+        // parsed from the right: a phase name may itself hold a colon (mom:matrix)
+        const std::string spec(e);
+        const std::size_t b = spec.rfind(':');
+        const std::size_t a = (b == std::string::npos || b == 0) ? std::string::npos : spec.rfind(':', b - 1);
+        if (!stats_ || a == std::string::npos)
+        {
+            throw std::runtime_error("brae: BRAE_POOL_POISON=" + spec + " needs BRAE_POOL_STATS=1 and the form "
+                                     "<phase>:<nan|big>:<ids>");
+        }
+        poisonPhase_ = spec.substr(0, a);
+        const std::string kind = spec.substr(a + 1, b - a - 1);
+        if (kind == "nan") poisonByte_ = 0xff;
+        else if (kind == "big") poisonByte_ = 0x7f;
+        else throw std::runtime_error("brae: BRAE_POOL_POISON sentinel '" + kind + "' is neither nan nor big");
+        std::size_t i = b + 1;
+        while (i < spec.size())
+        {
+            std::size_t j = spec.find(',', i);
+            if (j == std::string::npos) j = spec.size();
+            const std::string item = spec.substr(i, j - i);
+            if (!item.empty() && item[0] == 'x')
+            {
+                poisonSites_.insert(std::stoul(item.substr(1), nullptr, 16));
+                i = j + 1;
+                continue;
+            }
+            const std::size_t dash = item.find('-');
+            const std::size_t lo = std::stoul(item.substr(0, dash));
+            const std::size_t hi = (dash == std::string::npos) ? lo : std::stoul(item.substr(dash + 1));
+            for (std::size_t k = lo; k <= hi; ++k) poisonIds_.insert(k);
+            i = j + 1;
+        }
+        if (const char* f = std::getenv("BRAE_POOL_POISON_FROM")) poisonFrom_ = std::stoul(f);
+    }
+    // a block re-taken at every iteration has a new take number each time; its call site does not change, so a
+    // site (x<offset>, a frame's offset into the executable as the live lists print it) names it for good
+    bool takenAtPoisonSite(const Big& b) const
+    {
+        if (poisonSites_.empty()) return false;
+        for (int i = 0; i < b.nFrames; ++i)
+        {
+            Dl_info info;
+            if (!dladdr(b.frames[i], &info) || !info.dli_fbase) continue;
+            const unsigned long off = static_cast<unsigned long>(
+                reinterpret_cast<char*>(b.frames[i]) - reinterpret_cast<char*>(info.dli_fbase));
+            if (poisonSites_.count(off)) return true;
+        }
+        return false;
+    }
+    std::set<unsigned long> poisonSites_;
+    std::string poisonPhase_;
+    int poisonByte_ = 0xff;
+    std::set<std::size_t> poisonIds_;
+    unsigned long poisonFrom_ = 2;
+    unsigned long poisonEntries_ = 0;
     bool enabled_;
     bool exact_;
     bool short_;
+    bool stats_;
 };
 inline DevicePool& devicePool() { static DevicePool* p = new DevicePool(); return *p; }   // intentionally leaked
 } // namespace detail

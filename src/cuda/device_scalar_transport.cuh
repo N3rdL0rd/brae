@@ -17,6 +17,7 @@
 #include "device_cyclic.cuh"
 #include "device_interface.cuh"   // interfaceAssembleMomentum/OffDiagSum/ZeroWallIfCoeff
 #include "device_amg.cuh"         // deviceSymGaussSeidel
+#include "device_colour_gauss_seidel.cuh"   // the colour rule's sweep (turbColourRule)
 #include "stage_dump.cuh"      // Phase 0 stage harness
 #include "device_ddt.cuh"         // ScalarDdt + deviceFvmDdtDiag/Source (transient turbulence)
 #include <cuda_runtime.h>
@@ -49,6 +50,55 @@ inline const DeviceDilu*& turbPrecon() { static const DeviceDilu* p = nullptr; r
 // unchanged. Process-wide for the same reason turbPrecon is: this scaffold is called from closures that
 // do not carry the solver controls.
 inline int& turbPolyDeg() { static int d = 1; return d; }
+// ...and simpleFoam's COLOUR RULE for the transported scalars, set by the same solver at the same point
+// (device_simple_foam.cu, colourTurb_): with a colouring here, a smoothSolver solve below sweeps in colour
+// order on the GPU (deviceColourGaussSeidelFused) under the field's own stop rule, the call's: its
+// tolerance, relTol, maxIter and minIter (ScalarStopRule), nSweeps and smoother. Null is OpenFOAM's own
+// order, so an unset driver is unchanged. The rule held ONE maxIter and minIter here for every field it
+// took, the tighter maxIter and the larger minIter of k's and omega's entries.
+//
+// oneSweep is the rule's gate's CONTROL (BRAE_CONTROL_SIMPLE_COLOUR_ONE_SWEEP): every solve the rule
+// takes stops after its first block of nSweeps sweeps.
+struct TurbColourRule
+{
+    const DeviceCellColouring* colouring = nullptr;
+    bool oneSweep = false;
+};
+// BRAE_CONTROL_SCALAR_FIXED_CAP=1, the stop-rule gate's CONTROL (tests/simple_turbulence_stop_rule_vs_openfoam.sh):
+// OpenFOAM's order and the Krylov solve stop at kUnreadEntryMaxIter with no minIter, whatever the field's entry
+// says, as every scalar transport solve did before each field's own maxIter and minIter were handed down.
+inline bool scalarFixedCapControl()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_SCALAR_FIXED_CAP") != nullptr;
+    return on;
+}
+inline TurbColourRule& turbColourRule() { static TurbColourRule r; return r; }
+// The folded system of each transported scalar, per mesh and field (deviceSolveScalarTransport has why it
+// persists), and whether its last solve was the colour-order sweep -- which gathers the system into scratch
+// of its own, where a Krylov solve captures a graph pinned to these addresses (FP-10 there). One store for
+// every model's instantiation, so that a driver can hand the swept ones back.
+struct ScalarTransportFold
+{
+    DeviceBuffer<scalar> diag;
+    DeviceBuffer<scalar> B;
+    bool colourSwept = false;
+};
+inline std::map<std::pair<const void*, std::string>, ScalarTransportFold>& scalarTransportFolds()
+{
+    static auto& store = *new std::map<std::pair<const void*, std::string>, ScalarTransportFold>();
+    return store;
+}
+// Hands the mesh's colour-swept folded systems back to the pool until the next solve re-takes them; a system
+// a Krylov solve read keeps its addresses for that solve's graph.
+inline void deviceScalarTransportFoldRelease(const DeviceMesh& dm)
+{
+    auto& store = scalarTransportFolds();
+    for (auto it = store.begin(); it != store.end();)
+    {
+        if (it->first.first == dm.owner.data() && it->second.colourSwept) it = store.erase(it);
+        else ++it;
+    }
+}
 
 namespace {
 // setValues (eps wall constraint): zero wall-cell off-diagonals + move the known eps0 to the neighbour RHS.
@@ -130,6 +180,20 @@ void svBndKernel(
 
 
 static __global__
+void wfRelaxICKernel(
+    int nB,
+    const label* __restrict__ wallFunction,
+    const scalar* __restrict__ gamma,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ deltaCoeffs,
+    scalar* __restrict__ iC)
+{
+    const int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bi < nB && wallFunction[bi]) { iC[bi] += gamma[bi] * magSf[bi] * deltaCoeffs[bi]; }
+}
+
+
+static __global__
 void svCellKernel(
     int nC,
     const label* __restrict__ isW,
@@ -206,8 +270,7 @@ void deviceSolveScalarTransport(
     bool nonOrth,
     scalar twoByk,
     scalar relax,
-    scalar tol,
-    scalar relTolKE,
+    const ScalarStopRule& stop,   // the field's own entry: tolerance, relTol, maxIter, minIter
     int keCheckEvery,
     bool useGS,
     Reaction&& reaction,
@@ -259,24 +322,41 @@ void deviceSolveScalarTransport(
     // are different smoothers, so the same relTol stops in a different place. Trailing, like nSweeps.
     bool gsSymmetric = true,
     // OpenFOAM's lower bound for THIS field, used by the clamp AND by Foam::bound's message.
-    scalar boundFloor = 1e-15)
+    scalar boundFloor = 1e-15,
+    // The cellLimited coefficient of gradSchemes `grad(<field>)`, the field's OWN entry, falling back to `default`
+    // only when there is none. Two consumers take it: the non-orthogonal laplacian correction (correctedSnGrad.C:
+    // 52-55, mesh.gradScheme("grad(" + vf.name() + ')')) and limitedLinear's limiter (LimitedScheme.C:56,
+    // fvc::grad(lPhi), and lPhi is the field itself for a scalar). The limiter took the plain Gauss gradient here
+    // whatever the entry said. 0 = unlimited. Trailing, so every existing call is unchanged.
+    scalar fieldGradLimitK = 0.0,
+    // The field's patch values as OpenFOAM's gradient reads them, when they are not this equation's own evaluate:
+    // null is deviceBCValue. Trailing, so every existing call is unchanged. See deviceKOmegaSSTCorrect's obv.
+    const DeviceBuffer<scalar>* storedBnd = nullptr)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
     deviceInterpolate(dm, D, Df);
     DeviceBuffer<scalar> aD, aU, aL, lD, lU, lL, luCorr, lapCorr;   // luCorr/lapCorr = linearUpwind / non-orth deferred sources (empty otherwise)
-    DeviceBuffer<scalar> gx, gy, gz;         // gradSchemes `default`: limitedLinear's limiter + non-orth
+    DeviceBuffer<scalar> gx, gy, gz;         // plain Gauss linear
     DeviceBuffer<scalar> lgx, lgy, lgz;      // the gradient linearUpwind NAMES (limited when that name is cellLimited)
-    // ONE GRADIENT CANNOT SERVE ALL THREE. Only linearUpwind takes a named gradient
-    // (linearUpwind.C: mesh.gradScheme(gradSchemeName_)); limitedLinear's limiter and the non-orthogonal
-    // laplacian correction both resolve gradSchemes `default`, which is plain Gauss linear here. Limiting
+    // ONE GRADIENT CANNOT SERVE ALL THREE. linearUpwind takes the gradient its div entry NAMES
+    // (linearUpwind.C: mesh.gradScheme(gradSchemeName_)); the non-orthogonal laplacian correction and
+    // limitedLinear's limiter take `grad(<field>)` (fieldGradLimitK below), so on squareBendLiq --
+    // linearUpwind naming a limited scheme, no grad(k) entry -- those two are plain Gauss linear. Limiting
     // the shared buffer in place therefore over-limited the other two -- measured on squareBendLiq as a
     // transient nut excursion to 1.5e+01 against OF's 1.4e-03.
     const bool limitLU = (gradLimitK > 0.0) && linearUpwind;
+    // ...and `grad(<field>)` itself, which a case can limit as well (the boxy5 UAV: `grad(nuTilda) cellLimited
+    // Gauss linear 1`, also what its linearUpwind names). The same limited buffer when the two coefficients
+    // agree, a separate one when they do not.
+    const bool limitField = (fieldGradLimitK > 0.0) && (nonOrth || limited);
+    const bool fieldSharesLU = limitField && limitLU && fieldGradLimitK == gradLimitK;
+    DeviceBuffer<scalar> ngx, ngy, ngz;      // grad(<field>), when it is limited apart
     if (limited || linearUpwind || nonOrth)
     {
         DeviceBuffer<scalar> bv;
-        deviceBCValue(db, field, bv);
+        if (storedBnd) deviceCopy(bv, *storedBnd);
+        else           deviceBCValue(db, field, bv);
         deviceGaussGrad(dm, field, bv, gx, gy, gz);
         // THE COUPLED FACES, which this gradient never had. deviceGaussGrad sums over the internal and
         // non-coupled boundary faces; a cyclic/AMI/ACMI face is in neither list, so the gradient of k,
@@ -309,15 +389,38 @@ void deviceSolveScalarTransport(
             }
             deviceCellLimitGrad(dm, field, bv, lgx, lgy, lgz, gradLimitK, ifs, nIfs);
         }
+        if (limitField && !fieldSharesLU)
+        {
+            deviceCopy(ngx, gx); deviceCopy(ngy, gy); deviceCopy(ngz, gz);
+            CellLimitInterface ifs[2];
+            int nIfs = 0;
+            DeviceBuffer<scalar> cycNbr, amiNbr, empty;
+            if (cyc && cyc->n > 0)
+            {
+                deviceCyclicNbrValue(*cyc, field, empty, empty, empty, 0, cycNbr);
+                ifs[nIfs++] = { cyc->n, cyc->ownCell.data(), cycNbr.data(),
+                                cyc->dOwnX.data(), cyc->dOwnY.data(), cyc->dOwnZ.data() };
+            }
+            if (ami && ami->n > 0)
+            {
+                deviceAmiInterpolate(*ami, field, amiNbr);
+                ifs[nIfs++] = { ami->n, ami->ownCell.data(), amiNbr.data(),
+                                ami->dOwnX.data(), ami->dOwnY.data(), ami->dOwnZ.data() };
+            }
+            deviceCellLimitGrad(dm, field, bv, ngx, ngy, ngz, fieldGradLimitK, ifs, nIfs);
+        }
     }
+    const DeviceBuffer<scalar>& fieldGx = !limitField ? gx : (fieldSharesLU ? lgx : ngx);
+    const DeviceBuffer<scalar>& fieldGy = !limitField ? gy : (fieldSharesLU ? lgy : ngy);
+    const DeviceBuffer<scalar>& fieldGz = !limitField ? gz : (fieldSharesLU ? lgz : ngz);
     const bool sharedLim = limField && limGradX && limGradY && limGradZ;
     if (limited)
     {
         deviceDivLimitedCoeffs(dm, phiInt,
                                sharedLim ? *limField  : field,
-                               sharedLim ? *limGradX  : gx,
-                               sharedLim ? *limGradY  : gy,
-                               sharedLim ? *limGradZ  : gz,
+                               sharedLim ? *limGradX  : fieldGx,
+                               sharedLim ? *limGradY  : fieldGy,
+                               sharedLim ? *limGradZ  : fieldGz,
                                twoByk, aD, aU, aL);   // Gauss limitedLinear/vanAlbada: implicit limited weight
     }
     else
@@ -337,16 +440,18 @@ void deviceSolveScalarTransport(
         }
     }
     // laplacian "corrected": nonOrthDeltaCoeffs implicit (in deviceLaplacianCoeffs) + corrVec.grad(field) explicit (deviceLaplacianCorr).
-    deviceLaplacianCoeffs(dm, Df, lD, lU, lL, nonOrth);
+    // ...and `uncorrected` takes those coefficients with no correction. MEASURED on pitzDailyTurb from one state, two tight
+    // iterations (JUPITER job 2637170): orthogonal's coefficients left epsilon 1.0e-04, k 1.8e-05, nut 2.2e-05 from OpenFOAM
+    deviceLaplacianCoeffs(dm, Df, lD, lU, lL, nonOrth || dm.scalarNonOrthCoeffs);
     deviceAxpy(-1.0, lD, aD); deviceAxpy(-1.0, lU, aU); deviceAxpy(-1.0, lL, aL);
     if (nonOrth)
     {
-        deviceLaplacianCorr(dm, Df, gx, gy, gz, lapCorr);
+        deviceLaplacianCorr(dm, Df, fieldGx, fieldGy, fieldGz, lapCorr);
         // The interface's own non-orthogonal correction. An AMI face is non-conformal by construction, so
         // its corrVec is NOT small even on a mesh that is orthogonal everywhere else -- the one place a
         // "corrected" laplacian actually has work to do on this fixture.
-        if (cyc && cyc->n > 0) interfaceAddLapCorr(*cyc, D, gx, gy, gz, lapCorr);
-        if (ami && ami->n > 0) interfaceAddLapCorr(*ami, D, gx, gy, gz, lapCorr);
+        if (cyc && cyc->n > 0) interfaceAddLapCorr(*cyc, D, fieldGx, fieldGy, fieldGz, lapCorr);
+        if (ami && ami->n > 0) interfaceAddLapCorr(*ami, D, fieldGx, fieldGy, fieldGz, lapCorr);
     }
     if (bounded) { DeviceBuffer<scalar> bt; deviceHadamard(bt, divU, dm.V); deviceAxpy(-1.0, bt, aD); }   // -Sp(div(phi),f)
     DeviceBuffer<scalar> src(static_cast<std::size_t>(nC));
@@ -391,6 +496,12 @@ void deviceSolveScalarTransport(
     // internalCoeffs never enters the diagonal here -- it is folded in at solve time -- so a wrong
     // boundary diffusivity leaves every column above intact. Added when the mirror SST closure
     // matched this one on all of them and still solved to a different omega.
+    // ON REQUEST ONLY (BRAE_TURB_COEFF_NORMS=1): the norms are taken on the host from a pageable copy of
+    // both off-diagonals, every solve. On the boxy5 UAV's 4.94 M cells (25.96 M internal faces, H100)
+    // that was a 415 MB download and a single-core pass per iteration, inside a 720 ms turbulence phase;
+    // no test reads the line.
+    static const bool coeffNorms = std::getenv("BRAE_TURB_COEFF_NORMS") != nullptr;
+    if (coeffNorms)
     {
         auto l2 = [](const DeviceBuffer<scalar>& b)
         {
@@ -437,8 +548,29 @@ void deviceSolveScalarTransport(
     DeviceBuffer<scalar> aRD, aDelta;
     if (relax > scalar(0))
     {
+        // A wall function's face is a fixedValue in OpenFOAM (omegaWallFunctionFvPatchScalarField.H) and carries zeroGradient's slots here, so its laplacian
+        // coefficient is missing from aIC. setValues cuts it from the cell below, so nothing but this relax reads it: fvMatrix::relax adds it and takes
+        // it off around the division, which leaves the wall row's diagonal, and so the normalised residual, 0.16 to 0.42% from OpenFOAM's with the fields exact.
+        // MEASURED (pitzDailySST, jobs 4845099, 4845295): row 1 7.2845e-06 against 7.2951e-06, all 472 wall rows, no other row.
+        DeviceBuffer<scalar> wfIC, wfICmag;
+        static const bool wfNorm = std::getenv("BRAE_CONTROL_WALL_ROW_NORM") == nullptr;
+        if (wall && eps0 && wfNorm && db.n)
+        {
+            deviceCopy(wfIC, aIC);
+            const DeviceBuffer<scalar>* gammaB = (DBnd && DBnd->size()) ? DBnd : nullptr;
+            DeviceBuffer<scalar> gammaCell;
+            if (!gammaB)
+            {
+                deviceOwnerGather(dm, D, gammaCell);
+            }
+            wfRelaxICKernel<<<nBlocks(db.n), TPB>>>(db.n, db.wallFunctionMask.data(), gammaB ? gammaB->data() : gammaCell.data(), db.magSf.data(), db.deltaCoeffs.data(), wfIC.data());
+            cudaCheck(cudaGetLastError(), "wall function relax coefficient");
+            deviceCmptMaxMag3(wfIC, wfIC, wfIC, wfICmag);
+        }
         deviceRelaxDiag(deviceLduView(dm, aD, aU, aL), dm, aIC, relax, aRD, aDelta,
-                        ifSumOff.size() ? ifSumOff.data() : nullptr);
+                        ifSumOff.size() ? ifSumOff.data() : nullptr,
+                        wfICmag.size() ? wfICmag.data() : nullptr,
+                        wfIC.size() ? wfIC.data() : nullptr);
         DeviceBuffer<scalar> t;
         deviceHadamard(t, aDelta, field);
         deviceAxpy(1.0, t, src);
@@ -479,10 +611,9 @@ void deviceSolveScalarTransport(
     // had to copy the matrix into its own buffers before capturing a graph against them -- at 896,000
     // cells the largest copy in the iteration. With these stable the solver takes its direct path
     // (device_pcg.cu) and the copy does not happen. deviceFold resizes and overwrites both.
-    static auto& foldCache = *new std::map<std::pair<const void*, std::string>, std::pair<DeviceBuffer<scalar>, DeviceBuffer<scalar>>>();
-    auto& folded = foldCache[{dm.owner.data(), std::string(fieldName)}];
-    DeviceBuffer<scalar>& diagC = folded.first;
-    DeviceBuffer<scalar>& B = folded.second;
+    ScalarTransportFold& folded = scalarTransportFolds()[{dm.owner.data(), std::string(fieldName)}];
+    DeviceBuffer<scalar>& diagC = folded.diag;
+    DeviceBuffer<scalar>& B = folded.B;
     deviceFold(dm, aRD, src, aIC, aBC, diagC, B);
     // Stage harness: the assembled system for this transported scalar, at its first assembly only.
     if (stageDumpActive() && stageDumpFirstOnly((std::string("xport-") + fieldName).c_str()))
@@ -569,8 +700,32 @@ void deviceSolveScalarTransport(
     }
     // The smoothSolver the case asked for, algorithm included: OpenFOAM's own sweep, level-scheduled
     // (device_sym_gauss_seidel.cuh), symmetric or ascending-only as the `smoother` entry names.
-    if (gs) deviceSymGaussSeidel(sv, B, field, dnf.data(), tol, relTolKE, 3000, &perf, /*minIter*/0, nSweeps,
-                                 gsSymmetric);
+    const TurbColourRule& colourRule = turbColourRule();
+    folded.colourSwept = gs && colourRule.colouring;
+    const bool fixedCap = scalarFixedCapControl();
+    const int maxIter = fixedCap ? kUnreadEntryMaxIter : stop.maxIter;
+    const int minIter = fixedCap ? 0 : stop.minIter;
+    if (gs && colourRule.colouring)
+    {
+        GSFusedComponent one;
+        one.A = &sv;
+        one.b = &B;
+        one.psi = &field;
+        one.normFactor = 1.0;
+        one.dNormFactor = dnf.data();
+        deviceColourGaussSeidelFused(1,
+                                     &one,
+                                     *colourRule.colouring,
+                                     stop.tol,
+                                     stop.relTol,
+                                     colourRule.oneSweep ? 1 : stop.maxIter,
+                                     stop.minIter,
+                                     nSweeps,
+                                     gsSymmetric,
+                                     &perf);
+    }
+    else if (gs) deviceSymGaussSeidel(sv, B, field, dnf.data(), stop.tol, stop.relTol, maxIter, &perf, minIter, nSweeps,
+                                      gsSymmetric);
     // DILU when the case asks for it, Jacobi otherwise. NOT a cost choice: both reach the requested
     // relTol, but they stop in different places -- on turbulentFlatPlate:kEpsilon OpenFOAM's DILU solve
     // lands at a median 0.0064 of the initial residual against brae's Jacobi 0.0726, and that gap leaves
@@ -578,7 +733,7 @@ void deviceSolveScalarTransport(
     else
     {
         const DeviceDilu* pc = precon ? precon : turbPrecon();
-        perf = deviceJacobiBiCGStab(sv, B, field, dnf.data(), tol, relTolKE, 3000, keCheckEvery, 0,
+        perf = deviceJacobiBiCGStab(sv, B, field, dnf.data(), stop.tol, stop.relTol, maxIter, keCheckEvery, minIter,
                                     (pc && pc->valid) ? pc : nullptr, /*amg=*/nullptr,
                                     (pc && pc->valid) ? 1 : turbPolyDeg());
     }

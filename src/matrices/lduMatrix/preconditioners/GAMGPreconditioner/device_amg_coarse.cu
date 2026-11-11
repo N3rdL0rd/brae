@@ -7,10 +7,15 @@
 #include "device_amg_detail.cuh"   // safeDiag/blockDot/warpReduceSum + TPB/OMEGA/CCL/... constants
 #include "amg_kernels.cuh"       // smoothT<> for deviceCoarseJacobiLoop
 #include "device_amg_coarse.cuh"   // deviceCoarsePCG/JacobiSingleBlock internal decls (match defs here)
+#include "device_amg_coarse_default.cuh"
 #include "device_ldu.cuh"
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <mutex>
+#include <string>
+#include <stdexcept>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 
 namespace cg = cooperative_groups;
@@ -537,6 +542,491 @@ void coarseLUSolveKernel(
     for (int i = tid; i < n; i += blockDim.x) xc[i] = y[i];
 }
 
+// ---------------------------------------------------------------------------------------------------
+// THE COARSEST SOLVE'S ALTERNATIVES (BRAE_AMG_COARSE_SOLVE; branch perf/amg-coarse-solve, an experiment).
+// Each is prepared from the factorisation amgGalerkin makes, outside every capture, and applied inside the
+// V-cycle: `tri` the same LU applied by one warp, `inverse` A^-1 formed once and applied as a product,
+// `cholesky` L L^T where the level is symmetric and its pivots positive, the LU otherwise.
+// ---------------------------------------------------------------------------------------------------
+
+// rows a lane holds: the warp kernels below take n <= 32*TRI_ROWS
+constexpr int TRI_ROWS = 4;
+// Cholesky is taken only on a level symmetric to this, relative to max|diag| (a Galerkin product sums its
+// upper and lower entries in different orders, so a symmetric level is symmetric to a rounding, not exactly)
+constexpr scalar CHOL_SYM_TOL = 1e-12;
+// and only with every pivot above this, relative to max|diag|: a singular level (an all-Neumann pressure)
+// leaves a pivot of a rounding, and keeps the LU's floored pivot (DENSE_LU_EPS) by falling back to it
+constexpr scalar CHOL_PIVOT_MIN = 1e-10;
+// the inverse stands in for the LU only where it reproduces the LU's substitutions on three probe vectors to this,
+// relative to the LU's answer: the inverse and the LU differed by at most 2.5e-14 over thirty synthetic levels to a
+// condition number of 1e12 and twenty CFD coarsest grids (bench_amg_coarse_solve, GB10, 2026-10-15). On the consistent
+// probe the difference grows as eps*cond, so a level kept has the inverse's backward error far below the V-cycle's
+// single-precision cast
+constexpr scalar INVERSE_PROBE_TOL = 1e-10;
+
+// lu (row-major, unit L and U in place) -> fc column-major, fc[k*n + i] = lu[i*n + k], so that a warp reading
+// column k of a factor reads consecutive words; and the row interchanges composed into one gather,
+// y[i] = b[perm[i]]: the swaps of coarseLUSolveKernel applied to the positions, in factorisation order
+__global__
+void coarseLUColumnMajorKernel(
+    int n,
+    const scalar* __restrict__ lu,
+    const int* __restrict__ piv,
+    scalar* __restrict__ fc,
+    int* __restrict__ perm)
+{
+    for (int idx = blockIdx.x*blockDim.x + threadIdx.x; idx < n*n; idx += gridDim.x*blockDim.x)
+    {
+        const int i = idx / n;
+        const int k = idx % n;
+        fc[k*n + i] = lu[idx];
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        for (int i = 0; i < n; ++i) perm[i] = i;
+        for (int k = 0; k < n; ++k)
+        {
+            const int r = piv[k];
+            if (r != k)
+            {
+                const int t = perm[k];
+                perm[k] = perm[r];
+                perm[r] = t;
+            }
+        }
+    }
+}
+
+// row i lives in lane i % 32, slot i / 32 (a constant index into the slots, so they stay in registers)
+__device__ __forceinline__
+scalar warpRow(
+    const scalar (&yr)[TRI_ROWS],
+    int k)
+{
+    const int s = k >> 5;
+    const scalar v = (s == 0) ? yr[0] : (s == 1) ? yr[1] : (s == 2) ? yr[2] : yr[3];
+    return __shfl_sync(0xffffffffu, v, k & 31);
+}
+
+__device__ __forceinline__
+void warpDivideRow(
+    scalar (&yr)[TRI_ROWS],
+    int k,
+    int lane,
+    scalar d)
+{
+    if ((k & 31) != lane) return;
+    const int s = k >> 5;
+    if (s == 0) yr[0] /= d;
+    else if (s == 1) yr[1] /= d;
+    else if (s == 2) yr[2] /= d;
+    else yr[3] /= d;
+}
+
+// coarseLUSolveKernel's two substitutions, row for row and step for step (y_i -= F_ik y_k in k order, the
+// backward step's division at its own row first), by one warp: the same arithmetic in the same order is the
+// same bits. F is column-major. unitLower: L's diagonal is 1 and not stored (the LU); otherwise the forward
+// step divides by F_kk first (Cholesky's L).
+__device__ __forceinline__
+void warpSubstitute(
+    int n,
+    const scalar* __restrict__ F,
+    bool unitLower,
+    scalar (&yr)[TRI_ROWS],
+    int lane)
+{
+    for (int k = 0; k < n; ++k)
+    {
+        if (!unitLower) warpDivideRow(yr, k, lane, F[k*n + k]);
+        const scalar yk = warpRow(yr, k);
+        #pragma unroll
+        for (int s = 0; s < TRI_ROWS; ++s)
+        {
+            const int i = lane + 32*s;
+            if (i > k && i < n) yr[s] -= F[k*n + i]*yk;
+        }
+    }
+    for (int k = n - 1; k >= 0; --k)
+    {
+        warpDivideRow(yr, k, lane, F[k*n + k]);
+        const scalar yk = warpRow(yr, k);
+        #pragma unroll
+        for (int s = 0; s < TRI_ROWS; ++s)
+        {
+            const int i = lane + 32*s;
+            if (i < k) yr[s] -= F[k*n + i]*yk;
+        }
+    }
+}
+
+// x = A^-1 r in one block: the block brings the factors into shared memory in one coalesced pass when they
+// fit, and ONE warp then runs both substitutions with the vector in its registers -- no block barrier in the
+// n steps, where coarseLUSolveKernel takes about 3n. chol (a device flag, so the choice made at the
+// factorisation holds inside a captured graph): 1 = F2 holds Cholesky's L and L^T, taken with no
+// interchange; otherwise the LU (F, perm).
+__global__
+void coarseWarpSolveKernel(
+    int n,
+    const scalar* __restrict__ F,
+    const int* __restrict__ perm,
+    const scalar* __restrict__ F2,
+    const int* __restrict__ chol,
+    const scalar* __restrict__ rc,
+    scalar* __restrict__ xc,
+    bool inShared)
+{
+    extern __shared__ scalar sh[];
+    const bool useChol = F2 != nullptr && chol != nullptr && *chol == 1;
+    const scalar* __restrict__ G = useChol ? F2 : F;
+    if (inShared)
+    {
+        for (int i = threadIdx.x; i < n*n; i += blockDim.x) sh[i] = G[i];
+        __syncthreads();
+        G = sh;
+    }
+    if (threadIdx.x >= 32) return;
+    const int lane = threadIdx.x;
+    scalar yr[TRI_ROWS];
+    #pragma unroll
+    for (int s = 0; s < TRI_ROWS; ++s)
+    {
+        const int i = lane + 32*s;
+        yr[s] = (i < n) ? rc[useChol ? i : perm[i]] : 0.0;
+    }
+    warpSubstitute(n, G, !useChol, yr, lane);
+    #pragma unroll
+    for (int s = 0; s < TRI_ROWS; ++s)
+    {
+        const int i = lane + 32*s;
+        if (i < n) xc[i] = yr[s];
+    }
+}
+
+// A^-1, a column a warp: column j is the LU's solve of e_j by the same substitutions, written row-major
+// (inv[i*n + j]) for the product below. Reads the column-major factors from global memory: once a factorisation.
+__global__
+void coarseInverseKernel(
+    int n,
+    const scalar* __restrict__ F,
+    const int* __restrict__ perm,
+    scalar* __restrict__ inv)
+{
+    const int j = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (j >= n) return;
+    scalar yr[TRI_ROWS];
+    #pragma unroll
+    for (int s = 0; s < TRI_ROWS; ++s)
+    {
+        const int i = lane + 32*s;
+        yr[s] = (i < n && perm[i] == j) ? 1.0 : 0.0;
+    }
+    warpSubstitute(n, F, true, yr, lane);
+    #pragma unroll
+    for (int s = 0; s < TRI_ROWS; ++s)
+    {
+        const int i = lane + 32*s;
+        if (i < n) inv[i*n + j] = yr[s];
+    }
+}
+
+// x = A^-1 r as a product: a warp a row, each lane every 32nd column, then a fixed shuffle tree. Where the
+// preparation found the inverse unsafe (unsafe != 0: a floored pivot, an entry not finite, or the probes'
+// disagreement with the LU), ONE warp runs the LU's own substitutions instead -- the same bits as
+// coarseLUSolveKernel, so a singular level keeps the LU's floored pivot, its null-space behaviour, exactly.
+// control: 1 = the transpose applied (BRAE_CONTROL_COARSE_INVERSE=transpose), 2 = the fallback ignored (nofallback).
+__global__
+void coarseInverseApplyKernel(
+    int n,
+    const scalar* __restrict__ inv,
+    const scalar* __restrict__ F,
+    const int* __restrict__ perm,
+    const int* __restrict__ unsafe,
+    const scalar* __restrict__ rc,
+    scalar* __restrict__ xc,
+    int control)
+{
+    const int lane = threadIdx.x & 31;
+    if (*unsafe != 0 && control != 2)
+    {
+        if (blockIdx.x != 0 || threadIdx.x >= 32) return;
+        scalar yr[TRI_ROWS];
+        #pragma unroll
+        for (int s = 0; s < TRI_ROWS; ++s)
+        {
+            const int i = lane + 32*s;
+            yr[s] = (i < n) ? rc[perm[i]] : 0.0;
+        }
+        warpSubstitute(n, F, true, yr, lane);
+        #pragma unroll
+        for (int s = 0; s < TRI_ROWS; ++s)
+        {
+            const int i = lane + 32*s;
+            if (i < n) xc[i] = yr[s];
+        }
+        return;
+    }
+    const int i = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
+    if (i >= n) return;
+    scalar s = 0.0;
+    if (control == 1) for (int j = lane; j < n; j += 32) s += inv[j*n + i]*rc[j];
+    else for (int j = lane; j < n; j += 32) s += inv[i*n + j]*rc[j];
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+    if (lane == 0) xc[i] = s;
+}
+
+// Whether the inverse may stand in for the LU, decided once a factorisation, on the device (so the decision holds
+// inside a captured graph): unsafe = 1 where a pivot was floored (|U_kk| <= DENSE_LU_EPS*max|diag|, the LU's own
+// test: a singular level, whose null-space behaviour stays the LU's), 2 where an entry of the inverse is not
+// finite, 3 where the inverse and the LU's substitutions disagree on any of three probe vectors (the third consistent,
+// b = A w) by more than INVERSE_PROBE_TOL relative to the LU's answer. One block; warp 0 runs the LU's substitutions
+// on the probes.
+__global__
+void coarseInverseCheckKernel(
+    int n,
+    const scalar* __restrict__ diag,
+    const scalar* __restrict__ inv,
+    const scalar* __restrict__ F,
+    const int* __restrict__ perm,
+    scalar* __restrict__ probe,
+    int* __restrict__ unsafe)
+{
+    __shared__ int shUnsafe;
+    __shared__ scalar shScale;
+    __shared__ scalar shDiff[TPB];
+    __shared__ scalar shSize[TPB];
+    const int tid = threadIdx.x;
+    if (tid == 0)
+    {
+        scalar m = 0.0;
+        for (int c = 0; c < n; ++c) m = fmax(m, fabs(diag[c]));
+        shScale = (m > 0.0) ? m : 1.0;
+        shUnsafe = 0;
+        const scalar floor_ = DENSE_LU_EPS*shScale;
+        for (int k = 0; k < n; ++k)
+        {
+            if (!(fabs(F[k*n + k]) > floor_)) shUnsafe = 1;
+        }
+    }
+    __syncthreads();
+    if (shUnsafe == 0)
+    {
+        int bad = 0;
+        for (int idx = tid; idx < n*n; idx += blockDim.x) if (!isfinite(inv[idx])) bad = 1;
+        if (bad) atomicExch(&shUnsafe, 2);
+    }
+    __syncthreads();
+    for (int p = 0; p < 3 && shUnsafe == 0; ++p)
+    {
+        // probe[0..n) holds v, probe[n..2n) the LU's answer
+        if (p < 2)
+        {
+            for (int i = tid; i < n; i += blockDim.x)
+            {
+                probe[i] = (p == 0) ? cos(0.37*i) + 1.1 : ((i & 1) ? -1.0 : 1.0)*(1.0 + 0.01*i);
+            }
+        }
+        else
+        {
+            // the consistent probe, v = P^T L U w: its answer is w's size, where the first two's answers on a
+            // near-singular or ill-conditioned level are the smallest mode's, 1/lambda, and hide an error in every
+            // other component. The inverse's backward error grows as eps*cond and the LU's does not: on b = A w at
+            // cond 1e12 and 1e16 and one cell shifted by 1e-11 the inverse's was 1e-7 to 3.9e-3, the LU's 1e-16, and
+            // the first two probes passed every one (tests/test_amg_coarse_inverse.cu, GB10, 2026-10-15)
+            for (int i = tid; i < n; i += blockDim.x) probe[i] = sin(0.71*i) + 0.3;
+            __syncthreads();
+            // (U w)_i, U's diagonal included, into probe[n..2n)
+            for (int i = tid; i < n; i += blockDim.x)
+            {
+                scalar t = 0.0;
+                for (int k = i; k < n; ++k) t += F[k*n + i]*probe[k];
+                probe[n + i] = t;
+            }
+            __syncthreads();
+            // (L U w)_i, L's unit diagonal not stored, scattered so that the solve's gather b[perm[i]] reads it back
+            for (int i = tid; i < n; i += blockDim.x)
+            {
+                scalar c = probe[n + i];
+                for (int k = 0; k < i; ++k) c += F[k*n + i]*probe[n + k];
+                probe[perm[i]] = c;
+            }
+        }
+        __syncthreads();
+        if (tid < 32)
+        {
+            scalar yr[TRI_ROWS];
+            #pragma unroll
+            for (int s = 0; s < TRI_ROWS; ++s)
+            {
+                const int i = tid + 32*s;
+                yr[s] = (i < n) ? probe[perm[i]] : 0.0;
+            }
+            warpSubstitute(n, F, true, yr, tid);
+            #pragma unroll
+            for (int s = 0; s < TRI_ROWS; ++s)
+            {
+                const int i = tid + 32*s;
+                if (i < n) probe[n + i] = yr[s];
+            }
+        }
+        __syncthreads();
+        scalar diff = 0.0, size = 0.0;
+        for (int i = tid; i < n; i += blockDim.x)
+        {
+            scalar s = 0.0;
+            for (int j = 0; j < n; ++j) s += inv[i*n + j]*probe[j];
+            const scalar d = fabs(s - probe[n + i]);
+            diff = isfinite(d) ? fmax(diff, d) : 1e300;
+            size = fmax(size, fabs(probe[n + i]));
+        }
+        shDiff[tid] = diff;
+        shSize[tid] = size;
+        __syncthreads();
+        for (int width = blockDim.x / 2; width > 0; width /= 2)
+        {
+            if (tid < width)
+            {
+                shDiff[tid] = fmax(shDiff[tid], shDiff[tid + width]);
+                shSize[tid] = fmax(shSize[tid], shSize[tid + width]);
+            }
+            __syncthreads();
+        }
+        if (tid == 0 && !(shDiff[0] <= INVERSE_PROBE_TOL*shSize[0])) shUnsafe = 3;
+        __syncthreads();
+    }
+    if (tid == 0) *unsafe = shUnsafe;
+}
+
+// BRAE_CONTROL_COARSE_INVERSE=perturb|probe_blind: one entry of the inverse moved by a relative 1e-6 (after the
+// check: a defect the check did not see; before it: one the check must see)
+__global__
+void coarseInversePerturbKernel(
+    scalar* __restrict__ inv)
+{
+    inv[0] *= 1.0 + 1e-6;
+}
+
+// BRAE_CONTROL_COARSE_INVERSE=half: the whole inverse halved, a coarse correction a solve can see in its iterations
+__global__
+void coarseInverseHalfKernel(
+    int nn,
+    scalar* __restrict__ inv)
+{
+    for (int i = blockIdx.x*blockDim.x + threadIdx.x; i < nn; i += gridDim.x*blockDim.x) inv[i] *= 0.5;
+}
+
+// A_c = L L^T where the level allows it, in ONE block (the fill is coarseLUFactorKernel's, the coupled pair's
+// dense entries with it). work is the n*n row-major working matrix (shared memory when inShared). Writes lc
+// column-major with both factors, lc[k*n + i] = L[i][k] for i >= k and L[k][i] for i < k, so that the warp
+// solve reads L's columns forward and L^T's backward; chol = 1 then, 0 (and lc untouched) where the level is
+// not symmetric to CHOL_SYM_TOL or a pivot falls below CHOL_PIVOT_MIN.
+__global__
+void coarseCholeskyKernel(
+    int n,
+    const scalar* __restrict__ diag,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ upper,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ owner,
+    const scalar* __restrict__ lower,
+    const scalar* __restrict__ extra,
+    scalar* __restrict__ work,
+    scalar* __restrict__ lc,
+    int* __restrict__ chol,
+    bool inShared)
+{
+    const int tid = threadIdx.x;
+    __shared__ scalar shScale;
+    __shared__ scalar shAsym[TPB];
+    __shared__ scalar shL;
+    __shared__ int shFail;
+    extern __shared__ scalar sh[];
+    scalar* __restrict__ A = inShared ? sh : work;
+    for (int i = tid; i < n*n; i += blockDim.x) A[i] = 0.0;
+    __syncthreads();
+    for (int c = tid; c < n; c += blockDim.x)
+    {
+        A[c*n + c] = diag[c];
+        for (int f = ownerStart[c]; f < ownerStart[c+1]; ++f) A[c*n + nei[f]] = upper[f];
+        for (int k = losortStart[c]; k < losortStart[c+1]; ++k)
+        {
+            const int f = losort[k];
+            A[c*n + owner[f]] = lower[f];
+        }
+    }
+    __syncthreads();
+    if (extra)
+    {
+        for (int i = tid; i < n*n; i += blockDim.x) A[i] += extra[i];
+        __syncthreads();
+    }
+    scalar asym = 0.0;
+    for (int idx = tid; idx < n*n; idx += blockDim.x)
+    {
+        const int i = idx / n;
+        const int j = idx % n;
+        if (j > i) asym = fmax(asym, fabs(A[i*n + j] - A[j*n + i]));
+    }
+    shAsym[tid] = asym;
+    if (tid == 0)
+    {
+        scalar m = 0.0;
+        for (int c = 0; c < n; ++c) m = fmax(m, fabs(diag[c]));
+        shScale = (m > 0.0) ? m : 1.0;
+        shFail = 0;
+    }
+    __syncthreads();
+    for (int width = blockDim.x / 2; width > 0; width /= 2)
+    {
+        if (tid < width) shAsym[tid] = fmax(shAsym[tid], shAsym[tid + width]);
+        __syncthreads();
+    }
+    if (!(shAsym[0] <= CHOL_SYM_TOL*shScale))
+    {
+        if (tid == 0) *chol = 0;
+        return;
+    }
+    for (int k = 0; k < n; ++k)
+    {
+        if (tid == 0)
+        {
+            const scalar d = A[k*n + k];
+            if (!(d > CHOL_PIVOT_MIN*shScale)) shFail = 1;
+            else
+            {
+                shL = sqrt(d);
+                A[k*n + k] = shL;
+            }
+        }
+        __syncthreads();
+        if (shFail)
+        {
+            if (tid == 0) *chol = 0;
+            return;
+        }
+        const scalar l = shL;
+        for (int i = k+1+tid; i < n; i += blockDim.x) A[i*n + k] /= l;
+        __syncthreads();
+        const int m = n - k - 1;
+        for (int idx = tid; idx < m*m; idx += blockDim.x)            // the lower triangle of the trailing block
+        {
+            const int i = k + 1 + idx/m;
+            const int j = k + 1 + idx%m;
+            if (j <= i) A[i*n + j] -= A[i*n + k]*A[j*n + k];
+        }
+        __syncthreads();
+    }
+    for (int idx = tid; idx < n*n; idx += blockDim.x)
+    {
+        const int k = idx / n;
+        const int i = idx % n;
+        lc[idx] = (i >= k) ? A[i*n + k] : A[k*n + i];
+    }
+    if (tid == 0) *chol = 1;
+}
+
 } // anon
 
 bool deviceCoarseFitsCluster(int nCoarse)
@@ -678,6 +1168,173 @@ void deviceCoarseLUSolve(
     cudaCheck(cudaGetLastError(), "coarseLUSolve launch");
 }
 
+
+namespace
+{
+// BRAE_CONTROL_COARSE_INVERSE: the deliberately broken inverses the gate (tests/test_amg_coarse_inverse.cu) must see
+enum class InverseControl { None, Perturb, ProbeBlind, Transpose, Stale, NoFallback, Half };
+InverseControl inverseControl()
+{
+    static const InverseControl c = []()
+    {
+        const char* e = std::getenv("BRAE_CONTROL_COARSE_INVERSE");
+        const std::string v = e ? e : "";
+        InverseControl k = InverseControl::None;
+        if (v.empty()) return k;
+        if (v == "perturb") k = InverseControl::Perturb;
+        else if (v == "probe_blind") k = InverseControl::ProbeBlind;
+        else if (v == "transpose") k = InverseControl::Transpose;
+        else if (v == "stale") k = InverseControl::Stale;
+        else if (v == "nofallback") k = InverseControl::NoFallback;
+        else if (v == "half") k = InverseControl::Half;
+        else throw std::runtime_error("BRAE_CONTROL_COARSE_INVERSE='" + v + "' is not one of perturb, probe_blind, transpose, stale, nofallback, half");
+        std::printf("CONTROL coarse-inverse-%s INJECTED: this run's coarsest solve is deliberately wrong\n", v.c_str());
+        return k;
+    }();
+    return c;
+}
+} // anon
+
+CoarseSolveKind coarseSolveKind()
+{
+    static const CoarseSolveKind kind = []()
+    {
+        const char* e = std::getenv("BRAE_AMG_COARSE_SOLVE");
+        const std::string v = e ? e : "";
+        CoarseSolveKind k = COARSE_SOLVE_DEFAULT;
+        if (v.empty()) return k;
+        if (v == "lu") k = CoarseSolveKind::LU;
+        else if (v == "tri") k = CoarseSolveKind::Tri;
+        else if (v == "inverse") k = CoarseSolveKind::Inverse;
+        else if (v == "cholesky") k = CoarseSolveKind::Cholesky;
+        else throw std::runtime_error("BRAE_AMG_COARSE_SOLVE='" + v + "' is not one of lu, tri, inverse, cholesky");
+        // said where it was asked for, whatever it names; the default is silent
+        std::printf("NOTICE: the AMG's coarsest direct solve is '%s' (BRAE_AMG_COARSE_SOLVE)\n", v.c_str());
+        return k;
+    }();
+    return kind;
+}
+
+namespace
+{
+// the largest dynamic shared memory a block may ask for here, granted to the warp solve once (outside every
+// capture: the first prepare)
+int warpSolveSharedMax()
+{
+    static int bytes = 0;
+    static std::once_flag once;
+    std::call_once(once, []()
+    {
+        int dev = 0;
+        cudaCheck(cudaGetDevice(&dev), "warp solve device");
+        int optin = 0;
+        cudaCheck(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev), "warp solve shared");
+        cudaCheck(cudaFuncSetAttribute(coarseWarpSolveKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, optin),
+                  "warp solve shared optin");
+        bytes = optin;
+    });
+    return bytes;
+}
+} // anon
+
+// INSTRUMENT (BRAE_AMG_COARSE_REPORT=1): a line a preparation, the level's size and the path its solves take -- a
+// read of the device flag, so a host wait each factorisation; off by default
+static void coarseReport(
+    const CoarseDirect& d)
+{
+    static const bool on = std::getenv("BRAE_AMG_COARSE_REPORT") != nullptr;
+    if (!on) return;
+    int unsafe = 0;
+    cudaCheck(cudaMemcpy(&unsafe, d.unsafe.data(), sizeof(int), cudaMemcpyDeviceToHost), "coarse report");
+    static const char* why[] = {"the inverse", "the LU (a floored pivot)", "the LU (an entry not finite)", "the LU (the probes disagree)"};
+    std::printf("COARSE: %d cells, solved by %s\n", d.n, why[unsafe >= 0 && unsafe <= 3 ? unsafe : 0]);
+}
+
+void deviceCoarseDirectPrepare(
+    CoarseSolveKind kind,
+    const DeviceLduView& cv,
+    const scalar* extra,
+    const DeviceBuffer<scalar>& lu,
+    const DeviceBuffer<int>& piv,
+    CoarseDirect& d)
+{
+    const int n = cv.nCells;
+    // the warp kernels hold n <= 32*TRI_ROWS rows; above it every kind is the LU, and so is an empty level (an
+    // empty mesh: a launch of no blocks is an error, which the LU's solve never makes)
+    d.kind = (n >= 1 && n <= 32*TRI_ROWS) ? kind : CoarseSolveKind::LU;
+    d.n = n;
+    if (d.kind == CoarseSolveKind::LU) return;
+    const std::size_t nn = static_cast<std::size_t>(n)*n;
+    d.fc.resize(nn);
+    d.perm.resize(n);
+    warpSolveSharedMax();
+    coarseLUColumnMajorKernel<<<nBlocks(static_cast<int>(nn)), TPB, 0, cudaStreamPerThread>>>(n, lu.data(), piv.data(), d.fc.data(), d.perm.data());
+    cudaCheck(cudaGetLastError(), "coarse LU column-major");
+    if (d.kind == CoarseSolveKind::Inverse)
+    {
+        const InverseControl control = inverseControl();
+        // the stale control keeps the first factorisation's inverse (and its check) for every later level of this size
+        if (control == InverseControl::Stale && d.f2.size() == nn) return;
+        d.f2.resize(nn);
+        d.probe.resize(2*static_cast<std::size_t>(n));
+        d.unsafe.resize(1);
+        coarseInverseKernel<<<nBlocks(32*n), TPB, 0, cudaStreamPerThread>>>(n, d.fc.data(), d.perm.data(), d.f2.data());
+        cudaCheck(cudaGetLastError(), "coarse inverse");
+        if (control == InverseControl::ProbeBlind) coarseInversePerturbKernel<<<1, 1, 0, cudaStreamPerThread>>>(d.f2.data());
+        coarseInverseCheckKernel<<<1, TPB, 0, cudaStreamPerThread>>>(n, cv.diag, d.f2.data(), d.fc.data(), d.perm.data(), d.probe.data(),
+                                                                   d.unsafe.data());
+        cudaCheck(cudaGetLastError(), "coarse inverse check");
+        if (control == InverseControl::Perturb) coarseInversePerturbKernel<<<1, 1, 0, cudaStreamPerThread>>>(d.f2.data());
+        if (control == InverseControl::Half)
+        {
+            coarseInverseHalfKernel<<<nBlocks(static_cast<int>(nn)), TPB, 0, cudaStreamPerThread>>>(static_cast<int>(nn), d.f2.data());
+        }
+        cudaCheck(cudaGetLastError(), "coarse inverse control");
+        coarseReport(d);
+    }
+    else if (d.kind == CoarseSolveKind::Cholesky)
+    {
+        d.f2.resize(nn);
+        d.chol.resize(1);
+        const std::size_t shBytes = nn*sizeof(scalar);
+        // the static shared (the asymmetry reduction, TPB doubles) shares the 48 KB with the working matrix
+        const bool inShared = shBytes + TPB*sizeof(scalar) + 64 <= 48u*1024u;
+        if (!inShared) d.work.resize(nn);
+        coarseCholeskyKernel<<<1, TPB, inShared ? shBytes : 0, cudaStreamPerThread>>>(n,
+            cv.diag, cv.ownerStart, cv.nei, cv.upper, cv.losortStart, cv.losort, cv.owner, cv.lower, extra,
+            inShared ? nullptr : d.work.data(), d.f2.data(), d.chol.data(), inShared);
+        cudaCheck(cudaGetLastError(), "coarse cholesky");
+    }
+}
+
+void deviceCoarseDirectSolve(
+    int nC,
+    const DeviceBuffer<scalar>& lu,
+    const DeviceBuffer<int>& piv,
+    const CoarseDirect& d,
+    const DeviceBuffer<scalar>& rc,
+    DeviceBuffer<scalar>& xc)
+{
+    if (d.kind == CoarseSolveKind::LU || d.n != nC)
+    {
+        deviceCoarseLUSolve(nC, lu, piv, rc, xc);
+        return;
+    }
+    if (d.kind == CoarseSolveKind::Inverse)
+    {
+        const InverseControl control = inverseControl();
+        coarseInverseApplyKernel<<<nBlocks(32*nC), TPB, 0, cudaStreamPerThread>>>(nC, d.f2.data(), d.fc.data(), d.perm.data(), d.unsafe.data(),
+            rc.data(), xc.data(), control == InverseControl::Transpose ? 1 : control == InverseControl::NoFallback ? 2 : 0);
+        cudaCheck(cudaGetLastError(), "coarse inverse apply");
+        return;
+    }
+    const std::size_t shBytes = static_cast<std::size_t>(nC)*nC*sizeof(scalar);
+    const bool inShared = static_cast<int>(shBytes) <= warpSolveSharedMax();
+    const bool chol = d.kind == CoarseSolveKind::Cholesky;
+    coarseWarpSolveKernel<<<1, TPB, inShared ? shBytes : 0, cudaStreamPerThread>>>(nC, d.fc.data(), d.perm.data(),
+        chol ? d.f2.data() : nullptr, chol ? d.chol.data() : nullptr, rc.data(), xc.data(), inShared);
+    cudaCheck(cudaGetLastError(), "coarse warp solve");
+}
 
 // Iterated coarsest solve: nSweeps of global weighted-Jacobi (deviceAmul + smoothT). Reuses the V-cycle's
 // smoothT<> kernel (amg_kernels.cuh) and deviceAmul; kept out of the single-launch solvers above for that reason.

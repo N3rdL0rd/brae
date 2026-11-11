@@ -1,6 +1,7 @@
 // Device AMG preconditioner: host agglomeration (static) + device Galerkin and V-cycle smoothing.
 // Used by deviceAMGPCG. Feature flags live in one BRAE_AMG_* block at the top of the anonymous namespace.
 #include "device_amg.cuh"
+#include <unistd.h>
 #include "inter_phase_time.cuh"
 #include "device_blas.cuh"
 #include "proc_comm.cuh"       // ProcComm::current(): the rank in the hierarchy cache file name
@@ -212,6 +213,25 @@ void galFaceGatherK(
     cUp[cf] = u;
     cLo[cf] = l;
 }
+// ...for a fine matrix with ONE off-diagonal (upper and lower the same buffer): the flip picks between two equal
+// values, so the coarse face's sum is galFaceGatherK's u term for term, and its l is the same sum again
+__global__
+void galFaceGatherSymK(
+    int nCoarseFaces,
+    const label* __restrict__ faceStart,
+    const label* __restrict__ faceList,
+    const scalar* __restrict__ off,
+    scalar* __restrict__ cOff)
+{
+    const int cf = blockIdx.x*blockDim.x + threadIdx.x;
+    if (cf >= nCoarseFaces) return;
+    scalar u = 0.0;
+    for (label k = faceStart[cf]; k < faceStart[cf+1]; ++k)
+    {
+        u += off[faceList[k]];
+    }
+    cOff[cf] = u;
+}
 
 
 } // namespace
@@ -276,6 +296,51 @@ void buildGalerkinGather(AMGLevel& L, const AgglomT& a, int nFine)
 
 // THE BUILD'S PARAMETERS, read in ONE place: buildAMG and agglomerate take them from here, and so does the
 // disk cache's signature (amgHierarchySignature) -- a hierarchy built under another value is another hierarchy.
+// INSTRUMENT (BRAE_AMG_COARSE_DUMP=<dir>): the coarsest grid's matrix, dense and row-major at 17 digits, for the
+// coarse-solve benchmark (tests/bench_amg_coarse_solve.cu); the first BRAE_AMG_COARSE_DUMP_MAX (4) a process.
+static void dumpCoarsestForBenchmark(
+    const DeviceLduView& cv)
+{
+    static const char* dir = std::getenv("BRAE_AMG_COARSE_DUMP");
+    if (!dir) return;
+    static int written = 0;
+    static const int most = std::getenv("BRAE_AMG_COARSE_DUMP_MAX") ? std::atoi(std::getenv("BRAE_AMG_COARSE_DUMP_MAX")) : 4;
+    if (written >= most) return;
+    const int n = cv.nCells;
+    const int nf = cv.nInternalFaces;
+    std::vector<scalar> diag(n), upper(nf), lower(nf);
+    std::vector<label> owner(nf), nei(nf);
+    cudaCheck(cudaDeviceSynchronize(), "coarse dump sync");
+    cudaCheck(cudaMemcpy(diag.data(), cv.diag, n*sizeof(scalar), cudaMemcpyDeviceToHost), "coarse dump diag");
+    if (nf > 0)
+    {
+        cudaCheck(cudaMemcpy(upper.data(), cv.upper, nf*sizeof(scalar), cudaMemcpyDeviceToHost), "coarse dump upper");
+        cudaCheck(cudaMemcpy(lower.data(), cv.lower, nf*sizeof(scalar), cudaMemcpyDeviceToHost), "coarse dump lower");
+        cudaCheck(cudaMemcpy(owner.data(), cv.owner, nf*sizeof(label), cudaMemcpyDeviceToHost), "coarse dump owner");
+        cudaCheck(cudaMemcpy(nei.data(), cv.nei, nf*sizeof(label), cudaMemcpyDeviceToHost), "coarse dump nei");
+    }
+    std::vector<scalar> dense(static_cast<std::size_t>(n)*n, 0.0);
+    for (int c = 0; c < n; ++c) dense[static_cast<std::size_t>(c)*n + c] = diag[c];
+    for (int f = 0; f < nf; ++f)
+    {
+        dense[static_cast<std::size_t>(owner[f])*n + nei[f]] += upper[f];
+        dense[static_cast<std::size_t>(nei[f])*n + owner[f]] += lower[f];
+    }
+    char name[512];
+    std::snprintf(name, sizeof(name), "%s/coarsest_%d_%d.txt", dir, static_cast<int>(getpid()), written);
+    FILE* fp = std::fopen(name, "w");
+    if (!fp) return;
+    std::fprintf(fp, "%d\n", n);
+    for (int i = 0; i < n; ++i)
+    {
+        for (int j = 0; j < n; ++j) std::fprintf(fp, j ? " %.17g" : "%.17g", dense[static_cast<std::size_t>(i)*n + j]);
+        std::fprintf(fp, "\n");
+    }
+    std::fclose(fp);
+    std::printf("INSTRUMENT: the coarsest grid's matrix (%d cells) written to %s\n", n, name);
+    ++written;
+}
+
 int amgTarget()
 {
     const char* e = std::getenv("BRAE_AMG_TARGET");
@@ -1375,7 +1440,7 @@ AMGData buildAMG(
                 interPhase::Nested timedRest("hierarchy: a level's coarse matrix sized, the level kept");
                 L.cDiag.resize(a.nCoarse);
                 L.cUpper.resize(a.nCoarseFaces);
-                L.cLower.resize(a.nCoarseFaces);
+                // no cLower yet: the first Galerkin takes it for a matrix with two off-diagonals (amgTakeCoarseLower)
                 A.level.push_back(std::move(L));
             }
             owner = std::move(a.cOwn);
@@ -1622,6 +1687,28 @@ void amgSaFixedOrder(AMGLevel& L)
     L.rapDstIdx.copyFrom(permuted(dstIdx));
 }
 
+// A level without a lower off-diagonal (AMGLevel::coarseLower) takes one the first time a fine matrix with two
+// comes, and keeps it. If a Galerkin ran before, cycles may have been captured that read cUpper as the lower:
+// this hierarchy's graphs are dropped, and every other cache is told (deviceGraphGeneration), as when a solver's
+// long-lived buffers go.
+static void amgTakeCoarseLower(AMGData& A)
+{
+    bool taken = false;
+    for (AMGLevel& L : A.level)
+    {
+        if (static_cast<int>(L.cLower.size()) == L.nCoarseFaces) continue;
+        L.cLower.resize(L.nCoarseFaces);
+        taken = true;
+    }
+    // BRAE_CONTROL_AMG_LOWER_GRAPHS_KEPT=1, a gate's CONTROL, deliberately wrong: the graphs are kept, and a replay
+    // reads cUpper as the lower (tests/test_amg_one_off_diagonal.cu). Read at each call: the gate sets it for one arm.
+    if (!taken || !A.galerkinRun || std::getenv("BRAE_CONTROL_AMG_LOWER_GRAPHS_KEPT")) return;
+    A.gcache = std::make_unique<AMGGraphCache>();
+    A.gcacheF = std::make_unique<AMGGraphCache>();
+    A.pcgCache.reset();
+    bumpDeviceGraphGeneration();
+}
+
 void amgGalerkin(
     AMGData& A,
     const DeviceBuffer<scalar>& fineDiag,
@@ -1632,6 +1719,14 @@ void amgGalerkin(
     A.keptValid = false;
     A.fp32Current = false;
     A.fp32Stands = false;
+    // ONE OFF-DIAGONAL FOR A FINE MATRIX HANDED WITH ONE (upper and lower the same buffer: simpleFoam's
+    // symmetric pressure, interFoam's pcorr). The gather below then sums the same values in the same order into
+    // a coarse face's upper and lower, so they are the same bits on every grid, and an injection level keeps
+    // one: its view hands cUpper as the lower. The lifetime audit (2026-10-17) found cUpper and cLower equal
+    // byte for byte on all 16 coarse grids of boxy5 at 4.94 M cells, 225 MiB there. A smoothed level keeps both
+    // (its RAP recipe writes them apart), and so does a level that has once taken its own.
+    const bool oneOffDiagonal = !A.saSmooth && fineUpper.data() == fineLower.data();
+    if (!oneOffDiagonal) amgTakeCoarseLower(A);
     for (int k = 0; k < A.nLevels(); ++k)                      // grid k matrix -> grid k+1 (Galerkin scatter)
     {
         AMGLevel& L = A.level[k];
@@ -1650,7 +1745,7 @@ void amgGalerkin(
         {
             fd = A.level[k-1].cDiag.data();
             fu = A.level[k-1].cUpper.data();
-            fl = A.level[k-1].cLower.data();
+            fl = A.level[k-1].coarseLower();
             nFaces = A.level[k-1].nCoarseFaces;
         }
         if (A.saSmooth)                                          // general Galerkin A_c = P^T A P (precomputed RAP recipe)
@@ -1690,9 +1785,17 @@ void amgGalerkin(
             galDiagGatherK<<<nBlocks(L.nCoarse),TPB>>>(
                 L.nCoarse, L.galCellStart.data(), L.galCellList.data(),
                 L.galDFaceStart.data(), L.galDFaceList.data(), fd, fu, fl, L.cDiag.data());
-            galFaceGatherK<<<nBlocks(L.nCoarseFaces),TPB>>>(
-                L.nCoarseFaces, L.galFaceStart.data(), L.galFaceList.data(), L.galFaceFlipList.data(),
-                fu, fl, L.cUpper.data(), L.cLower.data());
+            if (L.cLower.size() > 0)
+            {
+                galFaceGatherK<<<nBlocks(L.nCoarseFaces),TPB>>>(
+                    L.nCoarseFaces, L.galFaceStart.data(), L.galFaceList.data(), L.galFaceFlipList.data(),
+                    fu, fl, L.cUpper.data(), L.cLower.data());
+            }
+            else
+            {
+                galFaceGatherSymK<<<nBlocks(L.nCoarseFaces),TPB>>>(
+                    L.nCoarseFaces, L.galFaceStart.data(), L.galFaceList.data(), fu, L.cUpper.data());
+            }
         }
     }
     cudaCheck(cudaGetLastError(), "galerkin");
@@ -1720,7 +1823,7 @@ void amgGalerkin(
             else
             {
                 const AMGLevel& Lg = A.level[g-1];
-                amgGatherPermutedGSCoeffs(A.coloring[g], Lg.cDiag.data(), Lg.cUpper.data(), Lg.cLower.data());
+                amgGatherPermutedGSCoeffs(A.coloring[g], Lg.cDiag.data(), Lg.cUpper.data(), Lg.coarseLower());
             }
         }
     }
@@ -1736,7 +1839,10 @@ void amgGalerkin(
     // part that is not an optimisation -- OUTSIDE every graph capture, for the same reason the permuted
     // GS coefficients are gathered here. A factorisation made conditional inside a captured V-cycle
     // would bake the coefficients of the iteration the graph was captured in into every replay.
-    if (useDenseCoarse() && A.nLevels() > 0 && A.level.back().nCoarse <= DENSE_COARSE_MAX)
+    // The coarsest solve's kind is read here whatever the level, so that a BRAE_AMG_COARSE_SOLVE no direct level
+    // reaches is still refused or said.
+    const CoarseSolveKind coarseKind = coarseSolveKind();
+    if (useDenseCoarse() && A.nLevels() > 0 && A.level.back().nCoarse <= denseCoarseMax())
     {
         const int n = A.level.back().nCoarse;
         if (A.coarseLUn != n)
@@ -1746,12 +1852,15 @@ void amgGalerkin(
             A.coarseLUn = n;
         }
         deviceCoarseLUFactor(A.level.back().coarseView(), A.coarseLU, A.coarsePiv);
+        deviceCoarseDirectPrepare(coarseKind, A.level.back().coarseView(), nullptr, A.coarseLU, A.coarsePiv, A.coarseDirect);
+        dumpCoarsestForBenchmark(A.level.back().coarseView());
     }
     else
     {
         A.coarseLUn = 0;
     }
     A.spectrumReady = false;
+    A.galerkinRun = true;
     static bool saDbgOnce = false;                             // report the SA coarse-operator health just once
     if (A.saSmooth && std::getenv("BRAE_AMG_DEBUG") && !saDbgOnce)   // diag sign + dominance + coarsest definiteness
     {
@@ -1819,6 +1928,7 @@ void amgGalerkin(
             }
         }
     }
+    amgGatherCsr64(A);
 }
 
 } // namespace brae

@@ -19,6 +19,8 @@
 #include "mrf_read.cuh"
 #include "fv_options.cuh"
 #include "turbulent_inlet.cuh"
+#include "solution_health.cuh"
+#include "memory_probe.cuh"   // BRAE_MEMORY_PROBE: memory at fixed iterations, host_smoother_memory's reading
 #include "turb_blowup.cuh"
 #include "foam_dict.cuh"
 #include "dict_audit.cuh"
@@ -42,6 +44,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <chrono>
 #include <deque>
 #include <filesystem>
@@ -295,7 +298,15 @@ int main(int argc, char** argv)
 
         DeviceSimpleControls ctl;
         ctl.caseDir = caseDir;
-        ctl.writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr;   // -partition (above) or the env
+        // The AMG hierarchy cache is WRITTEN by default, as interFoam's is (device_inter_pressure_step.cu): the
+        // hierarchy is a function of the mesh alone and the file is keyed on it (amgHierarchySignature), so the
+        // next run on this case reads it instead of agglomerating again. BRAE_AMG_CACHE=0 neither reads nor
+        // writes one (device_simple_foam.cu); BRAE_MESH_CACHE=1, or -partition above, still asks for it too.
+        {
+            const char* amgCache = std::getenv("BRAE_AMG_CACHE");
+            const bool amgCacheOff = amgCache && std::atoi(amgCache) == 0;
+            ctl.writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr || !amgCacheOff;
+        }
         ctl.nu = transport.scalarOr("nu", 1e-5);
         // brae is Newtonian-only; a non-Newtonian transportModel has no top-level nu, so it would silently run with
         // the default constant nu (the wrong viscosity for a shear-thinning/thickening fluid). Fail loud instead.
@@ -363,21 +374,58 @@ int main(int argc, char** argv)
         // This used to be an inline copy here; the compressible driver was ported from it and silently
         // dropped fifteen of these controls. One reader means a new driver gets the whole set or none.
         const std::string second = ctl.sst ? "omega" : "epsilon";
-        readLinearSolverControls(fvSolution, second, ctl);
+        // THE COLOUR RULE is asked for unless BRAE_SIMPLE_CASE_SOLVER=1 (the exact gates set it); the solver
+        // decides per field whether it applies and prints the line that is true, so the reader leaves
+        // nuTilda's smoother line to it.
+        ctl.colourWhereGaussSeidel = std::getenv("BRAE_SIMPLE_CASE_SOLVER") == nullptr;
+        SolverRunsAs runsAs;
+        runsAs.turbulenceSmootherNoticedByCaller = ctl.colourWhereGaussSeidel;
+        readLinearSolverControls(fvSolution, second, ctl, "SIMPLE", "", runsAs);
 
         const FoamDict* simple = fvSolution.subDict("SIMPLE");
         const FoamDict* resCtl = simple ? simple->subDict("residualControl") : nullptr;
         const bool hasRC = (resCtl != nullptr);
         const scalar rcP = resCtl ? resCtl->scalarOr("p", -1) : -1, rcU = resCtl ? resCtl->scalarOr("U", -1) : -1;
+        // ...and the transported turbulence fields' targets, read HERE rather than at the convergence test.
+        // The test reads a field's target only once p and U have passed, so a run that never got there --
+        // the boxy5 UAV's 1000 iterations, targets 1e-6 -- ended with `SIMPLE/residualControl/nuTilda` in
+        // the unread notice although the test does gate on it. Same lookup, same values, read once.
+        std::map<std::string, scalar> rcTurb;
+        if (resCtl && ctl.turbulent && !ctl.les)
+        {
+            std::vector<std::string> names;
+            if (ctl.sa)       names = {"nuTilda"};
+            else if (ctl.sst) names = {"k", "omega"};
+            else              names = {"k", "epsilon"};
+            if (ctl.lm)
+            {
+                names.push_back("ReThetat");
+                names.push_back("gammaInt");
+            }
+            for (const std::string& f : names) rcTurb[f] = resCtl->scalarOr(f, -1);
+        }
         // consistent / nNonOrthogonalCorrectors / bodyForce are read by readLinearSolverControls above.
 
-        std::printf("brae (device-resident) | case=%s | %s%s | nu=%.3g\n", caseDir.c_str(),
-                    simType.c_str(), ctl.turbulent ? (ctl.sst ? " (kOmegaSST)" : " (kEpsilon)") : "", ctl.nu);
+        // The model readTurbulenceModel selected, by its own name: this line read `(kEpsilon)` for every
+        // turbulent case that was not kOmegaSST, Spalart-Allmaras included.
+        const std::string modelTag = ctl.turbulent ? " (" + ctl.modelName + ")" : std::string();
+        std::printf("brae (device-resident) | case=%s | %s%s | nu=%.3g\n",
+                    caseDir.c_str(),
+                    simType.c_str(),
+                    modelTag.c_str(),
+                    ctl.nu);
         std::printf("  relax U=%.2g p=%.2g | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s\n",
                     ctl.relaxU, ctl.relaxP, ctl.tolP, ctl.tolU, endTime, hasRC ? "on" : "off");
         std::printf("  schemes: bounded(U=%d,k=%d,eps=%d) linearUpwind(U)=%d nonOrth(corrected)=%d nonOrthLimit=%.3g consistent(SIMPLEC)=%d limitedLinear(k=%d,eps=%d) linearUpwind(k=%d,eps=%d)\n",
                     ctl.bounded, ctl.boundedK, ctl.boundedEps, ctl.linearUpwind, ctl.nonOrth, ctl.nonOrthLimit, ctl.consistent, ctl.limitedK, ctl.limitedEps, ctl.luK, ctl.luEps);
         std::printf("  grad(U) cellLimited k=%.3g (0=unlimited)\n", ctl.gradULimitK);
+        // What the turbulence closures take for grad(k|nuTilda) and grad(epsilon|omega), each its own entry, and for
+        // the gradients the two linearUpwind entries name. A gate reads this line to see the entries were read.
+        if (ctl.turbulent)
+            std::printf("  turbulence gradients cellLimited (0=unlimited): grad(%s)=%.3g grad(%s)=%.3g "
+                        "linearUpwind(k|nuTilda)=%.3g linearUpwind(epsilon|omega)=%.3g\n",
+                        ctl.sa ? "nuTilda" : "k", ctl.gradKLimitK, ctl.sst ? "omega" : "epsilon", ctl.gradEpsLimitK,
+                        ctl.gradKLULimitK, ctl.gradEpsLULimitK);
         std::printf("  linear solver (GaussSeidel from fvSolution; else BiCGStab): U=%d k|nuTilda=%d eps|omega=%d\n", ctl.gsU, ctl.gsK, ctl.gsEps);
 
         // mesh + start fields (single GPU: read directly, no decomposition)
@@ -577,6 +625,25 @@ int main(int argc, char** argv)
         // converges if at least one criterion was ACTUALLY checked (see solvers/common/residual_control.cuh).
         int rcChecked = 0;
         TurbBlowup turbBlowup;   // sum|turb| tripwire; see solvers/common/turb_blowup.cuh
+        HealthAdmissible healthSecond;   // solvers/common/solution_health.cuh
+        const char* const healthLog = std::getenv("BRAE_HEALTH_LOG");
+        // TEST CONTROL: <field>:<kind>:<iteration>, DeviceSimpleFoam::corruptForTest
+        std::string corruptField;
+        std::string corruptKind;
+        long corruptIter = -1;
+        if (const char* e = std::getenv("BRAE_TEST_CORRUPT"))
+        {
+            const std::string t(e);
+            const std::size_t a = t.find(':');
+            const std::size_t b = t.rfind(':');
+            if (a == std::string::npos || b == a)
+            {
+                throw std::runtime_error("BRAE_TEST_CORRUPT wants <field>:<kind>:<iteration>");
+            }
+            corruptField = t.substr(0, a);
+            corruptKind = t.substr(a + 1, b - a - 1);
+            corruptIter = std::atol(t.c_str() + b + 1);
+        }
         auto ok = [&](scalar res, scalar ctlv) { if (ctlv < 0) return true; ++rcChecked; return res < ctlv; };
         // OF controlDict write cadence: writeControl / writeInterval / purgeWrite (ported from Foam::Time)
         const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
@@ -665,13 +732,129 @@ int main(int argc, char** argv)
                 "iterations -- on a restart set it past the time you are restarting from.");
         int iter = 0;
         bool converged = false;
+        // forceCoeffs SAMPLED through the run, on request: BRAE_FORCE_INTERVAL=N writes Cd/Cl/Cm every N iterations
+        // from iteration BRAE_FORCE_FROM (default 1) to postProcessing/forceCoeffs/<startTime>/coefficient.dat, as
+        // gpuPimpleFoam does. OpenFOAM's forceCoeffs runs every time step and writes that history; this driver
+        // otherwise evaluates it once, after the loop (below). Not every iteration by default because the evaluation
+        // is wallForces' host gaussGrad and near-wall distance over the whole mesh -- seconds on a few million cells.
+        // The polar of the boxy5 UAV compares means over the last 300 iterations, which is what this is for.
+        const long forceInterval = std::getenv("BRAE_FORCE_INTERVAL")
+                                 ? std::max(0L, std::atol(std::getenv("BRAE_FORCE_INTERVAL"))) : 0;
+        const long forceFrom = std::getenv("BRAE_FORCE_FROM")
+                             ? std::max(1L, std::atol(std::getenv("BRAE_FORCE_FROM"))) : 1;
+        const FoamDict* fcSampleDict = nullptr;
+        if (const FoamDict* funcs = controlDict.subDict("functions"))
+            for (const auto& sd : funcs->subs)
+                if (sd.second.wordOr("type", "") == "forceCoeffs")
+                {
+                    fcSampleDict = &sd.second;
+                    break;
+                }
+        std::vector<std::string> fcSampleWalls;
+        for (const auto& q : fvp)
+            if (q.type == "wall") fcSampleWalls.push_back(q.name);
+        // grad(U) is needed at the patches' cells only (wallForces' gradAt): the subset, made once
+        fvc::GradSubset fcSampleAt;
+        if (forceInterval > 0)
+        {
+            std::vector<char> onPatch(static_cast<std::size_t>(nC), 0);
+            for (const auto& q : fvp)
+            {
+                if (q.type == "empty") continue;
+                for (label i = 0; i < q.size; ++i)
+                    onPatch[static_cast<std::size_t>(q.faceCells[i])] = 1;
+            }
+            std::vector<label> cells;
+            for (label c = 0; c < nC; ++c)
+                if (onPatch[static_cast<std::size_t>(c)]) cells.push_back(c);
+            fcSampleAt = fvc::gradSubset(m, cells);
+        }
+        std::ofstream fcOut;
+        if (forceInterval > 0 && fcSampleDict && ctl.turbulent && !fcSampleWalls.empty())
+        {
+            const std::string fdir = caseDir + "/postProcessing/forceCoeffs/" + startStr;
+            std::error_code fec;
+            std::filesystem::create_directories(fdir, fec);
+            fcOut.open(fdir + "/coefficient.dat");
+            fcOut << "# Time\tCd\tCl\tCm\n";
+            fcOut.setf(std::ios::scientific);
+            fcOut.precision(10);
+            std::printf("  forceCoeffs: sampled every %ld iterations from iteration %ld to "
+                        "postProcessing/forceCoeffs/%s/coefficient.dat (BRAE_FORCE_INTERVAL, BRAE_FORCE_FROM)\n",
+                        forceInterval,
+                        forceFrom,
+                        startStr.c_str());
+        }
+        else if (forceInterval > 0)
+        {
+            std::printf("  forceCoeffs: BRAE_FORCE_INTERVAL set but NOT sampled (%s)\n",
+                        !fcSampleDict ? "no forceCoeffs entry in controlDict.functions"
+                                      : (!ctl.turbulent ? "laminar case" : "no wall patches"));
+        }
+        // the same evaluation as the one after the loop, from the current device state
+        auto sampleForceCoeffs = [&](scalar tval)
+        {
+            const std::vector<vector> Ug = solver.U();
+            const std::vector<scalar> pg = solver.p();
+            for (label c = 0; c < nC; ++c)
+                U.internal[c] = Ug[c];
+            p.internal = pg;
+            U.evaluateBoundary();
+            p.evaluateBoundary();
+            const scalar wCmu   = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
+            const scalar wKappa = ctl.sst ? ctl.ksstCoeffs.kappa    : ctl.keCoeffs.kappa;
+            const scalar wE     = ctl.sst ? ctl.ksstCoeffs.E        : ctl.keCoeffs.E;
+            const bool velNutWall = ctl.sa || ctl.nutWall != NutWall::Nutk;
+            const std::vector<scalar> saNutWall = velNutWall ? solver.nutWall() : std::vector<scalar>();
+            const std::vector<scalar>* nwb = velNutWall ? &saNutWall : nullptr;
+            auto toV = [](const std::vector<scalar>& a, vector d){ return a.size() >= 3 ? vector{a[0],a[1],a[2]} : d; };
+            const std::vector<std::string> fcP = fcSampleDict->wordListOr("patches", fcSampleWalls);
+            const scalar rhoInf = fcSampleDict->scalarOr("rhoInf", 1.0), magUInf = fcSampleDict->scalarOr("magUInf", 1.0);
+            const scalar Aref = fcSampleDict->scalarOr("Aref", 1.0), lRef = fcSampleDict->scalarOr("lRef", 1.0);
+            const vector liftDir = toV(fcSampleDict->scalarListOr("liftDir", {}), vector{0,1,0});
+            const vector dragDir = toV(fcSampleDict->scalarListOr("dragDir", {}), vector{1,0,0});
+            const vector pitchAxis = toV(fcSampleDict->scalarListOr("pitchAxis", {}), vector{0,0,1});
+            const vector CofR = toV(fcSampleDict->scalarListOr("CofR", {}), vector{0,0,0});
+            const ForceResult Fc = wallForces(U,
+                                              p,
+                                              solver.k(),
+                                              ctl.nu,
+                                              m,
+                                              g,
+                                              fvp,
+                                              fcP,
+                                              rhoInf,
+                                              0.0,
+                                              CofR,
+                                              wCmu,
+                                              wKappa,
+                                              wE,
+                                              nwb,
+                                              &fcSampleAt);
+            const ForceCoeffs cc = forceCoeffs(Fc, dragDir, liftDir, pitchAxis, rhoInf, magUInf, Aref, lRef);
+            fcOut << tval << '\t' << cc.Cd << '\t' << cc.Cl << '\t' << cc.Cm << '\n';
+            fcOut.flush();
+        };
         const auto _runStart = std::chrono::high_resolution_clock::now();          // for OpenFOAM-style ExecutionTime
         double _cumCont = 0.0;                                                     // cumulative continuity error (OF continuityErrs.H)
         time.setSteps(static_cast<int>(nSteps));
+        // BRAE_POOL_STATS=1: the device pool after start-up, after the first iterations and every 25th -- its
+        // footprint, the bytes in use and their peak, and which phase asked the driver for what
+        detail::devicePool().report("start-up");
+        // BRAE_MEMORY_PROBE: the memory the run holds at fixed iterations (solvers/common/memory_probe.cuh)
+        MemoryProbe memProbe;
+        memProbe.startUp();
         while (!converged && time.loop())
         {
             iter = time.timeIndex();
             const DeviceSimpleResidual r = solver.step();
+            detail::devicePool().phase("output");
+            if (iter <= 3 || iter == 5 || iter == 10 || iter % 25 == 0)
+            {
+                const std::string when = "iter " + std::to_string(iter);
+                detail::devicePool().report(when.c_str());
+                if (iter == 2) detail::devicePool().reportLive(when.c_str());
+            }
             {
                 // OpenFOAM-style per-iteration report: Time, per-field solver residuals, continuity, turbulence, ExecutionTime.
                 const double _et = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - _runStart).count();
@@ -690,9 +873,8 @@ int main(int argc, char** argv)
                 // Naming WHICH GaussSeidel, because OF has two in that family and they are different
                 // solvers: GaussSeidelSmoother.C sweeps ascending only. A log that said
                 // "symGaussSeidel" for both would be asserting a capability again.
-                const char* uSolv = ctl.gsU ? (ctl.gsUSym ? "smoothSolver[symGaussSeidel]"
-                                                          : "smoothSolver[GaussSeidel]")
-                                            : "Jacobi-BiCGStab";
+                const std::string uSolvName = solver.momentumSolverName();
+                const char* uSolv = uSolvName.c_str();
                 // OF prints the TIME NAME (simpleFoam.C:100, runTime.timeName()), not the iteration
                 // index. The two coincide only at startTime 0 with deltaT 1, which every fixture in
                 // validation/ happens to be -- the same blind spot that hid it on the V2 driver until
@@ -720,7 +902,13 @@ int main(int argc, char** argv)
                 // the solve reads, so the label cannot drift from it.
                 char kSolvBuf[64];
                 const char* kSolv;
-                if (ctl.gsK)
+                if (ctl.gsK && solver.colourTurbulence())
+                {
+                    // the colour rule runs the case-order path's smoother (decideColourRule)
+                    const bool sym = ctl.gsKESym;
+                    kSolv = sym ? "smoothSolver[colourSymGaussSeidel]" : "smoothSolver[colourGaussSeidel]";
+                }
+                else if (ctl.gsK)
                 {
                     kSolv = ctl.gsKESym ? "smoothSolver[symGaussSeidel]" : "smoothSolver[GaussSeidel]";
                 }
@@ -785,6 +973,56 @@ int main(int argc, char** argv)
                 if (turbBlowup.update(solver.turbSumMag(), (int)iter))
                     throw std::runtime_error(turbBlowup.message((int)iter));
             }
+            if ((long)iter == corruptIter)
+            {
+                solver.corruptForTest(corruptField, corruptKind);
+            }
+            // The fields and every residual, not only p's and U's: see solvers/common/solution_health.cuh.
+            if (!std::getenv("BRAE_ALLOW_NONFINITE"))
+            {
+                std::string why;
+                for (const auto& e : turbulenceReport())
+                {
+                    if (why.empty()) why = healthResidual(e.field, e.perf.initialResidual, (int)iter);
+                    if (why.empty()) why = healthResidual(e.field + " (final)", e.perf.finalResidual, (int)iter);
+                }
+                const std::vector<HealthField> fields = solver.healthFields();
+                for (const HealthField& f : fields)
+                {
+                    // BRAE_HEALTH_LOG: the reductions the detector judges, every field, every iteration
+                    if (healthLog)
+                    {
+                        std::printf("health: field %s iteration %ld min %.6e max %.6e mean %.6e\n",
+                                    f.name,
+                                    (long)iter,
+                                    (double)f.min,
+                                    (double)f.max,
+                                    (double)f.mean);
+                    }
+                    if (why.empty()) why = healthField(f, (int)iter);
+                }
+                if (why.empty() && ctl.turbulent && !ctl.sa)
+                {
+                    const SecondFieldLimit& lim = secondFieldLimit();
+                    for (const HealthField& f : fields)
+                    {
+                        const bool second = std::string(f.name) == "epsilon|omega|nuTilda";
+                        if (!second) continue;
+                        if (healthLog)
+                        {
+                            std::printf("health: %s max %.6e limit %.6e ratio %.3e\n", ctl.sst ? "omega" : "epsilon", (double)f.max, (double)lim.limit, lim.limit > 0 ? (double)(f.max / lim.limit) : 0.0);
+                        }
+                        if (lim.limit > 0 && healthSecond.update(f.max, lim.limit))
+                        {
+                            why = healthSecond.message(ctl.sst ? "omega" : "epsilon", (int)iter);
+                        }
+                    }
+                }
+                if (!why.empty())
+                {
+                    throw std::runtime_error("solution diverged: " + why + ". No field written. Set BRAE_ALLOW_NONFINITE=1 to continue anyway.");
+                }
+            }
             // OF residualControl: also gate on every turbulence field (k/epsilon/omega/nuTilda) that lists a target.
             // Previously ONLY p and Ux were checked, so a turbulent case could report "converged" with k/epsilon
             // still far from tol -- the substantive bug this fixes. Unlisted fields have target -1 -> ok() ignores
@@ -807,19 +1045,31 @@ int main(int argc, char** argv)
             converged = hasRC && ok(r.p, rcP) && ok(uMax, rcU);
             if (converged)
                 for (const auto& e : turbulenceReport())
-                    if (!ok(e.perf.initialResidual, resCtl->scalarOr(e.field, -1))) { converged = false; break; }
+                {
+                    const auto it = rcTurb.find(e.field);
+                    const scalar target = (it != rcTurb.end()) ? it->second : resCtl->scalarOr(e.field, -1);
+                    if (!ok(e.perf.initialResidual, target)) { converged = false; break; }
+                }
             // OF's `checked` safety: `residualControl { }`, or a dict naming only fields brae does not
             // check, must NOT report convergence. Without this brae stopped after ONE iteration and wrote
             // a plausible-looking field set (simpleControl.C:51-57).
             converged = converged && rcChecked > 0;
             const scalar tval = startTimeVal + (scalar)iter * deltaT;               // OF time value at this step
+            if (fcOut.is_open() && iter >= forceFrom && iter % forceInterval == 0)
+            {
+                sampleForceCoeffs(tval);
+            }
             if (!converged && iter != nSteps && time.writeControl().isWriteTime(iter, tval))
             {
                 writeTimeDir(WriteControl::timeName(tval));
                 time.write();   // OF splits write() from execute(); this driver owns its own cadence
             }
+            memProbe.iteration(iter);
         }
         time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
+        memProbe.loopEnd(iter);
+        detail::devicePool().report("loop end");
+        detail::devicePool().reportClasses("loop end");
         // timeIndex() is the iteration that ran, so no -1: the for-loop this replaced incremented past it.
         const int nIter = converged ? time.timeIndex() : static_cast<int>(nSteps);
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
@@ -968,6 +1218,7 @@ int main(int argc, char** argv)
                 }
             }
         }
+        memProbe.end(nIter);
     }
     catch (const std::exception& e)
     {

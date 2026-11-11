@@ -74,6 +74,20 @@ struct DeviceSimpleControls
     int    minIterUFinal = 0,    minIterPFinal = 0,    minIterKEFinal = 0;
     scalar tolUFinal = 1e-6, tolPFinal = 1e-6, tolKEFinal = 1e-6;
     scalar relTolUFinal = 0.0, relTolPFinal = 0.0, relTolKEFinal = 0.0;
+    // The transported pair's OWN entries, one field each: k (nuTilda under Spalart-Allmaras) and the second
+    // field, epsilon or omega. OpenFOAM's lduMatrix::solver reads tolerance, relTol, maxIter and minIter from
+    // the dictionary of the field it solves (lduMatrixSolver.C:193-207) and the models solve each equation on
+    // its own (kOmegaSSTBase.C:593/:618, kEpsilon.C:268/:288); the device closures take these.
+    //
+    // The ...KE figures above are the pair MERGED -- the tighter tolerance, relTol and maxIter, the larger
+    // minIter -- which the device closures took until 2026-10-22: with k staged at 1e-13 beside omega at
+    // 1e-15, k ran to its sweep cap at every solve on motorBike. They stay for the callers that still carry
+    // one rule for the pair or take the pair's for a field of their own: the rho mirror drivers' host
+    // closures, kOmegaSSTLM's transition scalars, Maxwell's sigma, a scalarTransport object's relTol.
+    scalar tolK = 1e-6, relTolK = 0.0, tolKFinal = 1e-6, relTolKFinal = 0.0;
+    int    maxIterK = 1000, minIterK = 0, maxIterKFinal = 1000, minIterKFinal = 0;
+    scalar tolEps = 1e-6, relTolEps = 0.0, tolEpsFinal = 1e-6, relTolEpsFinal = 0.0;
+    int    maxIterEps = 1000, minIterEps = 0, maxIterEpsFinal = 1000, minIterEpsFinal = 0;
     // TWO flags, because OF selects the Final entry two different ways and the difference is visible in
     // its log on any PISO-mode case (nOuterCorrectors 1, two pressure correctors):
     //
@@ -115,6 +129,14 @@ struct DeviceSimpleControls
     scalar uRelTol()  const { return finalIter  ? relTolUFinal  : relTolU; }
     scalar keTol()    const { return finalIter  ? tolKEFinal    : tolKE; }
     scalar keRelTol() const { return finalIter  ? relTolKEFinal : relTolKE; }
+    scalar kTol()       const { return finalIter ? tolKFinal       : tolK; }
+    scalar kRelTol()    const { return finalIter ? relTolKFinal    : relTolK; }
+    int    kMaxIter()   const { return finalIter ? maxIterKFinal   : maxIterK; }
+    int    kMinIter()   const { return finalIter ? minIterKFinal   : minIterK; }
+    scalar epsTol()     const { return finalIter ? tolEpsFinal     : tolEps; }
+    scalar epsRelTol()  const { return finalIter ? relTolEpsFinal  : relTolEps; }
+    int    epsMaxIter() const { return finalIter ? maxIterEpsFinal : maxIterEps; }
+    int    epsMinIter() const { return finalIter ? minIterEpsFinal : minIterEps; }
     // fvSolution PIMPLE/finalOnLastPimpleIterOnly (pimpleControl.C:53, default false).
     bool   finalOnLastPimpleIterOnly = false;
     int    bicgCheckEvery = 1;      // batched convergence for ALL BiCGStab solves (momentum + k/eps); BRAE_BICG_CHECK_EVERY.
@@ -267,6 +289,14 @@ struct DeviceSimpleControls
     // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1): the sweeps between residual
     // EVALUATIONS, so it decides where a solve stops, not merely how fast it gets there.
     int    nSweepsU = 1, nSweepsHe = 1, nSweepsKE = 1;
+    // nuTilda's OWN smoother and sweep count (Spalart-Allmaras). The case-order path does not run them --
+    // it sweeps nuTilda with gsKESym and one sweep between evaluations, and says so (linear_solver_setup.cuh)
+    // -- but the colour rule runs each field's own entry, so it needs them read.
+    bool   gsNuTildaSym = true;
+    int    nSweepsNuTilda = 1;
+    // simpleFoam's COLOUR RULE was asked for: the driver sets it unless BRAE_SIMPLE_CASE_SOLVER=1, and the
+    // solver decides per field whether the rule applies (device_simple_foam.cu, colourU_ / colourTurb_).
+    bool   colourWhereGaussSeidel = false;
     // The ENERGY equation on a smoothSolver + GaussSeidel-family smoother, and which of the two OF
     // smoothers. True only when the case asks AND the calling driver honours it (SolverRunsAs::
     // smoothSolverOnEnergy) -- a shared flag that assumed the caller is how the mirror came to run
@@ -356,8 +386,20 @@ struct DeviceSimpleControls
     bool   gnPowerLaw = false;
     scalar gnNuMin = 0.0, gnNuMax = 0.0, gnN = 1.0;
     scalar gradULULimitK = 0.0;                    // linearUpwind's own grad(U)
-    scalar gradKLULimitK = 0.0;                    // linearUpwind's own grad(k)/grad(epsilon)
-    scalar gradKLimitK = 0.0;                      // grad(k) / grad(omega) / grad(epsilon) / grad(nuTilda)
+    // ONE ENTRY, ONE FIELD. The four turbulence slots below were two until 2026-11-03: gradKLimitK took
+    // whichever of grad(k), grad(omega), grad(epsilon), grad(nuTilda) came last, plus the gradient
+    // div(phi,omega)'s linearUpwind names, and gradKLULimitK served the linearUpwind of both scalars.
+    // The legacy closures read neither for CDkOmega or the laplacian correction, so a cellLimited
+    // grad(k)/grad(omega) changed nothing: on the coarse motorBike, cold and tight, brae's fields were
+    // bit-identical with and without it while OpenFOAM's omega moved 3.4e-02 (Arrhenius job 4860833).
+    scalar gradKLULimitK = 0.0;                    // the gradient div(phi,k|nuTilda)'s linearUpwind names
+    scalar gradEpsLULimitK = 0.0;                  // the gradient div(phi,epsilon|omega)'s linearUpwind names
+    scalar gradKLimitK = 0.0;                      // gradSchemes grad(k), grad(nuTilda) under SA; named-then-default
+    scalar gradEpsLimitK = 0.0;                    // gradSchemes grad(epsilon|omega); named-then-default
+    // Non-empty when grad(k) or grad(epsilon|omega) resolves to a scheme the legacy closures do not compute
+    // (leastSquares, cellMDLimited, faceLimited, ...). The legacy driver refuses on it where the gradient is
+    // taken; the OF-mirror closures resolve their own and compute leastSquares, so the parser only records it.
+    std::string gradTurbUncomputed;
     scalar gradHeLimitK = 0.0;                     // grad(h) / grad(e)
     // The cellLimited coefficient of the gradient the KINETIC term's linearUpwind uses. Separate from
     // gradHeLimitK because fvSchemes gives div(phi,K|Ekp) its own entry, which may name a different

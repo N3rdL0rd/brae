@@ -39,6 +39,12 @@ struct DeviceBoundary
     // consumer: without this the device arms clamped nothing there, and clamping everything would move
     // wall-function faces OpenFOAM leaves alone.
     DeviceBuffer<label>  assignableMask;
+    DeviceBuffer<label>  wallFunctionMask;  // 1 on an epsilon/omegaWallFunction face, whose value follows the wall cell it writes
+    // Foam::bound's boundary half (bound.C:59), the one state this descriptor stores. A face whose field solved below the
+    // floor and whose patch takes the assignment holds the floor until that field's next evaluate, where its cell holds
+    // the bounded average; every read through deviceBCValue returns it. Empty when no face holds one. See deviceBoundCap.
+    mutable DeviceBuffer<label> boundCapped;
+    mutable scalar boundCap = 0;
     DeviceBuffer<label>  ioMask;            // 1 if the face is inletOutlet (bcType recomputed from the flux sign)
     DeviceBuffer<label>  oioMask;           // 1 if the face is outletInlet (freestreamPressure): opposite flux switch
     // The STORED patch value of an inletOutlet / outletInlet face, and whether it is still what an evaluate
@@ -109,7 +115,7 @@ inline DeviceBoundary buildDeviceBoundary(
     // the closure fields only -- see DeviceBoundary::ioStored for the two measurements that bound it.
     bool storedIoSeed = false)
 {
-    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp, sg, asg, iofr;
+    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp, sg, asg, iofr, wfm;
     std::vector<scalar> ref, dc, ms, vf, p0, rg, iost;   // rg = fixedGradient normal gradient (0 elsewhere)
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
@@ -149,6 +155,7 @@ inline DeviceBoundary buildDeviceBoundary(
             iost.push_back((cat == 3 && i < (label)cur.size()) ? cur[i] : 0.0);
             iofr.push_back((cat == 3 && storedIoSeed && ioStoredEnabled()) ? 1 : 0);
             asg.push_back(f.boundary[pi]->assignable() ? 1 : 0);
+            wfm.push_back(f.boundary[pi]->isTurbulenceWallFunction() ? 1 : 0);
             io.push_back(cat == 3 ? 1 : 0);
             oio.push_back(cat == 4 ? 1 : 0);
             mx.push_back(cat == 5 ? 1 : 0);
@@ -169,6 +176,7 @@ inline DeviceBoundary buildDeviceBoundary(
     db.n = static_cast<int>(ty.size());
     db.bcType.copyFrom(ty);
     db.assignableMask.copyFrom(asg);
+    db.wallFunctionMask.copyFrom(wfm);
     db.ioMask.copyFrom(io);
     db.oioMask.copyFrom(oio);
     db.ioStored.copyFrom(iost);
@@ -195,6 +203,13 @@ inline DeviceBoundary buildDeviceBoundary(
 void deviceUpdateInletOutlet(DeviceBoundary& db, const DeviceBuffer<scalar>& phiBnd);
 void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value,
                    const int* skipIf = nullptr);   // skipIf: device flag, the launch is a no-op when set
+// A wall function writes cells (updateCoeffs) with no evaluate after it: a face that stores the last evaluate keeps it, a wall
+// function's own face reads the new cell. value holds the live evaluate on entry; stored is the evaluate before the write.
+void deviceBCKeepStored(const DeviceBoundary& db, const DeviceBuffer<scalar>& stored, DeviceBuffer<scalar>& value);
+// bound.C:59, vsf.boundaryFieldRef() = max(vsf.boundaryField(), lowerBound): bval is the patch values the solve's evaluate left,
+// and a face below the floor stays AT the floor until the field's next evaluate. deviceBoundCapClear is that evaluate.
+void deviceBoundCap(const DeviceBoundary& db, const DeviceBuffer<scalar>& bval, scalar floor);
+void deviceBoundCapClear(const DeviceBoundary& db);
 void deviceBCLaplacianCoeffs(const DeviceBoundary& db, const DeviceBuffer<scalar>& gammaCell,
                              DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC);
 // variant taking gamma per BOUNDARY FACE (for nuEff with the true wall nut, not the cell value).
@@ -255,6 +270,18 @@ void deviceUpdateMixedFreestream(DeviceVectorBoundary& dbU, DeviceBoundary& dbP,
 // cf's HbyA boundary value uses HbyA_cell in the (1-vf) part; at mixed faces replace hb[k] with the boundary value
 // of U itself (U_b = (1-vf) U_cell + vf U_freestream) so the boundary flux uses U_b, not HbyA_b. Non-mixed faces
 // untouched (pure fixedValue already = U_b; zeroGradient is not fixesValue).
+// U's patch values as OpenFOAM's fvc::grad(U) reads them at a momentum assembly, for a driver that keeps the
+// freestream faces' STORED value (UbStored, the last evaluate's) apart from the valueFraction the assembly has
+// just rebuilt: ub[k] arrives holding deviceBCValue's evaluation and leaves with the freestream velocity faces
+// (comp[0].mixedMask) replaced by UbStored[k]. Every other face is untouched.
+void deviceStoredFreestreamValues(const DeviceVectorBoundary& dbU,
+                                  const DeviceBuffer<scalar>* const* UbStored,
+                                  DeviceBuffer<scalar>* ub);
+// ...and p's: pb arrives holding deviceBCValue's evaluation and leaves with the freestream pressure faces
+// (dbP.mixedMask) replaced by pbStored -- what the last evaluate, and p.relax() after it, left there.
+void deviceStoredFreestreamValues(const DeviceBoundary& dbP,
+                                  const DeviceBuffer<scalar>& pbStored,
+                                  DeviceBuffer<scalar>& pb);
 void deviceConstrainMixedHbyA(const DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& Ux,
                               const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                               DeviceBuffer<scalar>& hbx, DeviceBuffer<scalar>& hby, DeviceBuffer<scalar>& hbz);

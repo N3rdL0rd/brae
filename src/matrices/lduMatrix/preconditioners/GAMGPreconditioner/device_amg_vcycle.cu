@@ -4,6 +4,7 @@
 // (ensureSpectrum/chebyshevSmooth/twoStageGSSmooth/gsSweep) + coarse solvers are called across TUs via the AMG
 // headers. Verbatim split of device_amg.cu -- no logic change. The PCG drivers (device_amg.cu) call vcycleAt/
 // vcycleAtF/amgCastFP32 (external linkage) via local decls there.
+#include <chrono>
 #include "device_amg.cuh"          // AMGData / AMGLevel / GridColoring / DeviceLduView / DeviceSolverPerf
 #include "device_amg_split.cuh"    // BRAE_AMG_PCG_SPLIT: a lap after every part of a cycle
 #include "device_amg_detail.cuh"   // constants (OMEGA/NPRE/NPOST/CHEB_*/SB_*/NCOARSE_CG) + env flags + nBlocks/TPB
@@ -744,6 +745,8 @@ void amgCouplePair(
         }
         cudaCheck(cudaGetLastError(), "pair on the coarsest grid");
         deviceCoarseLUFactor(amg.level.back().coarseView(), amg.coarseLU, amg.coarsePiv, p.dense.data());
+        deviceCoarseDirectPrepare(coarseSolveKind(), amg.level.back().coarseView(), p.dense.data(), amg.coarseLU, amg.coarsePiv,
+                                  amg.coarseDirect);
     }
     p.n = n;
     p.nSlots = nSlots;
@@ -852,6 +855,33 @@ bool amgSinglePrecisionCycle(const AMGData& amg)
     return useFP32() && !amg.gsSmooth && !useChebyshev() && !useTSGS();
 }
 
+// The double cycle's product on grid g: the row layout where the grid has one (amgGatherCsr64; on the finest grid
+// amgGatherFineCsr64's, when its rows are the caller's view's), amulKernel otherwise. The same sum in the same order.
+static inline void amgSpmvD(
+    AMGData& amg,
+    int g,
+    const DeviceLduView& Ag,
+    const DeviceBuffer<scalar>& x,
+    DeviceBuffer<scalar>& y)
+{
+    if (g == 0)
+    {
+        amgFineAmul(amg, Ag, x, y);
+        return;
+    }
+    // the coarse grids hold rows only when BRAE_AMG_CSR64_BELOW made them (amgGatherCsr64 sizes the lists to every grid); otherwise the
+    // lists hold the finest grid's alone, and a coarse grid's index is past them (job 4988466: the double cycle crashed there)
+    if (g < static_cast<int>(amg.csr64Val.size()) && amg.csr64Val[g].size() > 0)
+    {
+        y.resize(Ag.nCells);
+        amulCsrDK<<<nBlocks(Ag.nCells),TPB>>>(Ag.nCells, Ag.diag, amg.csr64Row[g].data(), amg.csr64Col[g].data(),
+                                              amg.csr64Val[g].data(), x.data(), y.data());
+        cudaCheck(cudaGetLastError(), "amulCsrD");
+        return;
+    }
+    deviceAmul(Ag, x, y);
+}
+
 // Recursive V-cycle at grid g: x_g <- M^-1 b_g (x_g overwritten). g==nLevels is the coarsest grid (an approximate
 // solve; single-block or fused-cluster when small); above it: pre-smooth, restrict the residual to g+1, recurse,
 // prolong the correction, post-smooth.
@@ -906,7 +936,7 @@ void vcycleAt(
         // test is against the grid size so a hierarchy whose coarsest changed, or a caller that never
         // ran a Galerkin update, falls through to the iterative solvers below). Exact for both the
         // symmetric and the asymmetric operator, so it precedes the CG/BiCGStab split.
-        if (amg.coarseLUn == n) deviceCoarseLUSolve(n, amg.coarseLU, amg.coarsePiv, bg, xg);
+        if (amg.coarseLUn == n) deviceCoarseDirectSolve(n, amg.coarseLU, amg.coarsePiv, amg.coarseDirect, bg, xg);
         else if (n <= SB_CG_MAX && asymmetric) deviceCoarseBiCGStab(Ag, bg, xg, ncoarseAsymCap);
         else if (n <= SB_CG_MAX) deviceCoarsePCG(Ag, bg, xg, ncoarseCG);            // tiny coarsest: single-block Jacobi-PCG (cheap+accurate)
         else if (n <= SB_MAX) deviceCoarseJacobiSingleBlock(Ag, bg, xg, NCOARSE);   // larger: single-block many-sweep Jacobi
@@ -930,12 +960,12 @@ void vcycleAt(
             smoothFromZeroT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), Ag.diag, xg.data());
             continue;
         }
-        deviceAmul(Ag, xg, amg.vAx[g]);
+        amgSpmvD(amg, g, Ag, xg, amg.vAx[g]);
         if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
     amgSplit::lap(g, amgSplit::smoothPre);
-    deviceAmul(Ag, xg, amg.vAx[g]);
+    amgSpmvD(amg, g, Ag, xg, amg.vAx[g]);
     if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
     residualT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), amg.vR[g].data());
     amgSplit::lap(g, amgSplit::residual);
@@ -990,7 +1020,7 @@ void vcycleAt(
     else if (amg.gsSmooth) for (int s = 0; s < nPostSweeps(); ++s) gsSweep(Ag, bg, xg, amg.coloring[g], false);  // backward GS (symmetric V-cycle)
     else for (int s = 0; s < nPostSweeps(); ++s)
     {
-        deviceAmul(Ag, xg, amg.vAx[g]);
+        amgSpmvD(amg, g, Ag, xg, amg.vAx[g]);
         if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
@@ -1041,7 +1071,17 @@ void vcycleAt(
 // launch. The structure is built once per hierarchy: agglomeration is static for the life of the mesh.
 //
 // BRAE_AMG_CSR=0 restores the face form everywhere; BRAE_AMG_CSR_BELOW moves the threshold.
+//
+// The values are gathered through the grid's own addressing (csrGatherFacesK), not through a stored list of
+// where each one comes from: that list was as large as the columns, 0.42 GiB on boxy5 at 4.94 M cells.
+// BRAE_AMG_CSR_SRC=1 keeps the list and the entry-by-entry gather (csrGatherValsK) -- the same bits.
 namespace {
+
+bool amgCsrStoredSrc()
+{
+    static const bool on = std::getenv("BRAE_AMG_CSR_SRC") && std::atoi(std::getenv("BRAE_AMG_CSR_SRC")) != 0;
+    return on;
+}
 
 int amgCsrOn()
 {
@@ -1089,29 +1129,30 @@ bool buildCsrForGrid(AMGData& amg, int g, const LduF& A)
     const std::vector<label> nei = pullLabels(A.nei, A.nInternalFaces);
     const std::vector<label> owner = pullLabels(A.owner, A.nInternalFaces);
 
+    const bool storeSrc = amgCsrStoredSrc();
     std::vector<label> row(A.nCells + 1, 0), col, src;
     col.reserve(2*A.nInternalFaces);
-    src.reserve(2*A.nInternalFaces);
+    if (storeSrc) src.reserve(2*A.nInternalFaces);
     for (int c = 0; c < A.nCells; ++c)
     {
         row[c] = static_cast<label>(col.size());
         for (label f = ownerStart[c]; f < ownerStart[c+1]; ++f)      // upper[f] * psi[nei[f]]
         {
             col.push_back(nei[f]);
-            src.push_back(f);
+            if (storeSrc) src.push_back(f);
         }
         for (label k = losortStart[c]; k < losortStart[c+1]; ++k)    // lower[f] * psi[owner[f]]
         {
             const label f = losort[k];
             col.push_back(owner[f]);
-            src.push_back(-f - 1);
+            if (storeSrc) src.push_back(-f - 1);
         }
     }
     row[A.nCells] = static_cast<label>(col.size());
 
     amg.csrRow[g].copyFrom(row);
     amg.csrCol[g].copyFrom(col);
-    amg.csrSrc[g].copyFrom(src);
+    if (storeSrc) amg.csrSrc[g].copyFrom(src);
     amg.csrVal[g].resize(col.size());
     return true;
 }
@@ -1119,7 +1160,8 @@ bool buildCsrForGrid(AMGData& amg, int g, const LduF& A)
 }   // namespace
 
 // Builds the CSR mirror for every grid that qualifies. Called once, from amgCastFP32, after the FP32
-// buffers exist; the agglomeration behind it is static for the life of the mesh.
+// diagonals and work vectors exist and before the face-form copies, which only a grid it leaves out
+// takes; the agglomeration behind it is static for the life of the mesh.
 void amgBuildCsrFP32(AMGData& amg, const DeviceLduView& A)
 {
     const int G = amg.nLevels();
@@ -1134,6 +1176,232 @@ void amgBuildCsrFP32(AMGData& amg, const DeviceLduView& A)
         buildCsrForGrid(amg, g, f);
     }
     amg.csrBuilt = true;
+}
+
+// THE DOUBLE CYCLE'S ROW LAYOUT (BRAE_AMG_CSR64_BELOW=<cells>, off by default, the experiment of 2026-10-30; the private multi-GPU
+// build sets it on every coarse grid). Off here by default because the coarse grids' values are gathered by amgGalerkin, outside the
+// captured cycle: tests/test_amg_one_off_diagonal.cu's control, a cycle kept across the switch to a lower of its own, could no longer
+// show the cycle reading the old lower (public suite on Arrhenius, job 4982403). On motorBike at 16 GH200s the grids under 50,000 cells a GPU are 5.6% of
+// the hierarchy's cells and 51% of the double V-cycle's time, 80% of each grid's in its two products: amulKernel's merge of two face
+// lists, three chained reads an entry, with few threads to hide the latency. The single-precision row layout is 1.6 to 2.5 times
+// faster there, where hardly any bytes move, so that gap is the layout's. On the FINEST grid (amgGatherFineCsr64 below) the rows
+// read 7% more bytes than amulKernel and still take 13.5% less time, 2.52 -> 3.10 TB/s on a GH200 (Nsight Compute, 2.9 M cells):
+// what binds there is the chain of reads, not the bytes; device_spmv.cu's FP-11 rejection measured BiCGStab solves, whose few
+// products a matrix do not pay for the gather.
+//
+// A row here is the cell's faces in increasing face index, amulKernel's order and OpenFOAM's face loop's, not the single-precision
+// layout's owner-then-neighbour: the same sum in the same order, so the same bits as the double cycle without the layout.
+// BRAE_CONTROL_AMG_CSR64_ORDER=1 is a gate's CONTROL, deliberately different: each row owner faces first, the same sum in another
+// order, so other bits. BRAE_CONTROL_AMG_CSR64_STALE=1 is another, deliberately wrong: the values gathered once and never again.
+static int amgCsr64Below()
+{
+    static const int n = []()
+    {
+        const char* e = std::getenv("BRAE_AMG_CSR64_BELOW");
+        return (e && std::atoi(e) > 0) ? std::atoi(e) : 0;
+    }();
+    return n;
+}
+
+// BRAE_AMG_FINE_CSR=0: the finest grid keeps amulKernel (the fallback); anything else, or unset, takes the rows
+static bool amgFineCsrOn()
+{
+    static const bool on = []()
+    {
+        const char* e = std::getenv("BRAE_AMG_FINE_CSR");
+        return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+
+static bool csr64OwnerFirst()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_AMG_CSR64_ORDER") != nullptr;
+    return on;
+}
+
+static bool csr64Stale()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_AMG_CSR64_STALE") != nullptr;
+    return on;
+}
+
+// one grid's rows in amulKernel's order (owner faces first under the ORDER control), and where each value comes from
+static void buildRows64(
+    const DeviceLduView& v,
+    DeviceBuffer<label>& rowD,
+    DeviceBuffer<label>& colD,
+    DeviceBuffer<label>& srcD,
+    DeviceBuffer<scalar>& valD)
+{
+    const bool ownerFirst = csr64OwnerFirst();
+    const std::vector<label> ownerStart = pullLabels(v.ownerStart, v.nCells + 1);
+    const std::vector<label> losortStart = pullLabels(v.losortStart, v.nCells + 1);
+    const std::vector<label> losort = pullLabels(v.losort, v.nInternalFaces);
+    const std::vector<label> nei = pullLabels(v.nei, v.nInternalFaces);
+    const std::vector<label> owner = pullLabels(v.owner, v.nInternalFaces);
+    std::vector<label> row(v.nCells + 1, 0), col, src;
+    col.reserve(2*v.nInternalFaces);
+    src.reserve(2*v.nInternalFaces);
+    for (int c = 0; c < v.nCells; ++c)
+    {
+        row[c] = static_cast<label>(col.size());
+        label f = ownerStart[c];
+        label k = losortStart[c];
+        // amulKernel's walk: the two ascending lists merged by face index
+        while (f < ownerStart[c+1] || k < losortStart[c+1])
+        {
+            const label fl = (k < losortStart[c+1]) ? losort[k] : 0x7fffffff;
+            if (f < ownerStart[c+1] && (ownerFirst || f < fl))
+            {
+                col.push_back(nei[f]);
+                src.push_back(f);
+                ++f;
+            }
+            else
+            {
+                col.push_back(owner[fl]);
+                src.push_back(-fl - 1);
+                ++k;
+            }
+        }
+    }
+    row[v.nCells] = static_cast<label>(col.size());
+    rowD.copyFrom(row);
+    colD.copyFrom(col);
+    srcD.copyFrom(src);
+    valD.resize(col.size());
+}
+
+void amgGatherCsr64(AMGData& amg)
+{
+    const int below = amgCsr64Below();
+    if (below == 0) return;
+    const int G = amg.nLevels();
+    const bool first = !amg.csr64Built;
+    if (first)
+    {
+        const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+        // index 0 is the finest grid's (amgGatherFineCsr64), kept as it is
+        amg.csr64Row.resize(G+1);
+        amg.csr64Col.resize(G+1);
+        amg.csr64Src.resize(G+1);
+        amg.csr64Val.resize(G+1);
+        int grids = 0;
+        std::size_t entries = 0;
+        for (int g = 1; g <= G; ++g)
+        {
+            const DeviceLduView v = amg.level[g-1].coarseView();
+            if (v.nCells >= below || v.nInternalFaces <= 0) continue;
+            buildRows64(v, amg.csr64Row[g], amg.csr64Col[g], amg.csr64Src[g], amg.csr64Val[g]);
+            ++grids;
+            entries += amg.csr64Val[g].size();
+        }
+        amg.csr64Built = true;
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+        std::printf("brae AMG: NOTICE: the double cycle's row layout on %d coarse grids under %d cells: %zu entries, built in %.4f s\n",
+                    grids, below, entries, seconds);
+    }
+    if (csr64Stale() && !first) return;
+    for (int g = 1; g <= G; ++g)
+    {
+        const int nnz = static_cast<int>(amg.csr64Val[g].size());
+        if (nnz == 0) continue;
+        const DeviceLduView v = amg.level[g-1].coarseView();
+        csr64GatherK<<<nBlocks(nnz),TPB>>>(nnz, amg.csr64Src[g].data(), v.upper, v.lower, amg.csr64Val[g].data());
+    }
+    cudaCheck(cudaGetLastError(), "csr64 gather");
+}
+
+// the finest grid's rows are this view's: made from its addressing, at its size, with no coupled faces
+static bool fineRowsAre(
+    const AMGData& amg,
+    const DeviceLduView& A)
+{
+    return amg.csr64FineKey != nullptr && amg.csr64FineKey == A.ownerStart && amg.csr64FineCells == A.nCells
+        && amg.csr64FineFaces == A.nInternalFaces && A.nCyc == 0 && A.nAmi == 0 && !amg.csr64Val.empty()
+        && amg.csr64Val[0].size() > 0;
+}
+
+bool amgPrepareFineCsr64(
+    AMGData& amg,
+    const DeviceLduView& A)
+{
+    // NO CAPTURED GRAPH IS DROPPED HERE: the graphs' own keys decide what replays (the one-off-diagonal and captured-cycle-view gates
+    // hold them), and a graph captured with the rows reads their blocks at every replay. So the rows' blocks never move once made: a
+    // view of the same size is made into them in place (DeviceBuffer::copyFrom keeps a block of the same size), a view of another
+    // size keeps amulKernel. Dropping the graphs here instead hid the one-off-diagonal gate's control and crashed interFoam's
+    // captured cycle, whose solves hold the cache across this call (public suite on Arrhenius, job 4977432)
+    if (!amgFineCsrOn() || A.nCyc > 0 || A.nAmi > 0 || A.nInternalFaces <= 0)
+    {
+        // a view the rows cannot serve: its products take amulKernel, and the rows stay as they are
+        amg.csr64FineKey = nullptr;
+        return false;
+    }
+    if (amg.csr64Row.empty())
+    {
+        amg.csr64Row.resize(1);
+        amg.csr64Col.resize(1);
+        amg.csr64Src.resize(1);
+        amg.csr64Val.resize(1);
+    }
+    const bool made = amg.csr64FineKey == A.ownerStart && amg.csr64FineCells == A.nCells && amg.csr64FineFaces == A.nInternalFaces;
+    if (!made)
+    {
+        if (amg.csr64Val[0].size() > 0 && (amg.csr64FineCells != A.nCells || amg.csr64FineFaces != A.nInternalFaces))
+        {
+            // rows of another size are held, and a graph captured with them may still replay for their view: this one keeps amulKernel
+            amg.csr64FineKey = nullptr;
+            return false;
+        }
+        const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+        buildRows64(A, amg.csr64Row[0], amg.csr64Col[0], amg.csr64Src[0], amg.csr64Val[0]);
+        amg.csr64FineKey = A.ownerStart;
+        amg.csr64FineCells = A.nCells;
+        amg.csr64FineFaces = A.nInternalFaces;
+        amg.csr64FineFilled = false;
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+        std::printf("brae AMG: NOTICE: the finest grid's row layout, %d cells, %zu entries, built in %.4f s (BRAE_AMG_FINE_CSR=0: amulKernel)\n",
+                    A.nCells, amg.csr64Val[0].size(), seconds);
+    }
+    return true;
+}
+
+void amgFillFineCsr64(
+    AMGData& amg,
+    const DeviceLduView& A)
+{
+    if (!fineRowsAre(amg, A)) return;
+    // TEST CONTROL BRAE_CONTROL_AMG_CSR64_STALE: the values filled once and never again (a capture then holds no fill at all)
+    if (csr64Stale() && amg.csr64FineFilled) return;
+    const int nnz = static_cast<int>(amg.csr64Val[0].size());
+    csr64GatherK<<<nBlocks(nnz),TPB>>>(nnz, amg.csr64Src[0].data(), A.upper, A.lower, amg.csr64Val[0].data());
+    cudaCheck(cudaGetLastError(), "fine csr64 fill");
+    amg.csr64FineFilled = true;
+}
+
+void amgGatherFineCsr64(
+    AMGData& amg,
+    const DeviceLduView& A)
+{
+    if (amgPrepareFineCsr64(amg, A)) amgFillFineCsr64(amg, A);
+}
+
+void amgFineAmul(
+    AMGData& amg,
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& x,
+    DeviceBuffer<scalar>& y)
+{
+    if (!fineRowsAre(amg, A))
+    {
+        deviceAmul(A, x, y);
+        return;
+    }
+    y.resize(A.nCells);
+    amulCsrDK<<<nBlocks(A.nCells),TPB>>>(A.nCells, A.diag, amg.csr64Row[0].data(), amg.csr64Col[0].data(), amg.csr64Val[0].data(),
+                                         x.data(), y.data());
+    cudaCheck(cudaGetLastError(), "fine amulCsrD");
 }
 
 // Cast the (current) FP64 fine + coarse matrices to their FP32 mirrors. Allocates the mirrors + FP32 work vectors once.
@@ -1155,12 +1423,22 @@ void amgCastFP32(
         {
             const DeviceLduView v = (g==0) ? A : amg.level[g-1].coarseView();
             amg.fDiag[g].resize(v.nCells);
-            amg.fUpper[g].resize(v.nInternalFaces);
-            amg.fLower[g].resize(v.nInternalFaces);
             amg.vAxF[g].resize(v.nCells);
             amg.vRF[g].resize(v.nCells);
             amg.vXF[g].resize(v.nCells);
             amg.vBF[g].resize(v.nCells);
+        }
+        // The row layout first, so that a grid's face-form copies are taken only where it has none: a CSR grid's
+        // off-diagonals are gathered into csrVal and its SpMV reads them there (amgSpmvF), so its fUpper/fLower
+        // would never be written or read. The lifetime audit (2026-10-17) found them idle: 0.42 GiB on boxy5 at
+        // 4.94 M cells, every grid in CSR.
+        if (amgCsrOn() && !amg.csrBuilt) amgBuildCsrFP32(amg, A);       // FP-12, once per hierarchy
+        for (int g=0; g<=G; ++g)
+        {
+            if (!amg.csrVal.empty() && amg.csrVal[g].size() > 0) continue;
+            const DeviceLduView v = (g==0) ? A : amg.level[g-1].coarseView();
+            amg.fUpper[g].resize(v.nInternalFaces);
+            amg.fLower[g].resize(v.nInternalFaces);
         }
         if (amg.saSmooth)
         {
@@ -1194,7 +1472,6 @@ void amgCastFP32(
         }
         amg.fp32Alloc = true;
     }
-    if (amgCsrOn() && !amg.csrBuilt) amgBuildCsrFP32(amg, A);       // FP-12, once per hierarchy
     // THE SAME MATRIX AGAIN (amgGalerkinStands): the copies of the last cast are this matrix's, grid for grid
     if (amg.fp32Stands)
     {
@@ -1211,10 +1488,16 @@ void amgCastFP32(
             // A CSR grid takes its off-diagonals through the row layout instead, in ONE launch where
             // the face form needs two -- the same values, gathered into the order the SpMV reads them.
             const int nnz = amgCsrOn() ? static_cast<int>(amg.csrVal[g].size()) : 0;
-            if (nnz > 0)
+            if (nnz > 0 && amg.csrSrc[g].size() > 0)
             {
                 csrGatherValsK<<<nBlocks(nnz),TPB>>>(nnz, amg.csrSrc[g].data(), v.upper, v.lower,
                                                      amg.csrVal[g].data());
+            }
+            else if (nnz > 0)
+            {
+                csrGatherFacesK<<<nBlocks(2*v.nInternalFaces),TPB>>>(v.nInternalFaces, amg.csrRow[g].data(), v.owner,
+                                                                     v.nei, v.ownerStart, v.losortStart, v.losort,
+                                                                     v.upper, v.lower, amg.csrVal[g].data());
             }
             else
             {
@@ -1290,7 +1573,7 @@ void vcycleAtF(
         // The asymmetric coarsest solve iterates to COARSE_REL_TOL and this is only its CAP.
         static const int ncoarseAsymCap = [](){ const char* e=std::getenv("BRAE_NCOARSE_CG"); return (e&&std::atoi(e)>0)?std::atoi(e):NCOARSE_ASYM_CAP; }();
         // Same coarsest split as the FP64 V-cycle: CG is not a solve on a nonsymmetric operator.
-        if (amg.coarseLUn == n) deviceCoarseLUSolve(n, amg.coarseLU, amg.coarsePiv, amg.vB[g], amg.vX[g]);
+        if (amg.coarseLUn == n) deviceCoarseDirectSolve(n, amg.coarseLU, amg.coarsePiv, amg.coarseDirect, amg.vB[g], amg.vX[g]);
         else if (n <= SB_CG_MAX && asymmetric) deviceCoarseBiCGStab(topoG, amg.vB[g], amg.vX[g], ncoarseAsymCap);
         else if (n <= SB_CG_MAX) deviceCoarsePCG(topoG, amg.vB[g], amg.vX[g], ncoarseCG);
         else

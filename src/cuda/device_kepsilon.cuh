@@ -38,6 +38,17 @@ struct ScalarSolveEntry
 void clearTurbulenceReport();
 const std::vector<ScalarSolveEntry>& turbulenceReport();
 
+// What the last iteration's own equation can sustain for omega or epsilon, for the divergence detector
+// (solvers/common/solution_health.cuh). 0: this closure sets none.
+struct SecondFieldLimit
+{
+    scalar limit = 0.0;
+};
+SecondFieldLimit& secondFieldLimit();
+scalar deviceFieldMax(const DeviceBuffer<scalar>& x);
+// The largest value on a face that holds its own: fixedValue and the wall functions. A zeroGradient face only repeats a cell.
+scalar deviceFixedFaceMax(const DeviceBoundary& db, const DeviceBuffer<scalar>& value);
+
 // Foam::bound's message, for the fields whose guard fired this iteration. A store of its own rather than
 // a field on ScalarSolveEntry: the OF-mirror closure reports its residuals through its own path and
 // never fills turbStore, so a report hung off that entry reached one driver and silently not the other.
@@ -81,11 +92,17 @@ const GradUMemo& deviceGradUShared(const DeviceMesh& dm, const DeviceVectorBound
                                    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                                    const DeviceBuffer<scalar>* const* UbStored = nullptr);
 
+// Hands the mesh's memo back to the pool until the next call re-takes and recomputes it: for a driver whose U
+// moves between the phases that read the memo, so that no hit is lost (the steady simpleFoam step, after its
+// turbulence phase).
+void deviceGradUSharedRelease(const DeviceMesh& dm);
+
 // gradU tensor (9*nC, OF convention column i = gaussGrad(U_i)) + GbyNu from a prebuilt gradU. Shared by k-eps
 // (GbyNu) and kOmegaSST (which also needs gradU for S2 = 2 magSqr(symm(gradU))).
 void deviceGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                  const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                 DeviceBuffer<scalar>& gradU, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr);
+                 DeviceBuffer<scalar>& gradU, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
+                 const DeviceBuffer<scalar>* const* UbStored = nullptr);
 void deviceGByNuFromGradU(const DeviceBuffer<scalar>& gradU, int nC, DeviceBuffer<scalar>& gByNu);
 // The same 9*nC tensor from OpenFOAM's least-squares fit: leastSquaresGrad.C's calcGrad on a vector
 // is lsGrad += ownLs*deltaVsf (an outer product), so column j is the SCALAR least-squares gradient of
@@ -100,7 +117,8 @@ void deviceLeastSquaresGradU(const DeviceMesh& dm, const DeviceVectorBoundary& d
 void deviceCellLimitGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                           const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                           DeviceBuffer<scalar>& gradU, scalar kc,
-                          const DeviceCyclic* cyc = nullptr, const DeviceAMI* ami = nullptr);
+                          const DeviceCyclic* cyc = nullptr, const DeviceAMI* ami = nullptr,
+                          const DeviceBuffer<scalar>* const* UbStored = nullptr);
 
 // nut = Cmu k^2 / eps.
 void deviceNut(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& eps, DeviceBuffer<scalar>& nut,
@@ -385,8 +403,55 @@ void deviceBoundaryNut(const DeviceBoundary& db, const DeviceBuffer<label>& isWa
                        const DeviceBuffer<scalar>* kBnd = nullptr,
                        const DeviceBuffer<scalar>* epsBnd = nullptr);
 
+// One transported scalar's stop rule, from that field's OWN fvSolution entry. OpenFOAM's lduMatrix::solver reads
+// tolerance, relTol, maxIter and minIter from the dictionary of the field it solves (lduMatrixSolver.C:193-207;
+// defaults 1e-6, 0, 1000 and 0), and kEpsilon.C:268/:288 and kOmegaSSTBase.C:593/:618 solve each equation of the
+// pair on its own. brae solved k and epsilon/omega under ONE tolerance and relTol, the tighter of the two entries,
+// and said nothing, and stopped every sweep in OpenFOAM's order at a literal 3000 whatever the entry's maxIter:
+// staged at k 1e-13 beside omega 1e-15 (motorBike, 14.1 M cells), k ran to that cap at every solve.
+struct ScalarStopRule
+{
+    scalar tol;
+    scalar relTol;
+    int maxIter;
+    int minIter;
+};
+// The cap every scalar transport solve took before each field's own maxIter was handed down, and minIter 0 beside
+// it. Still taken by the solves whose maxIter and minIter no driver hands down yet -- kOmegaSSTLM's ReThetat and
+// gammaInt, the energy, Maxwell's sigma, a scalarTransport object, the V2 driver's pair -- each a known gap:
+// OpenFOAM stops them at their own entry's maxIter, 1000 by default (lduMatrix.H:125).
+constexpr int kUnreadEntryMaxIter = 3000;
+
+// The cellLimited coefficients (0 = unlimited) of the gradients a two-equation closure takes of its own two scalars,
+// each from its OWN fvSchemes entry. OpenFOAM looks up four: gradSchemes `grad(k)` and `grad(epsilon|omega)`, which
+// kOmegaSST's CDkOmega (kOmegaSSTBase.C:557), the corrected laplacian (correctedSnGrad.C:52-55) and limitedLinear's
+// limiter (LimitedScheme.C:56) take, and the gradient each div entry's linearUpwind NAMES (linearUpwind.C). One
+// scalar used to carry all four, read as the linearUpwind one, so the other three ran unlimited whatever the case
+// said. -1 is UNSET and the closures refuse it: a caller resolves the case's entries or does not call.
+struct TurbScalarGradLimits
+{
+    scalar kField = -1.0;   // gradSchemes grad(k)
+    scalar eField = -1.0;   // gradSchemes grad(epsilon) or grad(omega)
+    scalar kLU    = -1.0;   // the gradient div(phi,k)'s linearUpwind names
+    scalar eLU    = -1.0;   // the gradient div(phi,epsilon|omega)'s linearUpwind names
+};
+
+// BRAE_CONTROL_TURB_GRAD_UNLIMITED, a gate's CONTROL and deliberately wrong: the closures take grad(k) and
+// grad(epsilon|omega) unlimited again, as before 2026-11-03. `cd` reverts CDkOmega alone, `eqn` the two
+// equations' laplacian correction and limitedLinear limiter alone, any other value both. Announced once.
+struct TurbGradControl
+{
+    bool cd  = false;
+    bool eqn = false;
+};
+TurbGradControl turbGradControl();
+
+// Refuses an unset TurbScalarGradLimits, naming the closure that was handed it.
+void requireTurbGradLimits(const TurbScalarGradLimits& g, const char* closure);
+
 // The full device kEpsilon::correct(): production -> wall functions/override -> eps eqn (with the wall
 // setValues constraint) -> k eqn -> correctNut. Updates k/eps/nut in place. Mirrors the CPU correct().
+// kStop and epsStop are k's and epsilon's own entries (ScalarStopRule).
 // div(phi,k)/div(phi,epsilon) scheme: upwind by default; limitedLinear when limitedK/limitedEps set (twoByk* =
 // 2/max(k_,SMALL) from the scheme coefficient). limitedLinear reduces to upwind at limiter=0 (bit-identical off).
 void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, const DeviceBoundary& dbEps,
@@ -394,10 +459,11 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                            const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                            DeviceBuffer<scalar>& k, DeviceBuffer<scalar>& eps, DeviceBuffer<scalar>& nut,
                            const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
-                           scalar nu, scalar relaxEps, scalar relaxK, scalar tol, bool bounded = false,
+                           scalar nu, scalar relaxEps, scalar relaxK, const ScalarStopRule& kStop,
+                           const ScalarStopRule& epsStop, bool bounded = false,
                            bool boundedEps = false,   // div(phi,epsilon) `bounded` (bounded = div(phi,k)'s)
                            bool limitedK = false, bool limitedEps = false, scalar twoBykK = 2.0, scalar twoBykEps = 2.0,
-                           const KEpsilonCoeffs& co = {}, scalar relTolKE = 0.0, int keCheckEvery = 1,
+                           const KEpsilonCoeffs& co = {}, int keCheckEvery = 1,
                            bool linearUpwindK = false, bool linearUpwindEps = false, bool nonOrth = false,
                            bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                            int nutWall = 0,   // 0=nutk 1=nutUSpalding 2=nutUBlended: near-wall G0 uses the BC-chosen nutw
@@ -409,9 +475,9 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             const DeviceBuffer<scalar>* nuWallFace = nullptr,  // compressible: nu = mu_b/rho_b per wall face
                             const DeviceBuffer<scalar>* nutBnd = nullptr,      // nut at boundary faces -> patch diffusivity
                             const DeviceBuffer<scalar>* muBnd = nullptr,       // compressible: mu at boundary faces
-                            // OF `grad(k)`/`grad(epsilon)` cellLimited coefficient (0 = unlimited); see the
-                            // kOmegaSST declaration below for why this is distinct from gradULimitK.
-                            scalar gradScalarLimitK = 0.0,
+                            // The case's grad(k)/grad(epsilon) and linearUpwind gradient limits, each its
+                            // own entry; see TurbScalarGradLimits. Distinct from gradULimitK below.
+                            const TurbScalarGradLimits& gradLim = TurbScalarGradLimits{},
                             // OF `grad(U)` cellLimited coefficient. kEpsilon::correct() builds its
                             // production from fvc::grad(U), which resolves that entry; leaving it
                             // unlimited makes the production term too large wherever the limiter bites.
@@ -440,15 +506,17 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
 // limiter). y = precomputed cell wall distance (cellWallDist). All blocks reuse the C1-6 validated kernels +
 // the shared deviceSolveScalarTransport scaffold. Updates k/omega/nut in place. Mirrors kOmegaSSTBase::correct().
+// kStop and omegaStop are k's and omega's own entries (ScalarStopRule).
 void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, const DeviceBoundary& dbOmega,
                             const DeviceBoundary& dbK, const DeviceVectorBoundary& dbU,
                             const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                             DeviceBuffer<scalar>& k, DeviceBuffer<scalar>& omega, DeviceBuffer<scalar>& nut,
                             const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
-                            scalar nu, scalar relaxOmega, scalar relaxK, scalar tol, bool bounded = false,
+                            scalar nu, scalar relaxOmega, scalar relaxK, const ScalarStopRule& kStop,
+                            const ScalarStopRule& omegaStop, bool bounded = false,
                             bool boundedEps = false,   // div(phi,omega) `bounded` (bounded = div(phi,k)'s)
                             bool limitedK = false, bool limitedOmega = false, scalar twoBykK = 2.0, scalar twoBykOmega = 2.0,
-                            const KOmegaSSTCoeffs& co = {}, scalar relTolKE = 0.0, int keCheckEvery = 1,
+                            const KOmegaSSTCoeffs& co = {}, int keCheckEvery = 1,
                             bool linearUpwindK = false, bool linearUpwindOmega = false, bool nonOrth = false, scalar gradULimitK = 0.0,
                             bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                             const scalar* gammaIntEff = nullptr,   // kOmegaSSTLM transition: scales k Pk/epsilonByk
@@ -466,11 +534,10 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const DeviceBuffer<scalar>* rhoBnd = nullptr,   // compressible: rho at boundary faces (volumetric flux for divU)
                             const DeviceBuffer<scalar>* nutBnd = nullptr,   // nut at boundary faces -> patch diffusivity
                             const DeviceBuffer<scalar>* muBnd = nullptr,   // compressible: mu at boundary faces
-                            // OF `grad(k)`/`grad(omega)` cellLimited coefficient (0 = unlimited). Distinct from
-                            // gradULimitK above, which limits grad(U) for the production term; this one limits the
-                            // TRANSPORTED scalar's own gradient, which feeds its limitedLinear weight, its
-                            // linearUpwind correction and the non-orth laplacian correction.
-                            scalar gradScalarLimitK = 0.0,
+                            // The case's grad(k)/grad(omega) and linearUpwind gradient limits, each its own
+                            // entry; see TurbScalarGradLimits. Distinct from gradULimitK above, which limits
+                            // grad(U) for the production term.
+                            const TurbScalarGradLimits& gradLim = TurbScalarGradLimits{},
                             // fvOptions scalarFixedValueConstraint on k / epsilon (OF eqn.setValues).
                             // Applied BEFORE the eps wall function, per kEpsilon.C:266-267.
                             const DeviceBuffer<label>*  fvoKMask = nullptr,
@@ -515,13 +582,13 @@ void deviceKOmegaSSTLMCorrect(const DeviceMesh& dm, const DeviceVectorBoundary& 
 // Spalart-Allmaras (one-equation): solve the nuTilda transport (div - laplacian(DnuTildaEff) + Sp(destruction) ==
 // production + Cb2 grad^2) via the shared scaffold, then nut = nuTilda*fv1. Mirrors SpalartAllmarasBase::correct()
 // (incompressible, steady, ft2 off). dbNuTilda = the nuTilda boundary (freestream + fixedValue-0 wall). y = cell
-// wall distance. nuTilda/nut updated in place.
+// wall distance. nuTilda/nut updated in place. stop is nuTilda's own entry (ScalarStopRule).
 void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBoundary& dbU, const DeviceBoundary& dbNuTilda,
                                   const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                                   DeviceBuffer<scalar>& nuTilda, DeviceBuffer<scalar>& nut, const DeviceBuffer<scalar>& y,
                                   const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
-                                  scalar nu, scalar relax, scalar tol, bool bounded = false, bool limited = false,
-                                  scalar twoByk = 2.0, const SpalartAllmarasCoeffs& co = {}, scalar relTol = 0.0, int checkEvery = 1,
+                                  scalar nu, scalar relax, const ScalarStopRule& stop, bool bounded = false, bool limited = false,
+                                  scalar twoByk = 2.0, const SpalartAllmarasCoeffs& co = {}, int checkEvery = 1,
                                   bool linearUpwind = false, bool nonOrth = false,
                                   bool gsK = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                                   const ScalarDdt& ntDdt = {},   // transient fvm::ddt(nuTilda)
@@ -548,7 +615,19 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   // (ascending then descending), false = GaussSeidel, whose sweep loop in
                                   // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
                                   // so the same relTol stops in a different place.
-                                  bool gsSymmetric = true);
+                                  bool gsSymmetric = true,
+                                  // The case's grad(nuTilda) limiters (cellLimited coefficients, 0 = unlimited):
+                                  // the one linearUpwind's div entry names, and gradSchemes `grad(nuTilda)` for
+                                  // the non-orthogonal laplacian correction and limitedLinear's limiter
+                                  // (deviceSolveScalarTransport's gradLimitK and fieldGradLimitK). Every caller
+                                  // ran both unlimited before.
+                                  scalar gradNuTildaLULimitK = 0.0,
+                                  scalar gradNuTildaLapLimitK = 0.0,
+                                  // true hands the shared grad(U) memo (deviceGradUShared) back to the pool as soon
+                                  // as the model has its tensor. Only for a driver whose next reader of the memo is
+                                  // a new U anyway: legacy simpleFoam's step(), which drops it after turbulence.
+                                  // pimpleFoam's step and V2 keep it, and with it their next sites' hits.
+                                  bool releaseGradUMemo = false);
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);

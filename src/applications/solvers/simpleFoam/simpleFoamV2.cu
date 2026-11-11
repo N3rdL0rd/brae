@@ -38,6 +38,7 @@
 #include "mrf_read.cuh"          // readCellZones
 #include "fv_options.cuh"        // readFvOptions -> RotorDiskParams
 #include "rotor_disk.cuh"
+#include "memory_probe.cuh"   // BRAE_MEMORY_PROBE: memory at fixed iterations, host_smoother_memory's reading
 #include "fvOptions_cpp.cuh"       // the fvOptions framework + explicitPorositySource    // readKOmegaSSTCoeffs (RAS.kOmegaSSTCoeffs, OF defaults when absent)
 #include "cell_wall_dist.cuh"       // cellWallDist: kOmegaSST's F1/F2 need y at every CELL, not just walls
 #include "near_wall_dist.cuh"
@@ -594,7 +595,7 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         if (simType == "RAS")
         {
             const FoamDict* ras = turbProps.subDict("RAS");
-            const std::string model = ras ? ras->wordOr("RASModel", "") : "";
+            const std::string model = turbulenceModelWord(ras, "RASModel");
             if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE"
                 && model != "SpalartAllmaras" && model != "kOmegaSSTLM")
                 r.blockers.push_back("RASModel is `" + model + "`; the rebuilt path wires kEpsilon, "
@@ -612,7 +613,7 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         if (simType == "RAS")
         {
             const FoamDict* ras = turbProps.subDict("RAS");
-            const std::string model = ras ? ras->wordOr("RASModel", "") : "";
+            const std::string model = turbulenceModelWord(ras, "RASModel");
             // SpalartAllmaras transports nuTilda and names no k or epsilon entry at all.
             std::vector<std::string> keys;
             if (model == "SpalartAllmaras")
@@ -1021,6 +1022,34 @@ int runSimpleFoamV2(const std::string& caseDir)
     // brae computes.
     scalar gradUSchemeLimit = 0.0;
     gradUSchemeUnsupported(caseDir, &gradUSchemeLimit);
+    const scalar gradUCaseLimit = gradUSchemeLimit;
+    scalar gradUDivDevLimit = gradUSchemeLimit;
+    // BRAE_CONTROL_GRADU_LIMIT_IGNORED, closure_gradlimit_vs_openfoam's CONTROL and deliberately wrong: the
+    // case's grad(U) limiter dropped again, as this driver ran before 2026-09-04 -- `1` at every site,
+    // `closure` in the closures only (strain, production, the start-up correctNut, the SST's calculated nut
+    // boundary), `divdev` in divDevReff's dev2 term only. The setup line still prints the case's
+    // coefficient, as the defect did.
+    if (const char* c = std::getenv("BRAE_CONTROL_GRADU_LIMIT_IGNORED"))
+    {
+        const std::string which(c);
+        if (which != "1" && which != "closure" && which != "divdev")
+        {
+            throw std::runtime_error("brae: BRAE_CONTROL_GRADU_LIMIT_IGNORED=" + which
+                                     + " is none of 1, closure, divdev.");
+        }
+        if (which != "divdev")
+        {
+            gradUSchemeLimit = 0.0;
+        }
+        if (which != "closure")
+        {
+            gradUDivDevLimit = 0.0;
+        }
+        std::printf("brae CONTROL: BRAE_CONTROL_GRADU_LIMIT_IGNORED=%s, the case's grad(U) limiter dropped in %s\n",
+                    which.c_str(),
+                    which == "1" ? "divDevReff and the closures" : (which == "closure" ? "the closures"
+                                                                                       : "divDevReff"));
+    }
     // The TRANSPORTED scalars' own `grad(<var>)` entries, which feed their limitedLinear weight, their
     // linearUpwind correction and the non-orthogonal laplacian correction. brae carries ONE coefficient
     // for the pair, so a case that limits them differently is refused by name rather than run with
@@ -1245,14 +1274,14 @@ int runSimpleFoamV2(const std::string& caseDir)
                             "validate() built from them. This is NOT simulationType laminar.\n",
                             sw.c_str());
         }
-        lmModel  = rasDict && rasDict->wordOr("RASModel", "") == "kOmegaSSTLM";
+        lmModel  = turbulenceModelWord(rasDict, "RASModel") == "kOmegaSSTLM";
         // The LM model IS kOmegaSST plus the transition transport, so every kOmegaSST path below is
         // taken as well -- the two flags are deliberately not exclusive.
-        sstModel = lmModel || (rasDict && rasDict->wordOr("RASModel", "") == "kOmegaSST");
+        sstModel = lmModel || (turbulenceModelWord(rasDict, "RASModel") == "kOmegaSST");
         // realizableKE rides the SAME fused device kEpsilon through KEpsilonCoeffs::realizable: variable
         // Cmu, the strain-based epsilon production and the C2*eps^2/(k + sqrt(nu*eps)) destruction are
         // all selected by that flag, so this is a coefficient change and not a second model path.
-        if (rasDict && rasDict->wordOr("RASModel", "") == "realizableKE")
+        if (turbulenceModelWord(rasDict, "RASModel") == "realizableKE")
         {
             keCoeffs.realizable = true;
             RealizableKECoeffs rc;
@@ -1269,7 +1298,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             // the legacy driver and rhoSimpleFoam use (turbulence_setup.cuh).
             readKEpsilonCoeffsDict(rasDict, keCoeffs);
         }
-        saModel = rasDict && rasDict->wordOr("RASModel", "") == "SpalartAllmaras";
+        saModel = turbulenceModelWord(rasDict, "RASModel") == "SpalartAllmaras";
         if (saModel) cpu::SA::readCoeffs(rasDict, saCoeffs);
 
         // SpalartAllmaras has no k and no epsilon: nuTilda is the whole model, and it rides the k slot
@@ -1367,13 +1396,21 @@ int runSimpleFoamV2(const std::string& caseDir)
                         "gammaIntEff seeded at 0 as OpenFOAM constructs it\n");
         }
 
+        // k's and epsilon|omega's inletOutlet faces hold their STORED values until the loop's first flux switch
+        // (DeviceBoundary::ioStored, the closures' seed): validate()'s correctNut below and the nuEff seed after it
+        // read them, and OpenFOAM's correctNut reads the patch values as read, nothing having evaluated them.
+        // Built without the seed, an outlet's k and epsilon stood at their inletValue there, which a start from
+        // rest cannot see (the field is the inletValue) and a restart can: windAroundBuildingsBox one iteration
+        // from OpenFOAM's t=400 (JUPITER job 2669843) held U's matrix to 1e-16 of OpenFOAM's and its source 3.0e-01
+        // off in z, on the outlet's 200 cells alone, then U 7.6e-05 and p 2.9e-03 where the legacy driver is
+        // 2.6e-16 and 1.9e-12. BRAE_IO_STORED=0 restores the inletValue seed: the gate's control.
         dK.copyFrom(kF.internal); dNut.copyFrom(nutF.internal);
-        dbK   = buildDeviceBoundary(kF,   fvp, g);
+        dbK   = buildDeviceBoundary(kF,   fvp, g, /*storedIoSeed=*/true);
         dbNut = buildDeviceBoundary(nutF, fvp, g);
         if (!saModel)
         {
             dEps.copyFrom(epsF.internal);
-            dbEps = buildDeviceBoundary(epsF, fvp, g);
+            dbEps = buildDeviceBoundary(epsF, fvp, g, /*storedIoSeed=*/true);
         }
 
         // OF fills nut by FIELD ASSIGNMENT (nut_ = Cmu*sqr(k_)/epsilon_), which writes the BOUNDARY from
@@ -1400,7 +1437,12 @@ int runSimpleFoamV2(const std::string& caseDir)
                 }
             }
             if (hasNutCalc) nutCalcMask.copyFrom(cm);
-            keNut = hasNutCalc && !sstModel && !keCoeffs.realizable;
+            // ...and kEpsilon is the only model it is, so NOT Spalart-Allmaras either: SA's nut is nuTilda*fv1,
+            // assigned on every face below, and an SA case has no epsilon boundary to evaluate. With a
+            // `calculated` nut patch -- the boxy5 UAV's inlet_front -- this
+            // asked dbEps (no faces) for its values and the zero-block launch stopped the run: `bcValue: invalid
+            // configuration argument`. airFoil2D's far-field nut is `freestream`, so no SA gate ever got here.
+            keNut = hasNutCalc && !sstModel && !keCoeffs.realizable && !saModel;
         }
 
         // Wall geometry for the wall functions. wallU is the patch velocity; a static mesh with no
@@ -1664,6 +1706,20 @@ int runSimpleFoamV2(const std::string& caseDir)
             // outer iteration while the case asks for 1e-05 / relTol 0.1 / symGaussSeidel. Measured: the
             // turbulence hook was 168 ms of a ~300 ms outer iteration on 440k cells -- 56% of the run --
             // and almost none of that was the nuEff host copy (6 ms); it was over-solving these two.
+            //
+            // ONE rule for both fields of the pair, from k's entry alone (the reader below reads no other), at
+            // the old cap: a known gap of this driver (kUnreadEntryMaxIter). The legacy driver takes each
+            // field's own entry.
+            const ScalarStopRule v2PairStop{tolKE, relTolKE, kUnreadEntryMaxIter, 0};
+            // This driver resolves ONE coefficient for grad(k) and grad(epsilon|omega) and refuses a case that limits
+            // them differently (above), so the two field slots are exact. Its linearUpwind takes the same one, as it
+            // did before the closures split the slots: whether that matches the gradient the div entries name is
+            // this driver's own question, not answered here.
+            TurbScalarGradLimits v2GradLim;
+            v2GradLim.kField = gradScalarSchemeLimit;
+            v2GradLim.eField = gradScalarSchemeLimit;
+            v2GradLim.kLU    = gradScalarSchemeLimit;
+            v2GradLim.eLU    = gradScalarSchemeLimit;
             if (saModel)
             {
                 // SpalartAllmarasBase::correct(): chi/fv1/fv2/ft2 -> Stilda -> the nuTilda transport
@@ -1681,9 +1737,9 @@ int runSimpleFoamV2(const std::string& caseDir)
                 dsa.E        = saCoeffs.E;
                 deviceSpalartAllmarasCorrect(dm, dbU, dbK, gf.Ux, gf.Uy, gf.Uz,
                                              dK, dNut, dY, gf.phiInt, gf.phiBnd,
-                                             nu, relaxK, tolKE,
+                                             nu, relaxK, v2PairStop,
                                              boundedK, limitedK, twoBykK,
-                                             dsa, relTolKE, /*checkEvery*/1,
+                                             dsa, /*checkEvery*/1,
                                              // SpalartAllmaras's own laplacian takes the case's scheme
                                              // too. validation/airFoil2D names
                                              // `div(phi,nuTilda) bounded Gauss linearUpwind grad(nuTilda)`
@@ -1707,10 +1763,10 @@ int runSimpleFoamV2(const std::string& caseDir)
                 // omega-wall setValues) -> bound -> k eqn -> bound -> correctNut (Bradshaw limiter).
                 deviceKOmegaSSTCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
                                        dK, dEps, dNut, dY, gf.phiInt, gf.phiBnd,
-                                       nu, relaxEps, relaxK, tolKE,
+                                       nu, relaxEps, relaxK, v2PairStop, v2PairStop,
                                        boundedK, boundedEps,
                                        limitedK, limitedEps, twoBykK, twoBykEps,
-                                       sstCoeffs, relTolKE, /*keCheckEvery*/1,
+                                       sstCoeffs, /*keCheckEvery*/1,
                                        // The case's OWN turbulence div and laplacian schemes. These were
                                        // hardcoded off while the setup line above printed what the case
                                        // asked for -- so a case naming `linearUpwind` or `corrected` got
@@ -1737,7 +1793,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                        &nb,
                                        /*muBnd*/nullptr,
                                        // `grad(k)`/`grad(omega)`, the transported scalars' own entries.
-                                       gradScalarSchemeLimit,
+                                       v2GradLim,
                                        /*fvoKMask*/nullptr, /*fvoKVal*/nullptr,
                                        /*fvoEMask*/nullptr, /*fvoEVal*/nullptr,
                                        /*lesDelta*/nullptr,
@@ -1758,10 +1814,10 @@ int runSimpleFoamV2(const std::string& caseDir)
             else
             deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
                                   dK, dEps, dNut, gf.phiInt, gf.phiBnd,
-                                  nu, relaxEps, relaxK, tolKE,
+                                  nu, relaxEps, relaxK, v2PairStop, v2PairStop,
                                   boundedK, boundedEps,
                                   limitedK, limitedEps, twoBykK, twoBykEps,
-                                  keCoeffs, relTolKE, /*keCheckEvery*/1,
+                                  keCoeffs, /*keCheckEvery*/1,
                                   // The case's OWN turbulence div and laplacian schemes. These were three
                                   // hardcoded `false`s while the SST call forty lines above forwarded the
                                   // very same variables, and while the driver printed what the case asked
@@ -1782,7 +1838,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                   // DkEff(patchi)/DepsilonEff(patchi) from nut's OWN boundary.
                                   &nb,
                                   /*muBnd*/nullptr,
-                                  gradScalarSchemeLimit,
+                                  v2GradLim,
                                   // kEpsilon::correct builds GbyNu from fvc::grad(U) (kEpsilon.C:237),
                                   // which resolves the case's `grad(U)` entry. These three arguments
                                   // used to fall through to their defaults, so the limiter never
@@ -2100,10 +2156,10 @@ int runSimpleFoamV2(const std::string& caseDir)
     // printed on its own line because the two can differ (validation/rotorDisk) and because the single
     // line this replaced named the SCHEME while carrying linearUpwind's value -- the display string
     // asserting a capability the code did not have.
-    in.gradUSchemeLimitK = gradUSchemeLimit;
-    if (gradUSchemeLimit > 0.0)
+    in.gradUSchemeLimitK = gradUDivDevLimit;
+    if (gradUCaseLimit > 0.0)
         std::printf("  gradSchemes grad(U): cellLimited Gauss linear %g "
-                    "(fvc::grad(U): divDevReff + the closures)\n", gradUSchemeLimit);
+                    "(fvc::grad(U): divDevReff + the closures)\n", gradUCaseLimit);
 
     std::printf("  U solver: %s\n",
                 // "as the case asks" was the display string this line used to carry, and it was the
@@ -2261,11 +2317,80 @@ int runSimpleFoamV2(const std::string& caseDir)
     turbPrecon() = (diluKE && dilu.valid) ? &dilu : nullptr;
     turbPolyDeg() = (diluKE && dilu.valid) ? 1 : polyDegKE;     // same reason: write it either way
 
+    // ---- the freestream family's stored values (StepInput::fsUbGrad and the hooks) -------------------
+    // U's and p's patch values as read -- OpenFOAM's mixed constructor keeps the file's `value`
+    // (freestreamVelocityFvPatchVectorField.C:55-58) and so does the host field -- then kept where OpenFOAM
+    // evaluates them. Only with a freestream patch (a wedge's category 5 is geometry, not one), and not under
+    // the control BRAE_CONTROL_FREESTREAM_REEVALUATE=1, which re-derives Up from the cells once an iteration as
+    // this driver did before. The default driver's arrangement (device_simple_foam.cu, UbStored_).
+    bool hasFreestream = false;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if ((f.U.boundary[pi]->bcCategory() == 5 && !f.U.boundary[pi]->wedgeFaceT())
+         || f.p.boundary[pi]->bcCategory() == 5)
+        {
+            hasFreestream = true;
+        }
+    }
+    const bool fsStored = hasFreestream && std::getenv("BRAE_CONTROL_FREESTREAM_REEVALUATE") == nullptr;
+    DeviceBuffer<scalar> fsUb[3];
+    DeviceBuffer<scalar> fsUbGrad[3];
+    const DeviceBuffer<scalar>* fsUbGradP[3] = {&fsUbGrad[0], &fsUbGrad[1], &fsUbGrad[2]};
+    DeviceBuffer<scalar> fsPb;
+    if (fsStored)
+    {
+        std::vector<scalar> ub[3], pb;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            const std::vector<vector>& v = f.U.boundary[pi]->value();
+            const std::vector<scalar>& w = f.p.boundary[pi]->value();
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                // an `empty` patch holds no values; its faces are never in the freestream mask
+                const std::size_t j = static_cast<std::size_t>(i);
+                const vector u = j < v.size() ? v[j] : vector{0, 0, 0};
+                ub[0].push_back(u.x);
+                ub[1].push_back(u.y);
+                ub[2].push_back(u.z);
+                pb.push_back(j < w.size() ? w[j] : scalar(0));
+            }
+        }
+        if (static_cast<int>(ub[0].size()) != dbU.comp[0].n || static_cast<int>(pb.size()) != dbP.n)
+            throw std::runtime_error("brae simpleFoam v2: U's and p's stored patch values do not span the device boundary");
+        for (int k = 0; k < 3; ++k) fsUb[k].copyFrom(ub[k]);
+        fsPb.copyFrom(pb);
+        in.fsUbGrad = fsUbGradP;
+        in.fsPbStored = &fsPb;
+        in.fsAfterMomentum = [&]()
+        {
+            deviceBCValue(dbU.comp[0], gf.Ux, fsUb[0]);
+            deviceBCValue(dbU.comp[1], gf.Uy, fsUb[1]);
+            deviceBCValue(dbU.comp[2], gf.Uz, fsUb[2]);
+        };
+        in.fsBeforePressureLoop = [&]()
+        {
+            deviceUpdateMixedFreestream(dbU, dbP, gf.phiBnd, gf.Ux, gf.Uy, gf.Uz, nullptr, /*which=*/2,
+                                        &fsUb[0], &fsUb[1], &fsUb[2]);
+        };
+        in.fsAfterCorrection = [&]()
+        {
+            deviceUpdateMixedFreestream(dbU, dbP, gf.phiBnd, gf.Ux, gf.Uy, gf.Uz, nullptr, /*which=*/1,
+                                        &fsUb[0], &fsUb[1], &fsUb[2]);
+            deviceBCValue(dbU.comp[0], gf.Ux, fsUb[0]);
+            deviceBCValue(dbU.comp[1], gf.Uy, fsUb[1]);
+            deviceBCValue(dbU.comp[2], gf.Uz, fsUb[2]);
+        };
+    }
+
     // ---- the SIMPLE loop ---------------------------------------------------------------------
     SolverWorkspace ws;
     std::map<std::string, scalar> residuals;
     label iter = 0;
     scalar timeValue = startTimeVal;
+    // BRAE_MEMORY_PROBE: the memory the run holds at fixed iterations (solvers/common/memory_probe.cuh)
+    MemoryProbe memProbe;
+    memProbe.startUp();
     while (ctl.loop(iter + 1, nSteps, residuals))
     {
         ++iter;
@@ -2292,7 +2417,20 @@ int runSimpleFoamV2(const std::string& caseDir)
         // far-field face a half-and-half blend whether it is inflow or outflow; on airFoil2D, whose whole
         // far field is freestream, that and the mixed evaluate() blend were worth 372x -> 47x on the
         // momentum residual and 3551x -> 136x on pressure.
-        if (hasMixedBC)
+        // With the stored values: U's valueFraction only, from the stored Up (freestreamPressure's moves at the
+        // pressure assembly, fsBeforePressureLoop), and the momentum assembly's gradients read the stored value
+        // on the freestream faces (fsUbGrad).
+        if (fsStored)
+        {
+            deviceUpdateMixedFreestream(dbU, dbP, gf.phiBnd, gf.Ux, gf.Uy, gf.Uz, nullptr, /*which=*/1,
+                                        &fsUb[0], &fsUb[1], &fsUb[2]);
+            deviceBCValue(dbU.comp[0], gf.Ux, fsUbGrad[0]);
+            deviceBCValue(dbU.comp[1], gf.Uy, fsUbGrad[1]);
+            deviceBCValue(dbU.comp[2], gf.Uz, fsUbGrad[2]);
+            const DeviceBuffer<scalar>* stored[3] = {&fsUb[0], &fsUb[1], &fsUb[2]};
+            deviceStoredFreestreamValues(dbU, stored, fsUbGrad);
+        }
+        else if (hasMixedBC)
             deviceUpdateMixedFreestream(dbU, dbP, gf.phiBnd, gf.Ux, gf.Uy, gf.Uz, nullptr);
 
         residuals = simpleStep(gf, ws, dm, dbU, dbP, in);
@@ -2333,7 +2471,9 @@ int runSimpleFoamV2(const std::string& caseDir)
             wc.recordWritten(caseDir, tname);
             lastWritten = tname;
         }
+        memProbe.iteration(iter);
     }
+    memProbe.loopEnd(iter);
     if (ctl.converged())
     {
         std::printf("SIMPLE solution converged in %d iterations\n", static_cast<int>(iter));
@@ -2361,6 +2501,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                     g_hookSeconds,    iter ? 1e3 * g_hookSeconds    / (double)iter : 0.0,
                     g_refreshSeconds, iter ? 1e3 * g_refreshSeconds / (double)iter : 0.0,
                     static_cast<int>(iter));
+    memProbe.end(iter);
 
     // ---- write -------------------------------------------------------------------------------
     return static_cast<int>(iter);

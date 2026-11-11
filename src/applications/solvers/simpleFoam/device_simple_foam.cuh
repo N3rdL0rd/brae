@@ -11,6 +11,7 @@
 // nuEff at boundary faces = the adjacent-cell value (this path's convention, consistent with its laplacian
 // boundary). The fully-faithful boundary-nut (nutkWallFunction) treatment lives in the host simple_foam.cuh.
 #include "cf_types.cuh"
+#include "solution_health.cuh"
 #include "function1.cuh"
 #include "foam_field_reader.cuh"   // FieldData/PatchFieldData: the parsed p0 Function1
 #include "primitive_mesh.cuh"
@@ -46,6 +47,7 @@
 #include "device_divdevreff.cuh"
 #include "device_ddt.cuh"          // transient fvm::ddt(U) for the PIMPLE path (no-op in steady SIMPLE)
 #include "device_amg.cuh"
+#include "device_colour_gauss_seidel.cuh"   // the colour rule's sweep (DeviceCellColouring)
 #include "fv_options.cuh"
 #include "device_fvoptions.cuh"
 #include "solver_controls.cuh"
@@ -93,6 +95,15 @@ public:
     // motorBike AND pitzDaily, i.e. fully laminar; harmless on attached flows but the seed of divergence on high-Re
     // skewed meshes. kMin_/epsilonMin_/omegaMin_ default to SMALL (= 1e-15), matching the floors used in correct().
     void validateTurbulence();
+    // The names on the `Solving for U?` lines: what the momentum solve RUNS, from the conditions it branches
+    // on -- the colour rule, OpenFOAM's sweep, or BiCGStab (an interface mesh's, or a Krylov entry's, with
+    // the DILU it was handed when it was). The label said `Jacobi-BiCGStab` under an honoured DILU, and
+    // `smoothSolver[...]` on a cyclic mesh, where the sweep is not run.
+    std::string momentumSolverName() const;
+    bool colourTurbulence() const { return colourTurb_; }
+    // THE COLOUR RULE: whether U and the transported turbulence fields are swept in colour order on the GPU
+    // (colourU_, colourTurb_), the colouring they share, and the one true line per field (the .cu has why).
+    void decideColourRule(const PrimitiveMesh& m);
     // E7: re-run OF's validate() ONCE the thermo exists, which is where OF does it.
     //
     // OF constructs the thermo, THEN the turbulence model, THEN calls validate() -> correctNut(). brae
@@ -112,7 +123,9 @@ public:
     void revalidateAfterThermo(const std::vector<scalar>* rhoBndSeed = nullptr);
     // PIMPLE-foundation composable phase: turbulence transport (k/eps/omega/nuTilda -> nut). Uses only members,
     // so SIMPLE's step() and a future PIMPLE outer loop both call it (once per outer corrector) unchanged.
-    void correctTurbulence();
+    // releaseGradUMemo: the model may hand the shared grad(U) memo back once it has read it (Spalart-Allmaras); only
+    // step() asks, which drops the memo after turbulence anyway. pimpleStep and rhoSimpleStep keep it.
+    void correctTurbulence(bool releaseGradUMemo = false);
     // PIMPLE-foundation composable phase 1: the momentum predictor -- assemble div(phi,U) - laplacian(nuEff,U)
     // - fvc::div(nuEff dev2(grad U)^T) + fvOptions/MRF/limiters + body force, relax, and solve each U component
     // (BiCGStab/GaussSeidel). Fills Uk_ + the shared members mDiagR/mUp/mLo/iC/bCb/relaxSrc (the relaxed matrix
@@ -121,7 +134,11 @@ public:
     // PIMPLE-foundation composable phase: pressure-velocity coupling (SIMPLE/SIMPLEC corrector). Reads the
     // predictor outputs (member relaxed matrix + boundary coeffs + source), forms rAU/HbyA, solves the pressure
     // correction (with non-orth passes) and corrects U + the conservative face flux. res gets the p residuals.
-    void correctPressureVelocity(DeviceSimpleResidual& res);
+    // releaseMomentumMatrix: mUp/mLo and relaxSrc go back to the pool once HbyA's flux is taken (H() and SIMPLEC's row
+    // sum were their last readers). Only step() asks; pimpleStep's next pressure corrector re-reads them in H().
+    void correctPressureVelocity(
+        DeviceSimpleResidual& res,
+        bool releaseMomentumMatrix = false);
 
     DeviceSimpleResidual step();
 
@@ -371,6 +388,60 @@ public:
         if (dk_.size()) s += deviceSumMag(dk_);
         if (de_.size()) s += deviceSumMag(de_);
         return s;
+    }
+    // The reductions the divergence detector reads (solvers/common/solution_health.cuh), of every field the loop carries.
+    // One group of device reads per field, so one queue drain each, once an iteration.
+    std::vector<HealthField> healthFields() const
+    {
+        std::vector<HealthField> out;
+        const auto add = [&](const char* name, const DeviceBuffer<scalar>& x, bool boundedBelow)
+        {
+            if (x.size() == 0) return;
+            HealthField f;
+            f.name = name;
+            f.boundedBelow = boundedBelow;
+            DeviceBuffer<scalar> mmm(3);
+            deviceMinMaxMeanInto(x, mmm.data());
+            DeviceReadValue v[3];
+            v[0].dSrc = mmm.data();     v[0].hDst = &f.min;  v[0].isInt = false;
+            v[1].dSrc = mmm.data() + 1; v[1].hDst = &f.max;  v[1].isInt = false;
+            v[2].dSrc = mmm.data() + 2; v[2].hDst = &f.mean; v[2].isInt = false;
+            deviceReadValues(v, 3);
+            out.push_back(f);
+        };
+        add("Ux", Uk_[0], false);
+        add("Uy", Uk_[1], false);
+        add("Uz", Uk_[2], false);
+        add("p", dp_, false);
+        add("phi", phiInt_, false);
+        add("k", dk_, true);
+        add("epsilon|omega|nuTilda", de_, true);
+        add("nut", dnut_, false);
+        return out;
+    }
+    // TEST CONTROL (BRAE_TEST_CORRUPT=<field>:<nan|inf|neg|big>:<iteration>): one cell of one field, so the gates can show
+    // the detector stops a run on each thing it claims to read. Nothing else reaches this.
+    void corruptForTest(const std::string& field, const std::string& kind)
+    {
+        DeviceBuffer<scalar>* x = field == "U" ? &Uk_[0]
+                                : field == "p" ? &dp_
+                                : field == "phi" ? &phiInt_
+                                : field == "k" ? &dk_
+                                : field == "omega" || field == "epsilon" ? &de_
+                                : field == "nut" ? &dnut_ : nullptr;
+        if (!x || x->size() == 0)
+        {
+            throw std::runtime_error("BRAE_TEST_CORRUPT: no field '" + field + "'");
+        }
+        scalar v = kind == "nan" ? std::numeric_limits<scalar>::quiet_NaN()
+                 : kind == "inf" ? std::numeric_limits<scalar>::infinity()
+                 : kind == "neg" ? scalar(-1) : kind == "big" ? scalar(1e12) : scalar(0);
+        if (kind != "nan" && kind != "inf" && kind != "neg" && kind != "big")
+        {
+            throw std::runtime_error("BRAE_TEST_CORRUPT: no kind '" + kind + "'");
+        }
+        const std::size_t c = x->size() / 2;
+        cudaCheck(cudaMemcpy(x->data() + c, &v, sizeof(scalar), cudaMemcpyHostToDevice), "test corrupt");
     }
     // Per-face turbulent-inlet data, so the boundary values can be refreshed per iteration (OF parity).
     void setTurbulentInlets(const std::vector<label>& tiMask, const std::vector<scalar>& tiIntensity,
@@ -759,7 +830,8 @@ private:
     RhoSimpleControls rc_{};
     DeviceThermo th_{};
     DeviceBoundary dbHe_{};
-    DeviceBuffer<scalar> pD_, pU_, pL_, diagCp_, bp_;            // persistent pressure matrix (graph-stable addresses)
+    DeviceBuffer<scalar> pD_, pU_, pL_, diagCp_, bp_;            // persistent pressure matrix (graph-stable addresses);
+                                                                 // pL_ is filled only where it can differ from pU_ (transonic)
     DeviceBuffer<label>  bndIsWall_, adjustMask_;              // wall mask (true boundary nut); adjustPhi adjustable mask
     // kEpsilon: 1 on boundary faces whose 0/nut BC is 'calculated'. OF fills those by field assignment
     // (Cmu*k_b^2/eps_b) rather than extrapolating the cell, and the two differ by >12x at a fixed-k inlet.
@@ -846,6 +918,23 @@ private:
     // corrector, so it is gated on the case actually having such a patch.
     bool   hasInletOutletU_ = false;
     bool   hasMixed_ = false;
+    // U's STORED patch values (OpenFOAM's U.boundaryField(): what the last evaluate left), on the uncoupled
+    // boundary layout, for the freestream family. freestreamVelocity and freestreamPressure take their
+    // valueFraction from them (`const Field<vector>& Up = *this`, freestreamVelocityFvPatchVectorField.C:105;
+    // lookupPatchField, freestreamPressureFvPatchScalarField.C:117) and fvc::grad(U) reads them at the
+    // momentum assembly. Seeded from the field as read, refreshed where OpenFOAM evaluates U's boundary:
+    // after the momentum solve and after the velocity correction. Empty without a freestream patch, and
+    // under the control BRAE_CONTROL_FREESTREAM_REEVALUATE=1 (the re-derivation this replaced).
+    DeviceBuffer<scalar> UbStored_[3];
+    // ...and p's, for freestreamPressure: what p's last evaluate left and p.relax() then relaxed with the field
+    // (GeometricField::relax assigns the boundary too, `operator==(prevIter() + alpha*(*this - prevIter()))`).
+    // The momentum assembly's grad(p) and the velocity correction's read it. pbPrev_ is prevIter()'s, taken
+    // where simple.loop() stores it, at the top of the iteration.
+    DeviceBuffer<scalar> pbStored_;
+    DeviceBuffer<scalar> pbPrev_;
+    bool freestreamStored() const { return UbStored_[0].size() > 0; }
+    // U's patch values as read, for kOmegaSST's validate() alone: empty once the first iteration begins
+    DeviceBuffer<scalar> UbRead_[3];
     bool   hasWedge_ = false;   // any wedge (axisymmetric constraint) U patch -> per-step rotated value                                  // any freestreamVelocity/Pressure (mixed) patch present
     bool   hasPiov_ = false;                                   // any pressureInletOutletVelocity (directionMixed) patch present
     bool   hasSym_ = false;                                    // any slip/symmetry patch present (general normal)
@@ -916,6 +1005,11 @@ private:
     // DILU for the momentum solves (OF's `preconditioner DILU`). The level schedule depends only on the
     // mesh addressing, so it is built once; rD is refactorised inside every solve.
     DeviceDilu dilu_;   // shared by the momentum and turbulence BiCGStab (schedule depends only on the mesh)
+    // THE COLOUR RULE (constructor): U, and the transported turbulence fields, swept in colour order on the
+    // GPU over this colouring -- one per mesh, shared by both, as rhoSimpleFoam's FP-1 shares its own.
+    bool   colourU_ = false;
+    bool   colourTurb_ = false;
+    DeviceCellColouring colouring_;
     bool   hasAMI_ = false;                                     // any cyclicAMI interface -> Jacobi-PCG pressure (no AMG)
     bool   amiNonConforming_ = false;                           // ...and a face with >1 partner -> BiCGStab (see below)
     DeviceAMI    ami_;                                          // cyclicAMI weighted-stencil coupling (translational path)

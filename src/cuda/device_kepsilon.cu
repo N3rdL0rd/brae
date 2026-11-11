@@ -18,7 +18,9 @@
 #include "device_interface.cuh"  // interface<Op>() overloads dispatching to the cyclic/AMI backends
 #include "device_amg.cuh"        // deviceSymGaussSeidel (scalar smoothSolver, for stiff low-Re k/omega)
 #include "nut_wall_function.cuh" // nutkWallFunctionValue / yPlusWall (shared wall-nut physics, BRAE_HD)
+#include "kEpsilon.cuh"          // gpu::kEpsilonRAS::boundField: Foam::bound, one implementation
 #include <cuda_runtime.h>
+#include <stdexcept>
 #include <vector>
 
 namespace brae {
@@ -29,6 +31,49 @@ void clearTurbulenceReport() { turbStore().clear(); }
 void clearBoundingReports() { boundStore().clear(); }
 const std::vector<BoundingReport>& boundingReports() { return boundStore(); }
 const std::vector<ScalarSolveEntry>& turbulenceReport() { return turbStore(); }
+
+SecondFieldLimit& secondFieldLimit()
+{
+    static SecondFieldLimit l;
+    return l;
+}
+
+namespace {
+__global__ void fixedFaceValueKernel(
+    int                        n,
+    const label*  __restrict__ type,
+    const label*  __restrict__ wallFunction,
+    const scalar* __restrict__ value,
+    scalar*       __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = (type[i] == 1 || wallFunction[i]) ? value[i] : scalar(0);
+}
+}   // namespace
+
+scalar deviceFieldMax(const DeviceBuffer<scalar>& x)
+{
+    if (x.size() == 0) return scalar(0);
+    DeviceBuffer<scalar> mmm(3);
+    deviceMinMaxMeanInto(x, mmm.data());
+    scalar v = 0.0;
+    DeviceReadValue r;
+    r.dSrc = mmm.data() + 1;
+    r.hDst = &v;
+    r.isInt = false;
+    deviceReadValues(&r, 1);
+    return v;
+}
+
+scalar deviceFixedFaceMax(const DeviceBoundary& db, const DeviceBuffer<scalar>& value)
+{
+    if (db.n == 0) return scalar(0);
+    DeviceBuffer<scalar> out;
+    out.resize(static_cast<std::size_t>(db.n));
+    fixedFaceValueKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.wallFunctionMask.data(), value.data(), out.data());
+    cudaCheck(cudaGetLastError(), "fixedFaceValue");
+    return deviceFieldMax(out);
+}
 
 namespace {
 inline scalar yPlusLamHost(scalar kappa, scalar E) { scalar y = 11.0; for (int i = 0; i < 10; ++i) y = std::log(std::fmax(E * y, 1.0)) / kappa; return y; }
@@ -479,6 +524,12 @@ __global__ void fpDecideK(const unsigned long long* __restrict__ acc, unsigned l
     *valid = 1;
     if (h) ++(*nHit); else ++(*nMiss);
 }
+// the memos, one a mesh (deviceGradUShared has why the key is the mesh)
+std::map<const void*, GradUMemo>& gradUMemos()
+{
+    static auto& cache = *new std::map<const void*, GradUMemo>();
+    return cache;
+}
 int gradUMemoMode()
 {
     static const int mode = []()
@@ -509,7 +560,7 @@ const GradUMemo& deviceGradUShared(
     // (item 76, the device twin of item 75). dm.owner is the mesh's own addressing and lives as long as
     // the mesh; the device pool can hand a freed mesh's block back, so the entry is rebuilt whenever the
     // cell count disagrees and the fingerprint carries V to witness the rest.
-    static auto& cache = *new std::map<const void*, GradUMemo>();
+    auto& cache = gradUMemos();
     GradUMemo& m = cache[dm.owner.data()];
     cacheStat("gradu-memo", cache.size());
     const int nC = dm.nCells;
@@ -635,6 +686,16 @@ const GradUMemo& deviceGradUShared(
     return m;
 }
 
+void deviceGradUSharedRelease(const DeviceMesh& dm)
+{
+    // every buffer's block goes back to the pool as the empty memo is moved over it; the next call finds a cell
+    // count of 0, starts the device state invalid and computes -- where a hit returns the bits that computation
+    // would give
+    auto& cache = gradUMemos();
+    const auto it = cache.find(dm.owner.data());
+    if (it != cache.end()) it->second = GradUMemo();
+}
+
 void deviceGradU(
     const DeviceMesh& dm,
     const DeviceVectorBoundary& dbU,
@@ -643,12 +704,13 @@ void deviceGradU(
     const DeviceBuffer<scalar>& Uz,
     DeviceBuffer<scalar>& gradU,
     DeviceAMI* ami,
-    DeviceCyclic* cyc)
+    DeviceCyclic* cyc,
+    const DeviceBuffer<scalar>* const* UbStored)
 {
     const int nC = dm.nCells;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
     gradU.resize(static_cast<std::size_t>(9) * nC);
-    const GradUMemo& memo = deviceGradUShared(dm, dbU, Ux, Uy, Uz);
+    const GradUMemo& memo = deviceGradUShared(dm, dbU, Ux, Uy, Uz, UbStored);
 
     // interface (cyclic/cyclicAMI) face contribution to grad(U): without it the gradient at interface cells is
     // ONE-SIDED -> wrong turbulence production G=nut*(gradU&&devTwoSymm(gradU)) there (the divDevReff x-invariance
@@ -872,6 +934,16 @@ void deviceBoundField(
     const char*           fieldName,
     const DeviceBoundary* db)
 {
+    // fvc::average(max(field, floor)) takes the mesh's face areas and the patches' values (bound.C:50, fvcAverage.C), as the
+    // mirror closure's boundField does. MEASURED: the unweighted mean of faces below, with the cell's value on the boundary,
+    // gave bounded cells 12.02 and 0.44 where OpenFOAM gave 31.58 and 6.46 (JUPITER job 2638365, pitzDailyTurb, epsilon at -41).
+    static const bool unweighted = std::getenv("BRAE_CONTROL_BOUND_UNWEIGHTED") != nullptr;
+    if (!unweighted)
+    {
+        if (!db) throw std::runtime_error("deviceBoundField: fvc::average reads the patch values, and no boundary was given");
+        gpu::kEpsilonRAS::boundField(x, dm, *db, floor, fieldName);
+        return;
+    }
     // BEFORE the clamp, as OpenFOAM does (bound.C:42 precedes bound.C:48).
     if (fieldName)
     {
@@ -994,6 +1066,7 @@ void deviceBoundaryNut(
     // viscosity. Constant-property incompressible flow makes that a single number, which is why the scalar
     // argument exists; compressible flow does not, so nuFace overrides it when supplied.
     nutBnd.resize(db.n);
+    if (db.n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     const scalar Cmu25 = std::pow(co.Cmu, 0.25), yplLam = yPlusLamHost(co.kappa, co.E);
     boundaryNutKernel<<<nBlocks(db.n), TPB>>>(db.n, db.faceCell.data(), isWall.data(), y.data(), k.data(), nut.data(),
                                               nu, yplLam, Cmu25, co.kappa, co.E, atmZ0, atmBoundNut, nutBnd.data(),
@@ -1035,6 +1108,32 @@ static void scaleDEffCompressibleKE(
     deviceAxpy(1.0, muLam, D);
 }
 
+TurbGradControl turbGradControl()
+{
+    static const TurbGradControl c = []()
+    {
+        TurbGradControl t;
+        const char* e = std::getenv("BRAE_CONTROL_TURB_GRAD_UNLIMITED");
+        if (!e || !*e) return t;
+        const std::string v(e);
+        t.cd  = (v != "eqn");
+        t.eqn = (v != "cd");
+        std::fprintf(stderr, "brae CONTROL: BRAE_CONTROL_TURB_GRAD_UNLIMITED=%s -- the legacy closures take grad(k) and "
+                     "grad(epsilon|omega) unlimited in%s%s, whatever the case's gradSchemes say\n",
+                     e, t.cd ? " CDkOmega" : "", t.eqn ? " the laplacian correction and limitedLinear's limiter" : "");
+        return t;
+    }();
+    return c;
+}
+
+void requireTurbGradLimits(const TurbScalarGradLimits& g, const char* closure)
+{
+    if (g.kField < 0.0 || g.eField < 0.0 || g.kLU < 0.0 || g.eLU < 0.0)
+        throw std::runtime_error(std::string("brae: ") + closure + " was handed an unset TurbScalarGradLimits. The "
+                                 "caller resolves the case's grad(k), grad(epsilon|omega) and linearUpwind gradient "
+                                 "entries; a default here would run them unlimited under the case's name.");
+}
+
 void deviceKEpsilonCorrect(
     const DeviceMesh& dm,
     const DeviceWallData& wall,
@@ -1052,7 +1151,8 @@ void deviceKEpsilonCorrect(
     scalar nu,
     scalar relaxEps,
     scalar relaxK,
-    scalar tol,
+    const ScalarStopRule& kStop,
+    const ScalarStopRule& epsStop,
     bool bounded,
     bool boundedEps,   // div(phi,epsilon|omega) `bounded`; `bounded` above is div(phi,k)'s
     bool limitedK,
@@ -1060,7 +1160,6 @@ void deviceKEpsilonCorrect(
     scalar twoBykK,
     scalar twoBykEps,
     const KEpsilonCoeffs& co,
-    scalar relTolKE,
     int keCheckEvery,
     bool linearUpwindK,
     bool linearUpwindEps,
@@ -1080,7 +1179,7 @@ void deviceKEpsilonCorrect(
     const DeviceBuffer<scalar>* nuWallFace,   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
     const DeviceBuffer<scalar>* nutBnd,       // nut at boundary FACES -> DkEff/DepsEff(patchi), as OF's laplacian uses
     const DeviceBuffer<scalar>* muBnd,
-    scalar gradScalarLimitK,
+    const TurbScalarGradLimits& gradLim,
     scalar gradULimitK,
                             const DeviceBuffer<label>*  fvoKMask,
                             const DeviceBuffer<scalar>* fvoKVal,
@@ -1089,6 +1188,11 @@ void deviceKEpsilonCorrect(
                             int nSweeps,                              // solvers/<field>/nSweeps; see the declaration
                             bool gsSymmetric)
 {
+    requireTurbGradLimits(gradLim, "deviceKEpsilonCorrect");
+    // grad(k) and grad(epsilon) as the two equations take them: the corrected laplacian's non-orthogonal
+    // correction and limitedLinear's limiter (deviceSolveScalarTransport's fieldGradLimitK). Both ran unlimited.
+    const scalar kEqnGradLimit = turbGradControl().eqn ? scalar(0) : gradLim.kField;
+    const scalar eEqnGradLimit = turbGradControl().eqn ? scalar(0) : gradLim.eField;
     const int nC = dm.nCells;
     // production + divU, wall functions + near-wall override.
     DeviceBuffer<scalar> gByNu, rCmu, magS;
@@ -1153,7 +1257,7 @@ void deviceKEpsilonCorrect(
         divideFaceK<<<nBlocks(nIf), TPB>>>(nIf, phiInt.data(), rhoF.data(), pvI.data());
         const int nB = static_cast<int>(phiBnd.size());
         DeviceBuffer<scalar> pvB(static_cast<std::size_t>(nB));
-        divideFaceK<<<nBlocks(nB), TPB>>>(nB, phiBnd.data(), rhoBnd->data(), pvB.data());
+        if (nB > 0) divideFaceK<<<nBlocks(nB), TPB>>>(nB, phiBnd.data(), rhoBnd->data(), pvB.data());
         cudaCheck(cudaGetLastError(), "keVolFlux");
         deviceDiv(dm, pvI, pvB, divU);
         if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
@@ -1180,8 +1284,19 @@ void deviceKEpsilonCorrect(
             wo << c << ' ' << (int)hIs[c] << ' ' << hW[c] << ' ' << hInv[c] << ' '
                << hE0[c] << ' ' << hG0[c] << ' ' << hE[c] << ' ' << hK[c] << '\n';
     }
+    // epsilon's patches as the last evaluate left them: updateCoeffs below writes the wall cells and nothing evaluates after it, so the
+    // equation's gradient reads the old value on a zeroGradient face beside a wall cell, as deviceKOmegaSSTCorrect's obv has why.
+    DeviceBuffer<scalar> ebvStored;
+    deviceBCValue(dbEps, eps, ebvStored);
     overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), eps0.data(), G.data(), eps.data(),
                                           wall.wallW.size() ? wall.wallW.data() : nullptr);
+    DeviceBuffer<scalar> ebv;
+    deviceBCValue(dbEps, eps, ebv);
+    deviceBCKeepStored(dbEps, ebvStored, ebv);
+    static const bool gradLive = std::getenv("BRAE_CONTROL_TURB_GRAD_LIVE") != nullptr;
+    // epsilon's own equation sets what it can reach, C1 G = C2 epsilon: solvers/common/solution_health.cuh. None for the realizable closure,
+    // whose production is not G.
+    secondFieldLimit().limit = co.realizable ? scalar(0) : std::max(deviceFixedFaceMax(dbEps, ebv), (co.C1 / co.C2) * deviceFieldMax(G));
 
     // epsilon equation (loose solve) with the near-wall setValues constraint
     // DepsilonEff = nut/sigmaEps + nu. OF's laplacian is alpha*rho*DepsilonEff, so compressible wants
@@ -1207,32 +1322,32 @@ void deviceKEpsilonCorrect(
         }
     }
     deviceSolveScalarTransport(dm, dbEps, eps, "epsilon", Deps, phiInt, phiBnd, divPhi, boundedEps, limitedEps, linearUpwindEps, nonOrth, twoBykEps,
-                               relaxEps, tol, relTolKE, keCheckEvery, gsEps,
+                               relaxEps, epsStop, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    if (co.realizable) deviceEpsReactionRealizable(dm, eps, k, magS, nu, co.C2, diag, src);
                                    else               deviceEpsReaction(dm, eps, k, gByNu, divU, diag, src, co, rho); },
-                               &wall, &eps0, ami, cyc, eDdt, DepsB.size() ? &DepsB : nullptr, gradScalarLimitK,
+                               &wall, &eps0, ami, cyc, eDdt, DepsB.size() ? &DepsB : nullptr, gradLim.eLU,
                                true, fvoEMask, fvoEVal,
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.epsilonMin);
+                               /*boundFloor*/co.epsilonMin, eEqnGradLimit, gradLive ? nullptr : &ebv);
 
     // k equation (loose solve)
     DeviceBuffer<scalar> Dk(static_cast<std::size_t>(nC));
     depsKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), co.sigmaK, (rho ? scalar(0) : nu), Dk.data());
     if (rho && muLam) scaleDEffCompressibleKE(*rho, *muLam, Dk);
     deviceSolveScalarTransport(dm, dbK, k, "k", Dk, phiInt, phiBnd, divPhi, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
-                               relaxK, tol, relTolKE, keCheckEvery, gsK,
+                               relaxK, kStop, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReaction(dm, k, eps, G, divU, diag, src, rho); },
-                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK,
+                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradLim.kLU,
                                true, fvoKMask, fvoKVal,
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.kMin);
+                               /*boundFloor*/co.kMin, kEqnGradLimit);
 
     // correctNut (cell): nut = Cmu k^2 / eps (realizableKE: rCmu k^2 / eps with the variable Cmu).
     if (co.realizable) deviceRealizableNut(rCmu, k, eps, nut);
@@ -1341,6 +1456,7 @@ void deviceBoundaryNutSpalding(
         nutBnd.resize(n);
         cudaCheck(cudaMemsetAsync(nutBnd.data(), 0, n*sizeof(scalar), cudaStreamPerThread), "spalding init");
     }
+    if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     spaldingNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                            dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                            nutCell.data(), nu, co.kappa, co.E, nutBnd.data(),
@@ -1377,6 +1493,7 @@ void deviceBoundaryNutBlended(
         nutBnd.resize(n);
         cudaCheck(cudaMemsetAsync(nutBnd.data(), 0, n*sizeof(scalar), cudaStreamPerThread), "blended init");
     }
+    if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     blendedNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                           dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                           nutCell.data(), nu, kappa, E, nutBnd.data(),

@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,30 @@ namespace brae {
 // asked -- on essentially every tutorial in existence, since PBiCGStab is what they all name. Likewise
 // brae's AMG-PCG is an AMG-preconditioned CG (device_amg.cuh), which is OF's `PCG` +
 // `preconditioner GAMG`, NOT OF's `GAMG` -- that is multigrid as the solver, a different algorithm.
+// What the case-order path runs on a nuTilda smoothSolver entry, said where it differs from the entry:
+// symGaussSeidel with one sweep between residual evaluations (gsKESym and nSweepsKE are read from k's entry,
+// which a Spalart-Allmaras case does not have). Kept, not ported -- user decision 2026-10-15, brae keeps its
+// own smoother path where it has one. Shared by the reader and by a caller that owns the line
+// (SolverRunsAs::turbulenceSmootherNoticedByCaller).
+inline void noticeNuTildaCaseOrder(
+    const DeviceSimpleControls& ctl,
+    bool smoother = true)   // false: the sweep count only (a caller whose own line names the smoother)
+{
+    if (smoother && !ctl.gsNuTildaSym)
+    {
+        noticeApproximated("solvers/nuTilda smoother",
+                           "'GaussSeidel' in the case (GaussSeidelSmoother.C sweeps ascending only); "
+                           "brae runs symGaussSeidel on nuTilda (ascending, then back down).");
+    }
+    if (ctl.nSweepsNuTilda != 1)
+    {
+        noticeApproximated("solvers/nuTilda nSweeps",
+                           std::to_string(ctl.nSweepsNuTilda) + " in the case; brae evaluates the "
+                           "residual after every sweep (nSweeps 1), so its nuTilda solves stop "
+                           "where OpenFOAM's do not.");
+    }
+}
+
 struct SolverRunsAs
 {
     // The pressure equation. The default is what every driver but the OF-mirror runs. Those drivers fall
@@ -99,6 +124,11 @@ struct SolverRunsAs
     // tolerance, relTol, maxIter, minIter and nSweeps exactly as before and prints NO U notice; the
     // driver prints the one that is true. Default false: every other caller keeps the reader's lines.
     bool momentumNoticedByCaller = false;
+    // ...and does the CALLER announce nuTilda's smoother and sweep count? simpleFoam's legacy driver does
+    // when its colour rule is asked for: whether nuTilda then runs the case's own entry in colour order or
+    // the case-order path's symGaussSeidel is decided after the mesh is read, so the reader cannot know which
+    // line is true. The reader still reads the entry into ctl (gsNuTildaSym, nSweepsNuTilda).
+    bool turbulenceSmootherNoticedByCaller = false;
     // The ONE field whose solver path runs OpenFOAM's fixed-count nSweeps branch (a negative nSweeps,
     // smoothSolver.C:95-119); the reader hands that field its raw value and refuses it on every other.
     std::string fixedSweepsField;
@@ -246,6 +276,37 @@ inline void readLinearSolverControls(
     const SolverRunsAs& runsAs = SolverRunsAs{})
 {
     const FoamDict* solvers = fvSolution.subDict("solvers");
+
+    // AN ENTRY THAT NAMES NO SOLVER is refused, as OpenFOAM refuses it: lduMatrix::solver::New takes the
+    // solver from `solverControls.get<word>("solver")` (lduMatrixSolver.C:148), which has no default. brae
+    // read such an entry's tolerances and ran its own default solver on it with no notice -- found on the
+    // boxy5 UAV, where an edit left `"(U|nuTilda)" { }` and nuTilda ran Neumann6-BiCGStab. Checked for the
+    // fields this reader resolves an entry for; an entry that is absent altogether keeps the defaults below.
+    {
+        std::vector<std::string> fields = {"p", "U"};
+        if (ctl.turbulent && !ctl.les)
+        {
+            if (ctl.sa)
+            {
+                fields.push_back("nuTilda");
+            }
+            else
+            {
+                fields.push_back("k");
+                fields.push_back(secondName);
+            }
+        }
+        if (!heName.empty()) fields.push_back(heName);
+        for (const std::string& f : fields)
+        {
+            const FoamDict* s = solvers ? solvers->subDict(f) : nullptr;
+            if (s && s->wordOr("solver", "").empty())
+                throw std::runtime_error(
+                    "system/fvSolution: the solvers entry that matches '" + f + "' names no `solver`. OpenFOAM "
+                    "refuses it (lduMatrix::solver::New reads the keyword with no default, "
+                    "lduMatrixSolver.C:148); brae would run a default of its own in its place, so it refuses too.");
+        }
+    }
 
     auto solverTol = [&](const std::string& f, scalar def)
     {
@@ -507,11 +568,29 @@ inline void readLinearSolverControls(
     if (!runsAs.momentumNoticedByCaller)
         noticeSolverChoice("U", "PBiCGStab", krylovPrecon("U"), ctl.gsU);
 
+    // One field's OWN stop rule: tolerance, relTol, maxIter and minIter from its dictionary, with lduMatrix::solver's
+    // defaults where the entry is silent (lduMatrixSolver.C:193-207). A name that matches no entry leaves the four
+    // as they stand -- for a `Final` name, the base field's rule (OpenFOAM would stop there; the Final note in
+    // DeviceSimpleControls has why brae does not).
+    auto readOwnStop = [&](const std::string& f,
+                           scalar& tol,
+                           scalar& relTol,
+                           int& maxIter,
+                           int& minIter)
+    {
+        if (!solvers || !solvers->subDict(f))
+            return;
+        tol = solverTol(f, kOpenFoamDefaultTolerance);
+        relTol = solverRelTol(f);
+        maxIter = solverMaxIter(f, 1000);
+        minIter = solverMinIter(f, 0);
+    };
     if (ctl.turbulent)
     {
-        // brae solves the turbulence pair to ONE tolerance (the tighter of the two), so the Final pair
-        // collapses the same way. Falling back to the base value per field keeps a case that defines
-        // only one of them (kFinal but no epsilonFinal) from tightening the pair on the strength of it.
+        // The ...KE figures solve the turbulence pair to ONE tolerance (the tighter of the two), so the
+        // Final pair collapses the same way. Falling back to the base value per field keeps a case that
+        // defines only one of them (kFinal but no epsilonFinal) from tightening the pair on the strength of
+        // it. The device closures take each field's own instead (tolK, tolEps; DeviceSimpleControls).
         if (ctl.sa)
         {
             ctl.tolKE = solverTol("nuTilda", kOpenFoamDefaultTolerance);
@@ -520,9 +599,28 @@ inline void readLinearSolverControls(
             ctl.minIterKE = solverMinIter("nuTilda", 0);
             ctl.tolKEFinal = solverTol("nuTildaFinal", ctl.tolKE);
             ctl.relTolKEFinal = solvers && solvers->subDict("nuTildaFinal") ? solverRelTol("nuTildaFinal") : ctl.relTolKE;
+            // the k slot is nuTilda's: its own rule, and its Final entry's
+            readOwnStop("nuTilda", ctl.tolK, ctl.relTolK, ctl.maxIterK, ctl.minIterK);
+            ctl.tolKFinal = ctl.tolK;
+            ctl.relTolKFinal = ctl.relTolK;
+            ctl.maxIterKFinal = ctl.maxIterK;
+            ctl.minIterKFinal = ctl.minIterK;
+            readOwnStop("nuTildaFinal", ctl.tolKFinal, ctl.relTolKFinal, ctl.maxIterKFinal, ctl.minIterKFinal);
             ctl.gsK = useSymGS("nuTilda") && runsAs.smoothSolverOnTurbulence;
             ctl.gsEps = false;
             noticeSolverChoice("nuTilda", "PBiCGStab", krylovPreconGs("nuTilda", ctl.gsK), ctl.gsK);
+            // nuTilda's SMOOTHER and SWEEP COUNT are not read into ctl: gsKESym and nSweepsKE come from k's
+            // entry in the branch below, so every caller of this reader runs nuTilda with symGaussSeidel
+            // and one sweep between residual evaluations, whatever nuTilda's own entry says. Kept, not
+            // ported -- user decision 2026-10-15, brae keeps its own smoother path where it has one -- and
+            // announced HERE because it is true for every caller (the rebuilt driver, BRAE_SIMPLEFOAM_V2=1,
+            // reads its own fvSolution and honours both).
+            ctl.gsNuTildaSym = gsIsSymmetric("nuTilda");
+            ctl.nSweepsNuTilda = solverNSweeps("nuTilda", 1);
+            if (ctl.gsK && !runsAs.turbulenceSmootherNoticedByCaller)
+            {
+                noticeNuTildaCaseOrder(ctl);
+            }
             // THIS BRANCH NEVER SET THE PRECONDITIONER. ctl.diluKE was assigned only in the k/epsilon
             // branch below, so it stayed false here and a case naming `preconditioner DILU` on nuTilda --
             // which 37 of the 43 SpalartAllmaras tutorials in OpenFOAM do (4 name smoothSolver, 2 PBiCG,
@@ -552,13 +650,49 @@ inline void readLinearSolverControls(
             if (solverMaxIter("k", 1000) != solverMaxIter(secondName, 1000)
              || solverMinIter("k", 0) != solverMinIter(secondName, 0))
                 noticeApproximated("solvers/k and solvers/" + secondName + " maxIter/minIter",
-                                   "the pair is solved under ONE cap: the tighter maxIter and the larger"
-                                   " minIter of the two entries");
+                                   "rhoSimpleFoam's mirror drivers (BRAE_RHOSIMPLEFOAM_MIRROR) solve the pair under"
+                                   " ONE cap: the tighter maxIter and the larger minIter of the two entries; the"
+                                   " device closures take each field's own");
             ctl.tolKEFinal = std::fmin(solverTol("kFinal", solverTol("k", kOpenFoamDefaultTolerance)),
                                        solverTol(secondName + "Final", solverTol(secondName, kOpenFoamDefaultTolerance)));
             ctl.relTolKEFinal = std::fmin(
                 solvers && solvers->subDict("kFinal") ? solverRelTol("kFinal") : solverRelTol("k"),
                 solvers && solvers->subDict(secondName + "Final") ? solverRelTol(secondName + "Final") : solverRelTol(secondName));
+            // Each field under its OWN entry, the device closures' rule, and each Final entry's.
+            readOwnStop("k", ctl.tolK, ctl.relTolK, ctl.maxIterK, ctl.minIterK);
+            readOwnStop(secondName, ctl.tolEps, ctl.relTolEps, ctl.maxIterEps, ctl.minIterEps);
+            ctl.tolKFinal = ctl.tolK;
+            ctl.relTolKFinal = ctl.relTolK;
+            ctl.maxIterKFinal = ctl.maxIterK;
+            ctl.minIterKFinal = ctl.minIterK;
+            ctl.tolEpsFinal = ctl.tolEps;
+            ctl.relTolEpsFinal = ctl.relTolEps;
+            ctl.maxIterEpsFinal = ctl.maxIterEps;
+            ctl.minIterEpsFinal = ctl.minIterEps;
+            readOwnStop("kFinal", ctl.tolKFinal, ctl.relTolKFinal, ctl.maxIterKFinal, ctl.minIterKFinal);
+            readOwnStop(secondName + "Final", ctl.tolEpsFinal, ctl.relTolEpsFinal, ctl.maxIterEpsFinal, ctl.minIterEpsFinal);
+            // BRAE_CONTROL_TURB_PAIR_ONE_RULE=1, the stop-rule gate's CONTROL
+            // (tests/simple_turbulence_stop_rule_vs_openfoam.sh): both fields under the merged figures, as the
+            // device closures solved them before each field's own was handed down.
+            if (std::getenv("BRAE_CONTROL_TURB_PAIR_ONE_RULE"))
+            {
+                ctl.tolK = ctl.tolKE;
+                ctl.relTolK = ctl.relTolKE;
+                ctl.maxIterK = ctl.maxIterKE;
+                ctl.minIterK = ctl.minIterKE;
+                ctl.tolEps = ctl.tolKE;
+                ctl.relTolEps = ctl.relTolKE;
+                ctl.maxIterEps = ctl.maxIterKE;
+                ctl.minIterEps = ctl.minIterKE;
+                ctl.tolKFinal = ctl.tolKEFinal;
+                ctl.relTolKFinal = ctl.relTolKEFinal;
+                ctl.maxIterKFinal = ctl.maxIterKE;
+                ctl.minIterKFinal = ctl.minIterKE;
+                ctl.tolEpsFinal = ctl.tolKEFinal;
+                ctl.relTolEpsFinal = ctl.relTolKEFinal;
+                ctl.maxIterEpsFinal = ctl.maxIterKE;
+                ctl.minIterEpsFinal = ctl.minIterKE;
+            }
             ctl.gsK = useSymGS("k") && runsAs.smoothSolverOnTurbulence;
             ctl.gsEps = useSymGS(secondName) && runsAs.smoothSolverOnTurbulence;
             // ONE smoother variant for the transported pair, as nSweeps is: the model solves both

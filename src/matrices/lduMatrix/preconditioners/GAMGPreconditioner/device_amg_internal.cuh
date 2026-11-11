@@ -42,6 +42,9 @@ Coloring greedyColor(
 //      drivers (ensureSpectrum) call these across TUs; the standalone symGaussSeidel solver also reuses gsSweep. ----
 struct AMGData;   // fwd (full definition in the public device_amg.cuh)
 void ensureSpectrum(AMGData& amg, const DeviceLduView& A);
+// The double cycle's row layout on its small grids (AMGData::csr64Row): built at the first call, its values gathered at every
+// call. amgGalerkin's last act: the one point where the coarse matrices change and outside every captured cycle.
+void amgGatherCsr64(AMGData& amg);
 void gsSweep(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& x,
              const GridColoring& gc, bool forward);
 void chebyshevSmooth(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& x,
@@ -125,6 +128,33 @@ void amulCsrFK(int nC, const float* __restrict__ diag, const label* __restrict__
         s += val[i]*psi[col[i]];
     Apsi[c]=s;
 }
+// The double cycle's product on a grid with the row layout (AMGData::csr64Row): one contiguous row, where amulKernel merges two
+// lists of faces through three chained reads an entry. Nsight Compute, one launch at 1 to 197 blocks (motorBike, 16 GH200s):
+// amulKernel 13.5 to 19 us, amulCsrFK in single precision 5.9 to 9 us. The same sum as amulKernel, in its order, and the same
+// rounding: its multiply and add stay apart (the if-converted merge compiles to DMUL then DADD), where a plain s += a*b here compiled
+// to DFMA, one rounding fewer: 1e-14 from amulKernel's answers within 18 CG iterations on pitzDaily's pressure (tests/mgpu_sequence.sh).
+static __global__
+void amulCsrDK(int nC, const scalar* __restrict__ diag, const label* __restrict__ row,
+               const label* __restrict__ col, const scalar* __restrict__ val,
+               const scalar* __restrict__ psi, scalar* __restrict__ Apsi)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    scalar s = diag[c]*psi[c];
+    for (label i = row[c]; i < row[c+1]; ++i)
+        s = __dmul_rn(val[i], psi[col[i]]) + s;
+    Apsi[c]=s;
+}
+// Refill a double row layout's values from the grid's face arrays
+static __global__
+void csr64GatherK(int nnz, const label* __restrict__ src, const scalar* __restrict__ upper,
+                  const scalar* __restrict__ lower, scalar* __restrict__ val)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nnz) return;
+    const label s = src[i];
+    val[i] = (s >= 0) ? upper[s] : lower[-s - 1];
+}
 // Refill a grid's CSR values from its FP64 face arrays. Replaces the two cast_ launches that grid's
 // upper and lower would otherwise need, so a CSR grid costs one launch per solve, not two.
 static __global__
@@ -135,6 +165,40 @@ void csrGatherValsK(int nnz, const label* __restrict__ src, const scalar* __rest
     if (i >= nnz) return;
     const label s = src[i];
     val[i] = (s >= 0) ? (float)upper[s] : (float)lower[-s - 1];
+}
+// ...and the same values through the grid's own addressing, so that the stored source list is not needed (csrSrc,
+// AMGData). Row c is its owner faces in ownerStart order and then its neighbour faces in losort order (the layout
+// buildCsrForGrid gives it), so upper[f] sits at row[owner[f]] + (f - ownerStart[owner[f]]) and the lower of the
+// face at losort slot k at row[c] + (its owner count) + (k - losortStart[c]), c = nei[losort[k]]: one thread a
+// slot, threads [0, nF) the upper values in face order and [nF, 2 nF) the lower ones in losort order. The same
+// casts of the same values into the same slots. ONE THREAD A ROW, walking it, was measured first and cost the
+// stored list's speed: on boxy5 at 4.94 M cells (H100, 200 iterations) 0.4088 and 0.4091 s/it against 0.4031 --
+// its loads and stores stride a row apart across a warp, where these run along the face arrays.
+static __global__
+void csrGatherFacesK(
+    int nF,
+    const label* __restrict__ row,
+    const label* __restrict__ owner,
+    const label* __restrict__ nei,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ losort,
+    const scalar* __restrict__ upper,
+    const scalar* __restrict__ lower,
+    float* __restrict__ val)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= 2*nF) return;
+    if (i < nF)
+    {
+        const label c = owner[i];
+        val[row[c] + (i - ownerStart[c])] = (float)upper[i];
+        return;
+    }
+    const label k = i - nF;
+    const label f = losort[k];
+    const label c = nei[f];
+    val[row[c] + (ownerStart[c+1] - ownerStart[c]) + (k - losortStart[c])] = (float)lower[f];
 }
 inline void amulF(const LduF& A, const float* x, float* y)
 {

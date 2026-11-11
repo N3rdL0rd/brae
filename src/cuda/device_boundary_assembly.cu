@@ -163,12 +163,64 @@ void bcMatrixFluxKernel(
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) fluxB[i] = iC[i] * p[fc[i]] - bC[i];
 }
+
+__global__ void bcKeepStoredKernel(
+    int n,
+    const label* __restrict__ wallFunction,
+    const scalar* __restrict__ stored,
+    scalar* __restrict__ value)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (!wallFunction[i]) value[i] = stored[i];
+}
+
+// Which faces bound.C:59 leaves at the floor. The assignment dispatches on the patch: fixedValue and mixed ignore it, a
+// transform patch's operator= is its own evaluate (transformFvPatchField.C:142), which gives a scalar the bounded cell (both
+// have assignable() false here, fv_patch_field.cuh), a coupled face is re-derived on the next line of bound.C, and an
+// inletOutlet on inflow keeps its inletValue (inletOutletFvPatchField.C, operator=). What is left stores the floor.
+__global__ void boundCapMarkKernel(
+    int n,
+    const label* __restrict__ type,
+    const label* __restrict__ assignable,
+    const scalar* __restrict__ bval,
+    scalar floor,
+    label* __restrict__ capped)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const bool stores = assignable[i] && type[i] != 1 && type[i] != 8;
+    capped[i] = (stores && bval[i] < floor) ? 1 : 0;
+}
+
+__global__ void boundCapApplyKernel(
+    int n,
+    const label* __restrict__ capped,
+    scalar cap,
+    scalar* __restrict__ value)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (capped[i]) value[i] = cap;
+}
 } // namespace
+
+
+void deviceBCKeepStored(const DeviceBoundary& db, const DeviceBuffer<scalar>& stored, DeviceBuffer<scalar>& value)
+{
+    if (db.n == 0) return;
+    bcKeepStoredKernel<<<nBlocks(db.n), TPB>>>(db.n, db.wallFunctionMask.data(), stored.data(), value.data());
+    cudaCheck(cudaGetLastError(), "bcKeepStored");
+}
 
 
 void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value, const int* skipIf)
 {
     value.resize(db.n);
+    // A rank with no physical boundary face: a mesh partition whose faces are all interfaces, so every boundary array
+    // of this rank is empty. CUDA 13 refuses a launch of zero blocks (cudaErrorInvalidValue, "invalid argument"): the
+    // 14.1 M-cell motorBike at 16 ranks stopped here on the 7 ranks with no outer patch. Same in every boundary kernel below.
+    if (db.n == 0) return;
     bcValueKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
                                           db.faceCell.data(), internal.data(),
                                           db.refGrad.size() ? db.refGrad.data() : nullptr,
@@ -176,6 +228,30 @@ void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& interna
                                           db.ioStored.size() ? db.ioStored.data() : nullptr,
                                           db.ioFresh.size()  ? db.ioFresh.data()  : nullptr);
     cudaCheck(cudaGetLastError(), "bcValue");
+    if (db.boundCapped.size())
+    {
+        boundCapApplyKernel<<<nBlocks(db.n), TPB>>>(db.n, db.boundCapped.data(), db.boundCap, value.data());
+        cudaCheck(cudaGetLastError(), "bcValue bound cap");
+    }
+}
+
+
+void deviceBoundCap(const DeviceBoundary& db, const DeviceBuffer<scalar>& bval, scalar floor)
+{
+    db.boundCapped.resize(0);
+    if (db.n == 0) return;
+    // Foam::bound's guard has fired, or this is not reached, so the mask costs nothing on a field with nothing to bound
+    db.boundCapped.resize(db.n);
+    db.boundCap = floor;
+    boundCapMarkKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.assignableMask.data(), bval.data(), floor,
+                                               db.boundCapped.data());
+    cudaCheck(cudaGetLastError(), "bound cap");
+}
+
+
+void deviceBoundCapClear(const DeviceBoundary& db)
+{
+    db.boundCapped.resize(0);
 }
 
 
@@ -187,6 +263,7 @@ void deviceBCLaplacianCoeffsFace(
 {
     iC.resize(db.n);
     bC.resize(db.n);
+    if (db.n == 0) return;   // see deviceBCValue
     bcLaplacianFaceKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
                                                   db.deltaCoeffs.data(), db.magSf.data(), gammaFace.data(),
                                                   db.refGrad.size() ? db.refGrad.data() : nullptr, iC.data(), bC.data());
@@ -202,6 +279,7 @@ void deviceBCLaplacianCoeffs(
 {
     iC.resize(db.n);
     bC.resize(db.n);
+    if (db.n == 0) return;   // see deviceBCValue
     bcLaplacianKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
                                               db.deltaCoeffs.data(), db.magSf.data(), gammaCell.data(), db.faceCell.data(),
                                               db.refGrad.size() ? db.refGrad.data() : nullptr,
@@ -218,6 +296,7 @@ void deviceBCDivCoeffs(
 {
     iC.resize(db.n);
     bC.resize(db.n);
+    if (db.n == 0) return;   // see deviceBCValue
     bcDivKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
                                         db.refGrad.size() ? db.refGrad.data() : nullptr, db.deltaCoeffs.data(),
                                         phiB.data(), iC.data(), bC.data());
@@ -233,6 +312,7 @@ void deviceMatrixFluxBoundary(
     DeviceBuffer<scalar>& fluxB)
 {
     fluxB.resize(db.n);
+    if (db.n == 0) return;   // see deviceBCValue
     bcMatrixFluxKernel<<<nBlocks(db.n), TPB>>>(db.n, db.faceCell.data(), iC.data(), bC.data(), p.data(), fluxB.data());
     cudaCheck(cudaGetLastError(), "bcMatrixFlux");
 }

@@ -95,6 +95,10 @@ struct PCGGraphCache {
     // ...and the right-hand side and the fine matrix, copied in per solve, because a captured prologue
     // bakes their pointers and the callers hand in fresh buffers each time.
     DeviceBuffer<scalar> gB, gDiag, gUpper, gLower;
+    // A matrix handed with ONE off-diagonal (lower == upper: simpleFoam's symmetric pressure) is copied into gUpper
+    // alone and the graph reads gUpper as the lower; gLower stays empty. The lower the graph reads is in the key,
+    // so a view whose off-diagonals stop or start sharing is captured afresh instead of replayed.
+    const void* keyLower = nullptr;
     // THE COUPLED PAIR'S VALUES the same way -- the cyclic coefficient, its jump, the AMI coefficient -- and its
     // ADDRESSING in the key. A caller that builds the jump afresh each solve (interFoam's pressure step) had the
     // graph replay against the first solve's pointer: RAS/damBreakPorousBaffle, phi 5.6e-03 from OpenFOAM.
@@ -127,7 +131,8 @@ struct AMGLevel {
     DeviceBuffer<label>  cOwn, cNei, cOwnerStart, cLosort, cLosortStart;  // grid-(k+1) addressing (SpMV gather)
     unsigned long long   addressingId = 0;                      // of cOwn/cNei's content, see nextDeviceAddressingId
     DeviceBuffer<label>  faceRestrict, faceFlip;               // grid-k face -> grid-(k+1) face (>=0) / -1-coarseCell
-    DeviceBuffer<scalar> cDiag, cUpper, cLower;                // grid-(k+1) matrix (rebuilt by Galerkin)
+    // grid-(k+1) matrix (rebuilt by Galerkin); cLower is empty while the level has one off-diagonal (coarseLower)
+    DeviceBuffer<scalar> cDiag, cUpper, cLower;
     // DETERMINISTIC GALERKIN GATHER (see the note above galDiagGatherK in device_amg.cu).
     // The inverses of map/faceRestrict, as CSR lists over the COARSE entities. Agglomeration is static
     // for the life of the mesh, so these are built once on the host and reused by every solve; they let
@@ -174,8 +179,11 @@ struct AMGLevel {
     DeviceBuffer<scalar> Rterm;
     DeviceBuffer<float> RtermF;
     DeviceBuffer<scalar> rapTerm;
+    // ONE OFF-DIAGONAL FOR A SYMMETRIC MATRIX (amgGalerkin): an injection level coarsened only from fine matrices
+    // handed with one off-diagonal has no cLower, and every reader of the lower is handed cUpper -- the same bits.
+    const scalar* coarseLower() const { return cLower.size() > 0 ? cLower.data() : cUpper.data(); }
     DeviceLduView coarseView() const {
-        DeviceLduView v{nCoarse, nCoarseFaces, cDiag.data(), cUpper.data(), cLower.data(), cOwn.data(), cNei.data(),
+        DeviceLduView v{nCoarse, nCoarseFaces, cDiag.data(), cUpper.data(), coarseLower(), cOwn.data(), cNei.data(),
                         cOwnerStart.data(), cLosort.data(), cLosortStart.data()};
         v.addressingId = addressingId;
         return v;
@@ -286,6 +294,26 @@ struct AMGPair
     unsigned long long epoch = 0;               // moves when a buffer above does: what a captured cycle compares
 };
 
+// THE COARSEST SOLVE'S ALTERNATIVES (BRAE_AMG_COARSE_SOLVE, an experiment on perf/amg-coarse-solve):
+// lu applies coarseLU with coarseLUSolveKernel; tri the same factors by one warp; inverse (the default,
+// device_amg_coarse_default.cuh) A^-1 formed at the factorisation and applied as a product, the LU's substitutions
+// where its check finds it unsafe; cholesky L L^T where the level is SPD, the LU
+// otherwise (decided on the device, so it holds inside a captured graph). Prepared beside the LU, outside
+// every capture; same lifecycle as coarseLU.
+enum class CoarseSolveKind { LU = 0, Tri = 1, Inverse = 2, Cholesky = 3 };
+struct CoarseDirect
+{
+    CoarseSolveKind kind = CoarseSolveKind::LU;
+    int n = 0;
+    DeviceBuffer<scalar> fc;                                    // the LU, column-major (tri, and cholesky's fallback)
+    DeviceBuffer<scalar> f2;                                    // A^-1 row-major (inverse), L and L^T column-major (cholesky)
+    DeviceBuffer<scalar> work;                                  // cholesky's working matrix where it does not fit in shared
+    DeviceBuffer<int> perm;                                     // the LU's interchanges as one gather
+    DeviceBuffer<int> chol;                                     // 1 where cholesky factorised the level
+    DeviceBuffer<int> unsafe;                                   // inverse: 0, or why its solves take the LU (1 floored, 2 not finite, 3 probes)
+    DeviceBuffer<scalar> probe;                                 // inverse: the check's two vectors' scratch
+};
+
 struct AMGData {
     int nFine = 0;
     std::vector<AMGLevel> level;                                // level[k]: grid k -> grid k+1 (+ grid k+1's matrix)
@@ -323,16 +351,32 @@ struct AMGData {
     bool keptValid = false;
     bool fp32Current = false;
     bool fp32Stands = false;
+    // amgGalerkin has run on this hierarchy: a cycle captured since may hold its levels' coarse views
+    // (amgTakeCoarseLower)
+    bool galerkinRun = false;
     // FP-12: the FP32 SpMV's operand, per grid, as ONE contiguous row instead of two indirections.
     // csrRow[g] is nCells+1 offsets; csrCol[g] the column of each entry; csrVal[g] its FP32 value;
-    // csrSrc[g] says where that value comes from in the FP64 face arrays (f for upper[f], -(f+1) for
-    // lower[f]) so amgCastFP32 can refill the values in one pass per grid. The entries of a row are the
+    // csrSrc[g], only under BRAE_AMG_CSR_SRC=1, says where that value comes from in the FP64 face arrays (f for
+    // upper[f], -(f+1) for lower[f]); otherwise amgCastFP32 refills the values through the grid's own addressing
+    // (csrGatherFacesK), in one pass per grid either way. The entries of a row are the
     // cell's owner faces in ownerStart order and then its neighbour faces in losort order -- the exact
     // sequence amulFK sums in, so the arithmetic and the bits are unchanged. Empty for grids that keep
     // the face form (see amgCsrBelow).
     std::vector<DeviceBuffer<label>> csrRow, csrCol, csrSrc;
     std::vector<DeviceBuffer<float>> csrVal;
     bool csrBuilt = false;
+    // THE DOUBLE CYCLE'S ROW LAYOUT, on every coarse grid under BRAE_AMG_CSR64_BELOW cells (off by default, the private build's setting;
+    // device_amg_vcycle.cu's amgGatherCsr64), and on the finest grid (index 0, amgGatherFineCsr64, BRAE_AMG_FINE_CSR): each row is the
+    // cell's faces in increasing face index, amulKernel's order, so the same bits as that kernel; csr64Src says where each value comes
+    // from (f: upper[f], -(f+1): lower[f]). The finest grid's rows belong to the view they were made from (csr64FineKey, its
+    // ownerStart, and its size), and its values are gathered again at every solve
+    std::vector<DeviceBuffer<label>> csr64Row, csr64Col, csr64Src;
+    std::vector<DeviceBuffer<scalar>> csr64Val;
+    bool csr64Built = false;
+    const label* csr64FineKey = nullptr;
+    int csr64FineCells = 0;
+    int csr64FineFaces = 0;
+    bool csr64FineFilled = false;
     std::unique_ptr<AMGGraphCache> gcache;                      // cached V-cycle graph (capture once, replay)
     std::unique_ptr<AMGGraphCache> gcacheF;                     // cached FP32 V-cycle graph (#7 mixed precision)
     std::unique_ptr<PCGGraphCache> pcgCache;                    // cached device-resident PCG WHILE-body graph (#6); per-solver lifetime
@@ -346,6 +390,7 @@ struct AMGData {
     DeviceBuffer<scalar> coarseLU;                              // n*n row-major, L (unit diagonal) and U in place
     DeviceBuffer<int>    coarsePiv;                             // n row interchanges, in factorisation order
     int coarseLUn = 0;
+    CoarseDirect coarseDirect;                                  // the coarsest solve's alternative (BRAE_AMG_COARSE_SOLVE)
     int nCoarse = 0, nCoarseFaces = 0;                          // back-compat: the FIRST coarse level (level[0])
     int nLevels() const { return static_cast<int>(level.size()); }
     DeviceLduView coarseView() const { return level.front().coarseView(); }   // first coarse level (for #7b tests)
@@ -535,6 +580,23 @@ DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const De
 // removing the launch overhead of the V-cycle's many small kernels. Default false (direct launch).
 void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
                     const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z, bool captureVcycle = false);
+
+// THE FINEST GRID'S ROW LAYOUT (BRAE_AMG_FINE_CSR, on by default, 0 the fallback): A's rows made once for its addressing and its
+// values gathered from A's upper and lower, which a caller does at every solve before any captured graph replays (the values change
+// in their buffers from one system to the next). The V-cycle's finest-grid products and amgFineAmul then read the rows: amulKernel's
+// sum in its order, so the same bits. On an LDU view of 2.9 M cells a GH200 took 113.6 us a product in amulKernel and 98.3 in the
+// rows (6.1 M: 238.7 and 205.7; private bench, JUPITER job 2738781), the gather about one product. Not for a view with coupled
+// faces (a cyclic's or AMI's terms are deviceAmul's): it keeps amulKernel
+void amgGatherFineCsr64(AMGData& amg, const DeviceLduView& A);
+
+// ...in its two parts, for a caller that captures the fill. amgPrepareFineCsr64 makes the rows for A outside any capture and says
+// whether they serve it; amgFillFineCsr64 is one launch, which a capture holds: at every replay it reads the upper and lower the
+// capture baked, as a captured amulKernel would, so a graph keyed wrongly reads stale coefficients in either form
+bool amgPrepareFineCsr64(AMGData& amg, const DeviceLduView& A);
+void amgFillFineCsr64(AMGData& amg, const DeviceLduView& A);
+
+// y = A x on the finest grid: the rows of amgGatherFineCsr64 when they are A's, deviceAmul otherwise
+void amgFineAmul(AMGData& amg, const DeviceLduView& A, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y);
 
 // THE ASYMMETRIC V-CYCLE (upper != lower: the transonic pressure equation's fvm::div(phid, p)).
 //

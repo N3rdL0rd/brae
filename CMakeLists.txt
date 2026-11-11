@@ -949,6 +949,81 @@ set_tests_properties(les_wallfunction_refusals PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME sa_wallfunction_refusals COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_wallfunction_refusals.sh)
 set_tests_properties(sa_wallfunction_refusals PROPERTIES SKIP_RETURN_CODE 77)
 
+# The RAS model by its keyword on the simpleFoam drivers: `model`, and `RASModel` only where that is
+# absent (RASModel.C:140-144). `RAS { model SpalartAllmaras; }` was refused as an empty RASModel. Byte
+# identity against the `RASModel` case on both drivers, OpenFOAM's own premise, and a compat-only control.
+add_test(NAME sa_turbulence_model_keyword COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_turbulence_model_keyword.sh)
+set_tests_properties(sa_turbulence_model_keyword PROPERTIES SKIP_RETURN_CODE 77)
+
+# The default simpleFoam driver runs nSweeps 1 on U and the turbulence solves and symGaussSeidel on
+# nuTilda whatever the case names (kept by user decision 2026-10-15) -- and must SAY so: notices on
+# airFoil2D as shipped and on pitzDaily with nSweeps 2, none where the case asks what the driver runs, none
+# on the rebuilt driver, which honours both entries.
+add_test(NAME simple_smoother_notices COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_smoother_notices.sh)
+set_tests_properties(simple_smoother_notices PROPERTIES SKIP_RETURN_CODE 77)
+# The freestream family's valueFraction from U's (and p's) STORED patch values at OpenFOAM's evaluate points, on
+# the legacy simpleFoam driver: laminar airFoil2D restarted from OpenFOAM's own time 3, every solve pinned, U and
+# p held to round-off at 4 and 6; the re-derivation it replaced (BRAE_CONTROL_FREESTREAM_REEVALUATE=1) fails.
+add_test(NAME simple_freestream_stored_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_freestream_stored_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(simple_freestream_stored_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# ...and OpenFOAM-13's form of freestreamVelocity (BRAE_FREESTREAM_VELOCITY_UP=average) against real OpenFOAM-13,
+# the same restart; it SKIPS where /opt/openfoam13 is absent (OF13RC names another bashrc).
+add_test(NAME simple_freestream_of13_vs_openfoam13
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_freestream_of13_vs_openfoam13.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(simple_freestream_of13_vs_openfoam13 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# simpleFoam's colour rule (U and the turbulence fields swept in colour order on the GPU, relTol entries
+# included) against OpenFOAM's converged pitzDailyTurb: the colour order converges, lands within 1e-03 of
+# OpenFOAM's order and no further from OpenFOAM than it; a component swap in the fused solve fails. It unsets
+# BRAE_SIMPLE_CASE_SOLVER for its own arms.
+# A case's div(phi,epsilon) and div(phi,omega) naming different schemes: the model's own field takes its own entry. Control: the
+# other entry setting the flags, as before.
+add_test(NAME simple_second_scalar_scheme COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_second_scalar_scheme.sh)
+set_tests_properties(simple_second_scalar_scheme PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+add_test(NAME simple_colour_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_colour_vs_openfoam.sh)
+set_tests_properties(simple_colour_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+# kOmegaSST's first correctNut with U's patch values as read: one iteration on a 3-D duct, both outlets, cold and restarted, against real OpenFOAM. It sets its own BRAE_SIMPLE_CASE_SOLVER.
+add_test(NAME simple_sst_start_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_sst_start_vs_openfoam.sh)
+set_tests_properties(simple_sst_start_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+add_test(NAME simple_scalar_uncorrected_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_scalar_uncorrected_vs_openfoam.sh)
+set_tests_properties(simple_scalar_uncorrected_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+# Each transported turbulence field (k, epsilon, omega, nuTilda) stops on its OWN fvSolution entry --
+# tolerance, relTol, maxIter, minIter -- in both orders, against real OpenFOAM's sweep counts on pitzDailySST,
+# pitzDailyTurb and airFoil2D, each row from OpenFOAM's own iteration 100 (from rest OpenFOAM's one-ulp twin moved its
+# own counts). Controls: the pair under one merged rule, the fixed 3000 cap with no minIter.
+# Fail-proofed against 21d124d6: 16 of its 18 checks go red (SA's colour order already took nuTilda's own).
+# It unsets BRAE_SIMPLE_CASE_SOLVER for its own arms.
+add_test(NAME simple_turbulence_stop_rule_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_turbulence_stop_rule_vs_openfoam.sh)
+set_tests_properties(simple_turbulence_stop_rule_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# The legacy driver's solver reading: an entry naming no `solver` is refused as OpenFOAM refuses it,
+# residualControl's turbulence targets are read at the start (no false unread notice) and still gate, and the
+# `Solving for U?` label names what runs (DILUPBiCGStab, the colour sweep). Fail-proofed against the binary
+# before these fixes: every one of the five checks goes red, the controls do not.
+add_test(NAME simple_solver_entry_checks COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_solver_entry_checks.sh)
+set_tests_properties(simple_solver_entry_checks PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# The legacy simpleFoam driver writes its AMG hierarchy cache by default and reads it next run (identical
+# fields); BRAE_AMG_CACHE=0 writes none.
+add_test(NAME simple_amg_cache COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_amg_cache.sh)
+set_tests_properties(simple_amg_cache PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# The case's grad(U)/grad(nuTilda) cellLimited entries on Spalart-Allmaras (linearUpwind's named gradient, the
+# non-orthogonal correction's, Omega's grad(U)), airFoil2D with those entries, restarted from OpenFOAM's time 3:
+# nuTilda to 1e-04 at t4; unlimited (BRAE_CONTROL_SA_GRAD_UNLIMITED=1, how it ran) misses by three orders.
+add_test(NAME sa_gradlimit_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_gradlimit_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(sa_gradlimit_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# forceCoeffs sampled through a simpleFoam run on request (BRAE_FORCE_INTERVAL, BRAE_FORCE_FROM): the rows asked
+# for, the last one equal to the end-of-run evaluation; unset, no file. Fail-proofed against the binary before.
+add_test(NAME simple_force_sampling COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_force_sampling.sh)
+set_tests_properties(simple_force_sampling PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# V2 on Spalart-Allmaras with a `calculated` nut patch (the boxy5 UAV's inlet_front): it took kEpsilon's nut
+# path and stopped on the empty epsilon boundary. It must run, and match the shipped `freestream` arrangement.
+add_test(NAME sa_v2_calculated_nut COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_v2_calculated_nut.sh)
+set_tests_properties(sa_v2_calculated_nut PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
 # Audit finding #16: the turbulence-setup guards compared boundaryField keys to patch names exactly, so
 # regex/group keys (bfs2D writes every wall BC as "(upperWall|lowerWall)") disarmed them silently while
 # buildField resolved the same keys correctly. The guards resolve through patchesResolvingTo now; two
@@ -1535,6 +1610,13 @@ add_test(NAME closure_gradlimit_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
 set_tests_properties(closure_gradlimit_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
 
+# The V2 driver restarted from OpenFOAM's converged windAroundBuildingsBox 400/, against OpenFOAM's own restart: its first
+# boundary nut from k's and epsilon's stored outlet values, as OpenFOAM's validate() reads them. Control: BRAE_IO_STORED=0.
+add_test(NAME simple_v2_restart_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_v2_restart_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
+set_tests_properties(simple_v2_restart_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 add_test(NAME solver_iterbounds_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/solver_iterbounds_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)
@@ -1706,9 +1788,40 @@ add_test(NAME bound_report COMMAND test_bound_report)
 add_test(NAME turb_minima_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turb_minima_vs_openfoam.sh)
 set_tests_properties(turb_minima_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_test(NAME simple_bound_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_bound_vs_openfoam.sh)
+set_tests_properties(simple_bound_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+add_test(NAME simple_gradu_sites_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_gradu_sites_vs_openfoam.sh)
+set_tests_properties(simple_gradu_sites_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 add_test(NAME bound_message_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bound_message_vs_openfoam.sh)
 set_tests_properties(bound_message_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_test(NAME bound_weak_solver_stress
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bound_weak_solver_stress.sh)
+set_tests_properties(bound_weak_solver_stress PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_test(NAME simple_linearupwind_turbulence_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_linearupwind_turbulence_vs_openfoam.sh)
+set_tests_properties(simple_linearupwind_turbulence_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+add_test(NAME motorbike_tight_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/motorbike_tight_vs_openfoam.sh)
+set_tests_properties(motorbike_tight_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 3600)
+# grad(k) and grad(omega) each take the case's own gradSchemes entry, named-then-default, in the legacy kOmegaSST's
+# CDkOmega, laplacian correction and limitedLinear limiter: five arms (plain, limited, split, widened, default) against
+# OpenFOAM's own intermediates, 2-D pitzDailySST restarted and 3-D motorBike cold. Controls: the limiter ignored
+# (all, CDkOmega alone, the equations alone) and omega on k's entry, each red.
+add_test(NAME simple_turb_gradlimit_2d_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_turb_gradlimit_vs_openfoam.sh 2d)
+set_tests_properties(simple_turb_gradlimit_2d_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+add_test(NAME simple_turb_gradlimit_3d_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_turb_gradlimit_vs_openfoam.sh 3d)
+set_tests_properties(simple_turb_gradlimit_3d_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 5400)
+add_test(NAME limitedlinear_robustness_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/limitedlinear_robustness_vs_openfoam.sh)
+set_tests_properties(limitedlinear_robustness_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+add_test(NAME simple_divergence_detector
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_divergence_detector.sh)
+set_tests_properties(simple_divergence_detector PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 add_test(NAME bound_at_construction_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bound_at_construction_vs_openfoam.sh)
 set_tests_properties(bound_at_construction_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
@@ -1871,7 +1984,10 @@ set_tests_properties(tutorial_turbulentflatplate_kepsilon PROPERTIES SKIP_RETURN
 add_test(NAME tutorial_motorbike
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
                  motorBike U=8e-02,p=9e-02,k=1.7e-01,omega=1.0e-01,nut=2e-02 3e-04)
-set_tests_properties(tutorial_motorbike PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 5400)
+# known-red (2026-11-08, the user's decision): on the coarse mesh the cold start's pressure solver picks one of two steady states
+# 9-10 % apart that both codes hold, OpenFOAM's GAMG one and brae's AMG-PCG the other (SIM-24, 2026-11-03), so the bounds are
+# not met and stay as they are. The GB10 CI leaves the label out (.github/workflows/gpu-test.yml); ctest -L known-red runs it
+set_tests_properties(tutorial_motorbike PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;known-red" TIMEOUT 5400)
 
 # pitzDailyExptInlet ships no Allrun at all (blockMesh + simpleFoam) and its residualControl is very loose
 # -- p 1e-2, U 1e-3. That looseness is most of the gap: at the case's own settings brae reads U 2.866e-02
@@ -2840,6 +2956,11 @@ add_executable(test_turb_blowup tests/test_turb_blowup.cu)
 target_include_directories(test_turb_blowup PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_turb_blowup PRIVATE brae_core)
 add_test(NAME turb_blowup COMMAND test_turb_blowup)
+
+add_executable(test_solution_health tests/test_solution_health.cu)
+target_include_directories(test_solution_health PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_solution_health PRIVATE brae_core)
+add_test(NAME solution_health COMMAND test_solution_health)
 
 # rhoSimpleFoam's createFields.H against real OpenFOAM. The oracle is OpenFOAM's own
 # `rhoSimpleFoam -postProcess -func "writeObjects(phi,rho)"`, which builds createFields.H's field set and
@@ -5151,7 +5272,19 @@ add_test(NAME gpu_resident_turb COMMAND test_gpu_resident_turb ${CMAKE_CURRENT_S
 add_executable(test_gpu_amg tests/test_gpu_amg.cu)
 target_include_directories(test_gpu_amg PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_amg PRIVATE brae_core)
+# The AMG coarsest grid's direct solve, kind by kind (BRAE_AMG_COARSE_SOLVE): a benchmark, not a test
+add_executable(bench_amg_coarse_solve tests/bench_amg_coarse_solve.cu)
+target_include_directories(bench_amg_coarse_solve PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(bench_amg_coarse_solve PRIVATE brae_core)
 add_test(NAME gpu_amg COMMAND test_gpu_amg ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+
+# The AMG coarsest grid's precomputed inverse against the LU and a long double oracle, the whole preconditioner's
+# symmetry and definiteness, and six broken-inverse controls run as children (BRAE_CONTROL_COARSE_INVERSE)
+add_executable(test_amg_coarse_inverse tests/test_amg_coarse_inverse.cu)
+target_include_directories(test_amg_coarse_inverse PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_amg_coarse_inverse PRIVATE brae_core)
+add_test(NAME amg_coarse_inverse COMMAND test_amg_coarse_inverse ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(amg_coarse_inverse PROPERTIES RESOURCE_LOCK brae_gpu LABELS fast)
 
 add_executable(test_gpu_benchmark tests/test_gpu_benchmark.cu)
 target_include_directories(test_gpu_benchmark PRIVATE ${BRAE_HEADER_DIRS})
@@ -5394,6 +5527,32 @@ target_include_directories(test_gpu_amg_graph PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_amg_graph PRIVATE brae_core)
 add_test(NAME gpu_amg_graph COMMAND test_gpu_amg_graph ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurbBig)
 
+# The coarse matrices of a fine matrix handed with one off-diagonal: one coarse off-diagonal a level, the same bits
+# and solves as two, and a hierarchy switched to two off-diagonals drops its captured graphs (with its control).
+add_executable(test_amg_one_off_diagonal tests/test_amg_one_off_diagonal.cu)
+target_include_directories(test_amg_one_off_diagonal PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_amg_one_off_diagonal PRIVATE brae_core)
+add_test(NAME amg_one_off_diagonal COMMAND test_amg_one_off_diagonal ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+
+# The AMG's single-precision CSR values gathered through each grid's addressing: the stored source list's
+# bits (BRAE_AMG_CSR_SRC=1 keeps the list), a smaller footprint, and a control that changes the cycle.
+add_test(NAME amg_csr_rows_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/amg_csr_rows_identity.sh)
+set_tests_properties(amg_csr_rows_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# The pressure AMG-PCG's double-precision rows (the PCG's product, the double cycle's finest and coarse grids) byte for byte the face
+# form, in both cycle precisions; controls: the rows in another order, the values never gathered again.
+add_test(NAME amg_double_rows_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/amg_double_rows_identity.sh)
+set_tests_properties(amg_double_rows_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+
+# The BiCGStab graph cache keyed on the field it solves holds one graph per solved field: the velocity corrector
+# writes U into its own block (a new block each iteration had become a new cache entry an iteration once boxy5's
+# memory step 4 moved the pool's free list). Control: BRAE_CONTROL_U_CORRECTOR_NEW_BLOCK=1, the old new block.
+add_test(NAME bicg_graph_cache_bounded
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bicg_graph_cache_bounded.sh)
+set_tests_properties(bicg_graph_cache_bounded PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 # GPU offload #7c-loop: cached V-cycle graph replayed across SIMPLE steps (persistent buffers) vs direct, in-loop A/B.
 add_executable(test_gpu_loop_graph tests/test_gpu_loop_graph.cu)
 target_include_directories(test_gpu_loop_graph PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)
@@ -5496,3 +5655,11 @@ set_tests_properties(mgpu_alpha_stage_gate PROPERTIES SKIP_RETURN_CODE 77 TIMEOU
 add_test(NAME mgpu_step_parity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_step_parity.sh $<TARGET_FILE:brae_interFoam>)
 set_tests_properties(mgpu_step_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# SIMPLEFOAM'S COLOUR RULE'S TEST ARM, the same arrangement again. The legacy simpleFoam driver sweeps a
+# Gauss-Seidel smoothSolver on U and on the transported turbulence fields in colour order on the GPU by default
+# (device_simple_foam.cu, decideColourRule), relTol entries included: the same smoother and stopping rule,
+# another cell order, so another iterate. Every test runs OpenFOAM's order (BRAE_SIMPLE_CASE_SOLVER=1) and keeps
+# its bound; the rule is held to OpenFOAM by tests/simple_colour_vs_openfoam.sh, which unsets this. The user's
+# decision, 2026-10-16.
+set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_SIMPLE_CASE_SOLVER=1")

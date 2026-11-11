@@ -12,8 +12,10 @@
 #include "device_cyclic.cuh"
 #include "device_interface.cuh"
 #include "device_amg.cuh"
+#include "stage_dump.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
+#include <cstdlib>
 
 namespace brae {
 
@@ -685,6 +687,98 @@ void sstNutBoundaryK(
     nutBnd[bi] = a1*kb / fmax(a1*ob, b1*F2*sqrt(fmax(S2, scalar(0))));
 }
 
+// EXPERIMENT (BRAE_SST_F1_PATCH=1, off by default): F1 on a boundary face, as OpenFOAM's F1() evaluates it there: its expression from the patch values of k and omega, y's patch value
+// (zeroGradient off a wall, so the cell's), and CDkOmega from the corrected boundary gradients of k and omega (gaussGrad::correctBoundaryConditions).
+__global__
+void f1PatchK(
+    int nB,
+    const label* __restrict__ typeK,
+    const label* __restrict__ typeO,
+    const label* __restrict__ fc,
+    const scalar* __restrict__ kb,
+    const scalar* __restrict__ ob,
+    const scalar* __restrict__ yCell,
+    const scalar* __restrict__ kc,
+    const scalar* __restrict__ oc,
+    const scalar* __restrict__ gkx,
+    const scalar* __restrict__ gky,
+    const scalar* __restrict__ gkz,
+    const scalar* __restrict__ gox,
+    const scalar* __restrict__ goy,
+    const scalar* __restrict__ goz,
+    const scalar* __restrict__ nx,
+    const scalar* __restrict__ ny,
+    const scalar* __restrict__ nz,
+    const scalar* __restrict__ dc,
+    const scalar* __restrict__ F1c,
+    scalar nu,
+    scalar betaStar,
+    scalar alphaOmega2,
+    scalar* __restrict__ F1b)
+{
+    const int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bi >= nB) return;
+    const int c = fc[bi];
+    const scalar y = yCell[c];
+    const scalar kk = kb[bi];
+    const scalar w = ob[bi];
+    if (!(w > scalar(0)) || !(y > scalar(0)) || kk < scalar(0))
+    {
+        F1b[bi] = F1c[c];
+        return;
+    }
+    // a zeroGradient patch's snGrad is zero whatever it stores, and it can store something other than the cell: the floor after
+    // Foam::bound, the last evaluate beside a wall function's write (zeroGradientFvPatchField.H, snGrad)
+    const scalar snK = typeK[bi] == 0 ? scalar(0) : (kk - kc[c]) * dc[bi];
+    const scalar snO = typeO[bi] == 0 ? scalar(0) : (w - oc[c]) * dc[bi];
+    const scalar nK = nx[bi]*gkx[c] + ny[bi]*gky[c] + nz[bi]*gkz[c];
+    const scalar nO = nx[bi]*gox[c] + ny[bi]*goy[c] + nz[bi]*goz[c];
+    const scalar kbx = gkx[c] + nx[bi]*(snK - nK);
+    const scalar kby = gky[c] + ny[bi]*(snK - nK);
+    const scalar kbz = gkz[c] + nz[bi]*(snK - nK);
+    const scalar obx = gox[c] + nx[bi]*(snO - nO);
+    const scalar oby = goy[c] + ny[bi]*(snO - nO);
+    const scalar obz = goz[c] + nz[bi]*(snO - nO);
+    const scalar CD = (2.0*alphaOmega2)*(kbx*obx + kby*oby + kbz*obz)/w;
+    const scalar CDplus = fmax(CD, (scalar)1.0e-10);
+    const scalar a  = (1.0 / betaStar) * sqrt(kk) / (w * y);
+    const scalar b  = 500.0 * nu / (y * y * w);
+    const scalar cc = (4.0 * alphaOmega2) * kk / (CDplus * y * y);
+    const scalar arg1 = fmin(fmin(fmax(a, b), cc), (scalar)10.0);
+    const scalar a2 = arg1 * arg1;
+    F1b[bi] = tanh(a2 * a2);
+}
+
+void deviceF1OnPatch(
+    const DeviceBoundary& dbK,
+    const DeviceBoundary& dbOmega,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& kBnd,
+    const DeviceBuffer<scalar>& omegaBnd,
+    const DeviceBuffer<scalar>& yCell,
+    const DeviceBuffer<scalar>& k,
+    const DeviceBuffer<scalar>& omega,
+    const DeviceBuffer<scalar>& gkx,
+    const DeviceBuffer<scalar>& gky,
+    const DeviceBuffer<scalar>& gkz,
+    const DeviceBuffer<scalar>& gox,
+    const DeviceBuffer<scalar>& goy,
+    const DeviceBuffer<scalar>& goz,
+    const DeviceBuffer<scalar>& F1,
+    scalar nu,
+    const KOmegaSSTCoeffs& co,
+    DeviceBuffer<scalar>& F1b)
+{
+    static const bool on = std::getenv("BRAE_SST_F1_PATCH") != nullptr;
+    const int nB = static_cast<int>(F1b.size());
+    if (!on || nB == 0) return;
+    f1PatchK<<<nBlocks(nB), TPB>>>(nB, dbK.bcType.data(), dbOmega.bcType.data(), dbOmega.faceCell.data(), kBnd.data(), omegaBnd.data(), yCell.data(), k.data(), omega.data(),
+                                   gkx.data(), gky.data(), gkz.data(), gox.data(), goy.data(), goz.data(),
+                                   dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), dbU.comp[0].deltaCoeffs.data(), F1.data(),
+                                   nu, co.betaStar, co.alphaOmega2, F1b.data());
+    cudaCheck(cudaGetLastError(), "F1 on the patch");
+}
+
 void deviceSSTNutBoundary(
     const DeviceVectorBoundary& dbU,
     const DeviceBuffer<scalar>& kBnd,
@@ -813,7 +907,8 @@ void deviceCellLimitGradU(
     DeviceBuffer<scalar>& gradU,
     scalar kc,
     const DeviceCyclic* cyc,
-    const DeviceAMI* ami)
+    const DeviceAMI* ami,
+    const DeviceBuffer<scalar>* const* UbStored)
 {
     const int nC = dm.nCells;
     const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
@@ -831,7 +926,8 @@ void deviceCellLimitGradU(
         cudaMemcpyAsync(gy.data(), gradU.data()+(std::size_t)(3+j)*nC, nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         cudaMemcpyAsync(gz.data(), gradU.data()+(std::size_t)(6+j)*nC, nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         DeviceBuffer<scalar> ubv;
-        deviceBCValue(dbU.comp[j], *U[j], ubv);
+        if (UbStored) deviceCopy(ubv, *UbStored[j]);
+        else deviceBCValue(dbU.comp[j], *U[j], ubv);
         // The coupled patches join the limiter's range, exactly as in the momentum predictor -- an
         // interface cell limited as if the interface were not there is the defect this whole path
         // turned on. See CellLimitInterface.
@@ -909,7 +1005,8 @@ void deviceKOmegaSSTCorrect(
     scalar nu,
     scalar relaxOmega,
     scalar relaxK,
-    scalar tol,
+    const ScalarStopRule& kStop,
+    const ScalarStopRule& omegaStop,
     bool bounded,
     bool boundedEps,   // div(phi,epsilon|omega) `bounded`; `bounded` above is div(phi,k)'s
     bool limitedK,
@@ -917,7 +1014,6 @@ void deviceKOmegaSSTCorrect(
     scalar twoBykK,
     scalar twoBykOmega,
     const KOmegaSSTCoeffs& co,
-    scalar relTolKE,
     int keCheckEvery,
     bool linearUpwindK,
     bool linearUpwindOmega,
@@ -943,7 +1039,7 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<scalar>* rhoBnd,    // compressible: rho at boundary faces, for the volumetric flux
     const DeviceBuffer<scalar>* nutBnd,    // nut at boundary FACES -> DkEff/DomegaEff(patchi), as OF's laplacian uses
     const DeviceBuffer<scalar>* muBnd,
-    scalar gradScalarLimitK,
+    const TurbScalarGradLimits& gradLim,
     const DeviceBuffer<label>*  fvoKMask,
     const DeviceBuffer<scalar>* fvoKVal,
     const DeviceBuffer<label>*  fvoEMask,
@@ -952,6 +1048,7 @@ void deviceKOmegaSSTCorrect(
     int nSweeps,                             // solvers/<field>/nSweeps; see the declaration
     bool gsSymmetric)
 {
+    requireTurbGradLimits(gradLim, "deviceKOmegaSSTCorrect");
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
     DeviceBuffer<scalar> gradU;
@@ -990,7 +1087,7 @@ void deviceKOmegaSSTCorrect(
         const int nB = static_cast<int>(phiBnd.size());
         DeviceBuffer<scalar> phiVolBnd;
         phiVolBnd.resize(nB);
-        nuFromMuRhoK<<<nBlocks(nB), TPB>>>(nB, phiBnd.data(), rhoBnd->data(), phiVolBnd.data());
+        if (nB > 0) nuFromMuRhoK<<<nBlocks(nB), TPB>>>(nB, phiBnd.data(), rhoBnd->data(), phiVolBnd.data());
         cudaCheck(cudaGetLastError(), "phiVolBnd");
         deviceDiv(dm, phiVolInt, phiVolBnd, divU);
         if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
@@ -1003,6 +1100,13 @@ void deviceKOmegaSSTCorrect(
     DeviceBuffer<scalar> S2;
     deviceS2(gradU, nC, S2);
 
+    // omega's patches as the last evaluate left them. updateCoeffs below writes the wall cells and nothing evaluates after it, so
+    // grad(omega) in CDkOmega reads the OLD value on a zeroGradient or symmetry face beside a wall cell and the new one on the wall
+    // function's own (the mirror's omegaBndLast, kOmegaSST.cu). MEASURED (JUPITER job 2647231, 10,112 cells): CDkOmega 10.58 in
+    // OpenFOAM and 5.40 here at a wall cell with a symmetry face, then k 3.05e-09 and omega 5.98e-11 after one iteration, which a
+    // 30-iteration history took to Ux 1.5e-03. BRAE_CONTROL_SST_OMEGA_LIVE=1 reads the new cell on every face.
+    DeviceBuffer<scalar> obvStored;
+    deviceBCValue(dbOmega, omega, obvStored);
     // omega wall function FIRST (OF updateCoeffs before CDkOmega): omega0/G0, override omega & G at wall cells, so
     // grad(omega)/CDkOmega/F1/F2 and the reaction all see the wall-corrected omega (matches kOmegaSSTBase::correct).
     DeviceBuffer<scalar> omega0, G0;
@@ -1011,14 +1115,35 @@ void deviceKOmegaSSTCorrect(
                                           wall.wallW.size() ? wall.wallW.data() : nullptr);
 
     // CDkOmega from grad(k), grad(omega); F1, F2.
+    //
+    // EACH GRADIENT THROUGH ITS OWN gradSchemes ENTRY: CDkOmega is (2*alphaOmega2)*(fvc::grad(k_) & fvc::grad(omega_))/omega_
+    // (kOmegaSSTBase.C:557) and fvc::grad resolves grad(k) and grad(omega) by name, falling back to `default`. These were plain
+    // Gauss linear whatever the case said. MEASURED on the coarse motorBike, cold, every solve tight (Arrhenius job 4860833):
+    // with `grad(k) cellLimited Gauss linear 1; grad(omega) cellLimited Gauss linear 1;` brae's fields were bit-identical to
+    // the case without them, while OpenFOAM's omega moved 3.4e-02 and k 6.1e-03 at iteration 1; without the entries the two
+    // codes agree to 1.9e-13. cellLimitedGrad then evaluates the gradient's patch values from the LIMITED cell gradient
+    // (cellLimitedGrad.C, correctBoundaryConditions after limitGradient), which is what F1's patch half reads below.
+    // The coupled faces of a cyclic or AMI are in neither the sum nor the limiter's range here, as before: an open gap of
+    // its own, recorded in docs/solvers/simplefoam.md, not part of this change.
+    const scalar kCdLimit = turbGradControl().cd ? scalar(0) : gradLim.kField;
+    const scalar oCdLimit = turbGradControl().cd ? scalar(0) : gradLim.eField;
     DeviceBuffer<scalar> kbv;
     deviceBCValue(dbK, k, kbv);
     DeviceBuffer<scalar> kgx, kgy, kgz;
     deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
+    if (kCdLimit > scalar(0)) deviceCellLimitGrad(dm, k, kbv, kgx, kgy, kgz, kCdLimit, nullptr, 0);
     DeviceBuffer<scalar> obv;
     deviceBCValue(dbOmega, omega, obv);
+    static const bool omegaLive = std::getenv("BRAE_CONTROL_SST_OMEGA_LIVE") != nullptr;
+    if (!omegaLive) deviceBCKeepStored(dbOmega, obvStored, obv);
     DeviceBuffer<scalar> ogx, ogy, ogz;
     deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
+    if (oCdLimit > scalar(0)) deviceCellLimitGrad(dm, omega, obv, ogx, ogy, ogz, oCdLimit, nullptr, 0);
+    if (stageDumpActive() && stageDumpFirstOnly("sstGradKOmega"))
+    {
+        stageDump3("stage_sstGradKfield", kgx, kgy, kgz);
+        stageDump3("stage_sstGradOmega", ogx, ogy, ogz);
+    }
     DeviceBuffer<scalar> CD;
     deviceCDkOmega(kgx, kgy, kgz, ogx, ogy, ogz, omega, co.alphaOmega2, CD);
     DeviceBuffer<scalar> F1;
@@ -1076,6 +1201,13 @@ void deviceKOmegaSSTCorrect(
         F1b.resize(nB);
         gatherCellToFaceK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), F1.data(), F1b.data());
         cudaCheck(cudaGetLastError(), "F1b");
+        if (!rho && !gammaIntEff) deviceF1OnPatch(dbK, dbOmega, dbU, kbv, obv, y, k, omega, kgx, kgy, kgz, ogx, ogy, ogz, F1, nu, co, F1b);
+        if (stageDumpActive() && stageDumpFirstOnly("sstF1b"))
+        {
+            stageDump("stage_sstF1", F1);
+            stageDump("stage_sstF1b", F1b);
+            stageDump("stage_sstCD", CD);
+        }
         DomB.resize(nB); DkB.resize(nB);
         deviceDEff(F1b, *nutBnd, co.alphaOmega1, co.alphaOmega2, rho ? scalar(0) : nu, DomB);
         deviceDEff(F1b, *nutBnd, co.alphaK1,     co.alphaK2,     rho ? scalar(0) : nu, DkB);
@@ -1085,33 +1217,46 @@ void deviceKOmegaSSTCorrect(
             scaleDEffCompressible(*rhoBnd, *muBnd, DkB);
         }
     }
+    // linearUpwind.C:94 grads vf.component(cmpt), whose patches are copies of the stored values, and correctedSnGrad.C:52 reads vf's:
+    // the wall cells above changed and nothing evaluated, so this gradient reads what CDkOmega's did. MEASURED (pitzDailySST cold, tight,
+    // job 4844884): a live zeroGradient outlet at the wall corner put the outlet column 0.18% out in iteration 1, U and p still 1e-13.
+    static const bool gradLive = std::getenv("BRAE_CONTROL_TURB_GRAD_LIVE") != nullptr;
+    const bool luStored = !gradLive && !omegaLive;
+    // omega's own equation sets what it can reach: solvers/common/solution_health.cuh.
+    secondFieldLimit().limit = std::max(deviceFixedFaceMax(dbOmega, obv), std::sqrt(std::max(co.gamma1 / co.beta1, co.gamma2 / co.beta2) * deviceFieldMax(S2)));
+    // grad(k) and grad(omega) as the two equations take them: the corrected laplacian's non-orthogonal correction
+    // (correctedSnGrad.C:52-55) and limitedLinear's limiter (LimitedScheme.C:56). Both ran unlimited; the linearUpwind
+    // each div entry names is its own slot, and omega's used to be k's.
+    const scalar kEqnGradLimit = turbGradControl().eqn ? scalar(0) : gradLim.kField;
+    const scalar oEqnGradLimit = turbGradControl().eqn ? scalar(0) : gradLim.eField;
     deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divPhi, boundedEps, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
-                               relaxOmega, tol, relTolKE, keCheckEvery, gsEps,
+                               relaxOmega, omegaStop, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src, rho); },
-                               &wall, &omega0, ami, cyc, sDdt, DomB.size() ? &DomB : nullptr, gradScalarLimitK,
+                               &wall, &omega0, ami, cyc, sDdt, DomB.size() ? &DomB : nullptr, gradLim.eLU,
                                true, fvoEMask, fvoEVal,
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.omegaMin);
-    deviceBoundField(dm, omega, co.omegaMin, "omega", &dbOmega);   // OF bound(omega_, omegaMin_)
+                               /*boundFloor*/co.omegaMin, oEqnGradLimit, luStored ? &obv : nullptr);
+
+    // deviceSolveScalarTransport just bound omega, as it binds every transported field here: a second bound would find
+    // nothing below the floor and forget bound.C:59's patch half (deviceBoundCap).
 
     // k equation (loose solve)
     DeviceBuffer<scalar> DkEff;
     deviceDEff(F1, nut, co.alphaK1, co.alphaK2, rho ? scalar(0) : nu, DkEff);
     if (rho && muLam) scaleDEffCompressible(*rho, *muLam, DkEff);
     deviceSolveScalarTransport(dm, dbK, k, "k", DkEff, phiInt, phiBnd, divPhi, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
-                               relaxK, tol, relTolKE, keCheckEvery, gsK,
+                               relaxK, kStop, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff, des ? &FDES : nullptr, rho); },
-                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK,
+                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradLim.kLU,
                                true, fvoKMask, fvoKVal,
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.kMin);
-    deviceBoundField(dm, k, co.kMin, "k", &dbK);   // OF bound(k_, kMin_)
+                               /*boundFloor*/co.kMin, kEqnGradLimit);
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
     //
@@ -1467,6 +1612,9 @@ void deviceKOmegaSSTLMCorrect(
     bool gsSymmetric)
 {
     const int nC = dm.nCells;
+    // ReThetat and gammaInt solve under the pair's tolerance and relTol that the caller hands in, not their own
+    // entries, and at the old cap: a known gap (kUnreadEntryMaxIter). The colour rule does not take this model.
+    const ScalarStopRule transitionStop{tol, relTolKE, kUnreadEntryMaxIter, 0};
     const LMCoeffs lm;
     DeviceBuffer<scalar> gradU;
     deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);
@@ -1481,14 +1629,13 @@ void deviceKOmegaSSTLMCorrect(
     DeviceBuffer<scalar> DRe(nC);
     lmReDiffKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), lm.sigmaThetat, nu, DRe.data());   // sigmaThetat*(nut+nu)
     deviceSolveScalarTransport(dm, dbReThetat, ReThetat, "ReThetat", DRe, phiInt, phiBnd, divU, bounded, limitedLinear, linearUpwind, nonOrth, 2.0,
-                               relax, tol, relTolKE, keCheckEvery, gsEps,
+                               relax, transitionStop, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spR.data(), suR.data(), diag.data(), src.data()); },
                                nullptr, nullptr, ami, cyc, reDdt, /*DBnd*/nullptr, /*gradLimitK*/0.0,
                                /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric,
                                /*boundFloor*/scalar(0.0));
-    deviceBoundField(dm, ReThetat, 0.0, "ReThetat", &dbReThetat);
 
     // gammaInt: DgammaIntEff = nut+nu; reaction = Pgamma+Egamma - Sp(ce1*Pgamma+ce2*Egamma).
     DeviceBuffer<scalar> spG(nC), suG(nC);
@@ -1498,14 +1645,13 @@ void deviceKOmegaSSTLMCorrect(
     DeviceBuffer<scalar> DgI(nC);
     depsKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), 1.0, nu, DgI.data());   // nut/1 + nu
     deviceSolveScalarTransport(dm, dbGammaInt, gammaInt, "gammaInt", DgI, phiInt, phiBnd, divU, bounded, limitedLinear, linearUpwind, nonOrth, 2.0,
-                               relax, tol, relTolKE, keCheckEvery, gsEps,
+                               relax, transitionStop, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spG.data(), suG.data(), diag.data(), src.data()); },
                                nullptr, nullptr, ami, cyc, giDdt, /*DBnd*/nullptr, /*gradLimitK*/0.0,
                                /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric,
                                /*boundFloor*/scalar(0.0));
-    deviceBoundField(dm, gammaInt, 0.0, "gammaInt", &dbGammaInt);
     gammaIntEff.resize(nC);
     lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
         y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, LM_SMALL, gammaIntEff.data());

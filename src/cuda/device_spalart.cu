@@ -372,12 +372,11 @@ void deviceSpalartAllmarasCorrect(
     const DeviceBuffer<scalar>& phiBnd,
     scalar nu,
     scalar relax,
-    scalar tol,
+    const ScalarStopRule& stop,
     bool bounded,
     bool limited,
     scalar twoByk,
     const SpalartAllmarasCoeffs& co,
-    scalar relTol,
     int checkEvery,
     bool linearUpwind,
     bool nonOrth,
@@ -393,7 +392,10 @@ void deviceSpalartAllmarasCorrect(
     const DeviceBuffer<scalar>* wallN,
     scalar gradULimitK,   // OF `grad(U)` cellLimited coefficient; see the declaration
     int nSweeps,          // solvers/nuTilda/nSweeps; see the declaration
-    bool gsSymmetric)
+    bool gsSymmetric,
+    scalar gradNuTildaLULimitK,    // see the declaration
+    scalar gradNuTildaLapLimitK,
+    bool releaseGradUMemo)   // see the declaration
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
@@ -402,6 +404,13 @@ void deviceSpalartAllmarasCorrect(
     // to the TENSOR, as cellLimitedGrad does, so Omega, Stilda and the DES/IDDES length scales all see
     // the same gradient OpenFOAM built them from.
     if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK);
+    // deviceGradU above was this call's one reader of the shared memo, and the caller's next is a new U. Its nine
+    // cell fields back in the pool here serve the solve's temporaries, which set the turbulence phase's peak (the
+    // class census on boxy5 at 4.94 M cells: the memo was nine of the 40 MiB class's blocks alive there).
+    if (releaseGradUMemo)
+    {
+        deviceGradUSharedRelease(dm);
+    }
     // SA-DDES/IDDES: replace the wall distance y with the DES length scale dTilda in the SA length-scale terms (Stilda,
     // fw, destruction). des==false (RANS) -> dScale aliases y, so the model is byte-for-byte the standard SA. iddes uses
     // the improved (WMLES) length scale (needs hmax = maxDeltaxyz); otherwise the plain DDES cubeRootVol limiter.
@@ -473,6 +482,11 @@ void deviceSpalartAllmarasCorrect(
     deviceGaussGrad(dm, nuTilda, nbv, gnx, gny, gnz);
     DeviceBuffer<scalar> gradNt2(static_cast<std::size_t>(nC));
     saMagSqrKernel<<<nBlocks(nC), TPB>>>(nC, gnx.data(), gny.data(), gnz.data(), gradNt2.data());
+    // grad(nuTilda) has no reader past |grad nuTilda|^2. Back in the pool here, its three cell fields serve the
+    // solve's own temporaries, which set the turbulence phase's peak (BRAE_POOL_STATS class census, boxy5 4.94 M).
+    gnx.resize(0);
+    gny.resize(0);
+    gnz.resize(0);
     if (const char* sapath = std::getenv("BRAE_DUMP_SA"))   // cell-level SA-term dump (vs OF reference) -- first call only
     {
         static bool saDumped = false;
@@ -498,6 +512,9 @@ void deviceSpalartAllmarasCorrect(
             std::fprintf(stderr, "[BRAE_DUMP_SA] wrote %d cells to %s\n", nC, sapath);
         }
     }
+    // ...and the gradU tensor: Stilda, the DES length scales and the dump above were its last readers, and the
+    // reaction below reads Stilda and fw instead. Nine cell fields in one block, idle through the solve.
+    gradU.resize(0);
     DeviceBuffer<scalar> D(static_cast<std::size_t>(nC));
     saDEffKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.sigmaNut, D.data());
     DeviceBuffer<scalar> divU;
@@ -525,19 +542,21 @@ void deviceSpalartAllmarasCorrect(
         cudaCheck(cudaGetLastError(), "SA DEff boundary");
     }
     deviceSolveScalarTransport(dm, dbNuTilda, nuTilda, "nuTilda", D, phiInt, phiBnd, divU, bounded, limited, linearUpwind, nonOrth, twoByk,
-                               relax, tol, relTol, checkEvery, gsK,
+                               relax, stop, checkEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    saReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), nuTilda.data(), Stilda.data(),
                                        fw.data(), dScale.data(), gradNt2.data(), co, diag.data(), src.data()); },
                                nullptr, nullptr, ami, cyc, ntDdt, DB.size() ? &DB : nullptr,
-                               // gradLimitK 0, boundPositive true (nuTilda is positive-definite), no
-                               // fvOptions set-values, no limiter override, Jacobi, then the case's own
-                               // smoothSolver sweep count.
-                               /*gradLimitK*/0.0, /*boundPositive*/true,
+                               // the case's linearUpwind gradient limiter, boundPositive true (nuTilda is
+                               // positive-definite), no fvOptions set-values, no limiter override, Jacobi,
+                               // the case's own smoothSolver sweep count, and grad(nuTilda)'s limiter for the
+                               // non-orthogonal correction and, since 2026-11-03, limitedLinear's limiter too
+                               // (LimitedScheme.C:56 takes the same grad(nuTilda) entry).
+                               gradNuTildaLULimitK, /*boundPositive*/true,
                                /*fvoSetMask*/nullptr, /*fvoSetVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/scalar(0.0));
+                               /*boundFloor*/scalar(0.0), gradNuTildaLapLimitK);
     // deviceSolveScalarTransport already bounds to 1e-15 (~ bound(nuTilda, 0)). correctNut: nut = nuTilda*fv1(new).
     saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.Cv1, nut.data());
     cudaCheck(cudaGetLastError(), "SA correctNut");
