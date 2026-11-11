@@ -5130,8 +5130,10 @@ RunReport runInterFoamDevice(
         if (adjustPhiSync || adjustPhiHostSum || fvp.empty()) return false;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            // adjustPhi's deferred sums cover the PHYSICAL boundary only: a coupled patch (processor included)
-            // takes the host route, whose global reductions keep every rank's decision identical.
+            // adjustPhi sums the PHYSICAL boundary only (adjustPhi.C:87-95 skips coupled patches): a processor patch is
+            // left out of the queued sums below, which are global (the device-resident reductions under -parallel),
+            // as the host route's pg::sum makes its own. Any other coupled patch takes the host route.
+            if (isProcessorType(fvp[pi].type)) continue;
             if (fvp[pi].type == "empty" || isCoupledType(fvp[pi].type)) return false;
             const fvPatchField<vector>* up = f.U.boundary[pi].get();
             if (!up || !up->fixesValue() || dynamic_cast<const InletOutletPatchField<vector>*>(up)) return false;
@@ -5141,6 +5143,7 @@ RunReport runInterFoamDevice(
     constexpr int adjustPhiMaxQueued = 64;
     DeviceBuffer<scalar> dAdjustRecord(3*static_cast<std::size_t>(adjustPhiMaxQueued));
     int adjustPhiQueued = 0;
+    DeviceBuffer<scalar> dAdjustPhys;      // the physical part of the boundary flux on a decomposed mesh
     const auto adjustPhiFlush = [&]()
     {
         if (adjustPhiQueued == 0) return;
@@ -5179,8 +5182,22 @@ RunReport runInterFoamDevice(
             if (adjustPhiQueued == adjustPhiMaxQueued) adjustPhiFlush();
             scalar* rec = dAdjustRecord.data() + 3*static_cast<std::size_t>(adjustPhiQueued++);
             deviceSumMagInto(phiHI, rec);
-            deviceSumMagInto(phiHB, rec + 1);
-            deviceDotInto(phiHB, deviceOnes(static_cast<int>(phiHB.size())), rec + 2);
+            // the physical boundary: the processor faces are the boundary array's tail (from bndStart)
+            const DeviceBuffer<scalar>* phys = &phiHB;
+            if (procCtx && procCtx->nFaces() > 0)
+            {
+                const std::size_t nPhys = static_cast<std::size_t>(procCtx->bndStart());
+                dAdjustPhys.resize(nPhys);
+                if (nPhys > 0)
+                {
+                    cudaCheck(cudaMemcpyAsync(dAdjustPhys.data(), phiHB.data(), nPhys*sizeof(scalar),
+                                              cudaMemcpyDeviceToDevice, cudaStreamPerThread),
+                              "adjustPhi: the physical boundary flux");
+                }
+                phys = &dAdjustPhys;
+            }
+            deviceSumMagInto(*phys, rec + 1);
+            deviceDotInto(*phys, deviceOnes(static_cast<int>(phys->size())), rec + 2);
             return;
         }
         SurfaceScalarField ph;
