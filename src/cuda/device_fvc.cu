@@ -613,6 +613,111 @@ void deviceLeastSquaresGradFused(const DeviceMesh& dm, int n,
 }
 
 
+namespace {
+// THE FACE VALUES FIRST, ONE 32-BYTE RECORD A FACE (BRAE_CONTROL_GRAD_UNPACKED=1 keeps the one-kernel form).
+// gradKernel visits every internal face twice (once from each cell) and each visit read nine scattered 8-byte values
+// -- w, own, nei, two cell values, three Sf components, the merge's losort -- each a 32-byte sector of which one
+// double is used. nsys on the G4 tank at 8 ranks of 310,000 cells: 17 launches a step at 423 us, 13% of the GPU's
+// time and the second largest kernel after the AMG products; its bytes (about 860 per cell) at the card's bandwidth
+// are that time. The face value lambda*(P - N) + N does not depend on which cell asks, so one coalesced pass makes
+// {Sfx, Sfy, Sfz, face value} for every face and the cell pass reads ONE record per visit.
+// Bit-identical: the same expression for the face value (same contraction), the same products added in the same
+// order; only where the operands come from changed.
+struct alignas(32) GradFaceRecord
+{
+    scalar x, y, z, pf;
+};
+
+__global__
+void gradFaceRecordKernel(
+    int nF,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ Sfx,
+    const scalar* __restrict__ Sfy,
+    const scalar* __restrict__ Sfz,
+    const scalar* __restrict__ vol,
+    GradFaceRecord* __restrict__ rec,
+    const int* __restrict__ skipIf)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nF) return;
+    if (skipIf && *skipIf) return;
+    GradFaceRecord r;
+    r.x = Sfx[f];
+    r.y = Sfy[f];
+    r.z = Sfz[f];
+    r.pf = w[f] * (vol[own[f]] - vol[nei[f]]) + vol[nei[f]];
+    rec[f] = r;
+}
+
+__global__
+void gradRecordKernel(
+    int nC,
+    const GradFaceRecord* __restrict__ rec,
+    const scalar* __restrict__ Sfx,
+    const scalar* __restrict__ Sfy,
+    const scalar* __restrict__ Sfz,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ bndCellStart,
+    const label* __restrict__ bndPerm,
+    const label* __restrict__ bndGFace,
+    const label* __restrict__ bndIsEmpty,
+    const scalar* __restrict__ bval,
+    const scalar* __restrict__ V,
+    scalar* __restrict__ gx,
+    scalar* __restrict__ gy,
+    scalar* __restrict__ gz,
+    const int* __restrict__ skipIf)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    if (skipIf && *skipIf) return;
+    scalar sx = 0.0, sy = 0.0, sz = 0.0;
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
+    {
+        const bool takeOwner = (kn >= knEnd) || (fo < foEnd && fo < losort[kn]);
+        const int f = takeOwner ? fo : losort[kn];
+        const GradFaceRecord q = rec[f];
+        if (takeOwner)
+        {
+            sx += q.x * q.pf;
+            sy += q.y * q.pf;
+            sz += q.z * q.pf;
+            ++fo;
+        }
+        else
+        {
+            sx -= q.x * q.pf;
+            sy -= q.y * q.pf;
+            sz -= q.z * q.pf;
+            ++kn;
+        }
+    }
+    for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)   // +boundary, as gradKernel
+    {
+        const int kk = bndPerm[k];
+        if (bndIsEmpty[kk]) continue;
+        const int f = bndGFace[kk];
+        const scalar pv = bval[kk];
+        sx += Sfx[f] * pv;
+        sy += Sfy[f] * pv;
+        sz += Sfz[f] * pv;
+    }
+    gx[c] = sx / V[c];
+    gy[c] = sy / V[c];
+    gz[c] = sz / V[c];
+}
+} // namespace
+
+
 void deviceGaussGrad(
     const DeviceMesh& dm,
     const DeviceBuffer<scalar>& vol,
@@ -625,6 +730,22 @@ void deviceGaussGrad(
     resizeCellBuffer(gx, dm);   // gradients are read across a processor face: halo capacity
     resizeCellBuffer(gy, dm);
     resizeCellBuffer(gz, dm);
+    const bool unpacked = std::getenv("BRAE_CONTROL_GRAD_UNPACKED") != nullptr;   // read each call: a test toggles it
+    if (!unpacked && dm.nInternalFaces > 0)
+    {
+        DeviceBuffer<scalar> recBuf(static_cast<std::size_t>(dm.nInternalFaces)*4);
+        GradFaceRecord* rec = reinterpret_cast<GradFaceRecord*>(recBuf.data());
+        gradFaceRecordKernel<<<nBlocks(dm.nInternalFaces), TPB>>>(
+            dm.nInternalFaces, dm.owner.data(), dm.nei.data(), dm.w.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+            vol.data(), rec, skipIf);
+        gradRecordKernel<<<nBlocks(dm.nCells), TPB>>>(
+            dm.nCells, rec, dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+            dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
+            dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(), bval.data(),
+            dm.V.data(), gx.data(), gy.data(), gz.data(), skipIf);
+        cudaCheck(cudaGetLastError(), "gaussGrad");
+        return;
+    }
     gradKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.owner.data(), dm.nei.data(), dm.w.data(),
                                             dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), vol.data(),
                                             dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
