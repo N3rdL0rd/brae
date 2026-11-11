@@ -218,7 +218,7 @@ int main(int argc, char** argv)
         std::unique_ptr<ProcComm> comm = std::move(comms.at(0));
         g_comm = comm.get();
         ProcComm::setCurrent(comm.get());
-        if (argc < 2) { if (comm->isMaster()) std::printf("usage: test_dist_solvers_oracle <dump dir> [<monolithic dump dir>]\n"); Pstream::finalize(); return 77; }
+        if (argc < 2) { if (comm->isMaster()) std::printf("usage: test_dist_solvers_oracle <dump dir> [<monolithic dump dir>]\n"); ProcComm::setCurrent(nullptr); comm.reset(); Pstream::finalize(); return 77; }
         const std::string dir = argv[1];
         const int np = comm->size(), rank = comm->rank();
         RankData d;
@@ -228,6 +228,9 @@ int main(int argc, char** argv)
         if (hv < 1)
         {
             if (comm->isMaster()) std::printf("SKIP: no exported dump for %d ranks in %s\n", np, dir.c_str());
+            // torn down as the normal end is: a communicator that outlives MPI_Finalize aborts in MPI_Test
+            ProcComm::setCurrent(nullptr);
+            comm.reset();
             Pstream::finalize();
             return 77;
         }
