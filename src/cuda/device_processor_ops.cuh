@@ -118,6 +118,13 @@ inline DeviceProcView DeviceProcCtx::interfaceView() const
     v.nbrIdx = dp_->cyc.nbrCell.data();
     v.coeff = dp_->cyc.ifCoeff.data();
     v.rank = dp_->cyc.ifRank.data();
+    if (dp_->cyc.nIfCells > 0 && !std::getenv("BRAE_CONTROL_PROC_PER_PLACE_LAUNCH"))
+    {
+        v.nCellsWith = dp_->cyc.nIfCells;
+        v.cellList = dp_->cyc.ifCellList.data();
+        v.cellStart = dp_->cyc.ifCellStart.data();
+        v.perm = dp_->cyc.ifPerm.data();
+    }
     v.nRanks = dp_->cyc.nIfRanks;
     v.nGlobalCells = globalCells_;
     return v;

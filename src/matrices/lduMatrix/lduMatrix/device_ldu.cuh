@@ -44,6 +44,13 @@ struct DeviceProcView
     const label*  nbrIdx = nullptr;     // [nFaces] nC + halo slot of face i's neighbour cell
     const scalar* coeff = nullptr;      // [nFaces] see above
     const label*  rank = nullptr;       // [nFaces] place among the cell's processor faces (null: one launch)
+    // The same faces by owner cell, for ONE launch instead of one a place: nCellsWith cells (ascending) own faces; cell
+    // cellList[i]'s faces are perm[cellStart[c] .. cellStart[c+1]) in face order, which is the order the per-place launches
+    // reach them in. Null: the per-place launches.
+    int           nCellsWith = 0;
+    const label*  cellList = nullptr;
+    const label*  cellStart = nullptr;
+    const label*  perm = nullptr;
     int nRanks = 1;
     // Grouped launch plan, built with the interface: faces of pass p occupy the contiguous range
     // [passFirst[p], passFirst[p+1]) of a pass-permuted copy of the face arrays. Null = legacy full-face filter.

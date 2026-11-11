@@ -259,10 +259,67 @@ void procRhsKernel(
     bEff[faceCell[i]] = __dsub_rn(bEff[faceCell[i]], __dmul_rn(coeff[i], x[nbrIdx[i]]));
 }
 
-template <class Kernel>
-inline void launchProcFaces(Kernel k, const DeviceProcView& p, const scalar* x, scalar* y)
+// THE SAME THREE PRODUCTS IN ONE LAUNCH (DeviceProcView::cellList): one thread a cell that owns processor faces, which
+// walks its faces in face order -- the order the launches a place reach them in, so every cell's additions are the
+// same operations in the same sequence, to the bit (BRAE_CONTROL_PROC_PER_PLACE_LAUNCH=1 keeps the launches a place).
+// A cell has up to nRanks faces and a rank usually has seven neighbours: seven launches of 2 us each, and their
+// dependency gaps, per product, in a latency-bound iteration.
+__global__
+void procAmulFusedKernel(
+    int nCellsWith,
+    const label* __restrict__ cellList,
+    const label* __restrict__ cellStart,
+    const label* __restrict__ perm,
+    const label* __restrict__ nbrIdx,
+    const scalar* __restrict__ coeff,
+    const scalar* __restrict__ x,
+    scalar* __restrict__ Apsi)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nCellsWith) return;
+    const label c = cellList[i];
+    scalar s = Apsi[c];
+    for (label k = cellStart[c]; k < cellStart[c + 1]; ++k)
+    {
+        const label j = perm[k];
+        s += coeff[j] * x[nbrIdx[j]];
+    }
+    Apsi[c] = s;
+}
+
+__global__
+void procSubFusedKernel(
+    int nCellsWith,
+    const label* __restrict__ cellList,
+    const label* __restrict__ cellStart,
+    const label* __restrict__ perm,
+    const label* __restrict__ nbrIdx,
+    const scalar* __restrict__ coeff,
+    const scalar* __restrict__ x,
+    scalar* __restrict__ y)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nCellsWith) return;
+    const label c = cellList[i];
+    scalar s = y[c];
+    for (label k = cellStart[c]; k < cellStart[c + 1]; ++k)
+    {
+        const label j = perm[k];
+        s = __dsub_rn(s, __dmul_rn(coeff[j], x[nbrIdx[j]]));
+    }
+    y[c] = s;
+}
+
+template <class Kernel, class Fused>
+inline void launchProcFaces(Kernel k, Fused fused, const DeviceProcView& p, const scalar* x, scalar* y)
 {
     if (p.nFaces <= 0) return;
+    if (p.cellList && p.nCellsWith > 0)
+    {
+        fused<<<(p.nCellsWith + TPB - 1)/TPB, TPB>>>(p.nCellsWith, p.cellList, p.cellStart, p.perm, p.nbrIdx, p.coeff, x, y);
+        cudaCheck(cudaGetLastError(), "proc interface, fused");
+        return;
+    }
     if (p.passStart && !std::getenv("BRAE_PROC_FULL_FACE_LAUNCH"))
     {
         // Stable pass-grouped arrays: the same faces in the same per-cell order as the filtered launch, but the
@@ -336,7 +393,7 @@ void deviceResidual(
         }
         cudaCheck(cudaGetLastError(), "amiResidual");
     }
-    if (A.proc.active()) launchProcFaces(procResidualKernel, A.proc, psi.data(), rA.data());
+    if (A.proc.active()) launchProcFaces(procResidualKernel, procSubFusedKernel, A.proc, psi.data(), rA.data());
 }
 
 
@@ -388,7 +445,7 @@ void amulImpl(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuf
         }
         cudaCheck(cudaGetLastError(), "amiAmul");
     }
-    if (A.proc.active()) launchProcFaces(procAmulKernel, A.proc, psi.data(), Apsi.data());
+    if (A.proc.active()) launchProcFaces(procAmulKernel, procAmulFusedKernel, A.proc, psi.data(), Apsi.data());
 }
 } // namespace
 
@@ -432,7 +489,7 @@ void deviceProcFrozenRhs(const DeviceLduView& A, const DeviceBuffer<scalar>& x, 
     if (A.nCells > 0)
         cudaCheck(cudaMemcpyAsync(bEff.data(), b.data(), (std::size_t)A.nCells*sizeof(scalar), cudaMemcpyDeviceToDevice,
                                   cudaStreamPerThread), "proc rhs copy");
-    if (A.proc.active()) launchProcFaces(procRhsKernel, A.proc, x.data(), bEff.data());
+    if (A.proc.active()) launchProcFaces(procRhsKernel, procSubFusedKernel, A.proc, x.data(), bEff.data());
 }
 
 } // namespace brae
