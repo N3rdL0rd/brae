@@ -14,7 +14,7 @@
 # and compares the two trees with compare_fields.py (mapped onto the global mesh through the processor addressing).
 # Both sides read the SAME files, so no linear solve and no limiter is involved: the numbers are operator differences.
 # The tolerance (maxrel, default 1e-11) is the exit status; the table is always printed.
-# env: ORACLE_ROOT (default /mnt/storage/brae-scratch/oracle; setup.sh builds it), OUT_ROOT, KEEP=1 keeps the trees.
+# env: ORACLE_ROOT (default /tmp/brae-oracle; setup.sh builds it), OUT_ROOT, KEEP=1 keeps the trees.
 set -eo pipefail
 BRAE=${1:?usage: stage_gate.sh <brae_interFoam> <case> <np> [method] [tol]}
 CASE=${2:?case}
@@ -22,7 +22,7 @@ NP=${3:?np}
 METHOD=${4:-scotch}
 TOL=${5:-1e-11}
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
-ORACLE_ROOT=${ORACLE_ROOT:-/mnt/storage/brae-scratch/oracle}
+ORACLE_ROOT=${ORACLE_ROOT:-/tmp/brae-oracle}
 OUT_ROOT=${OUT_ROOT:-/tmp/mgpu_stage}
 BRAE_STAGE_ALPHA_REQUESTED=${BRAE_STAGE_ALPHA:-0}
 CASE_LABEL=$(basename "$CASE")

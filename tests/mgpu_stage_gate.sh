@@ -10,7 +10,7 @@ BRAE=${1:?usage: $0 <brae_interFoam> [cases] [specs]}
 CASES=${2:-"tank tankGraded open"}
 SPECS=${3:-"1 2 2:simple 4 4:hier 8 8:simple 8:hier"}
 HERE=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
-export ORACLE_ROOT=${ORACLE_ROOT:-/mnt/storage/brae-scratch/oracle}
+export ORACLE_ROOT=${ORACLE_ROOT:-/tmp/brae-oracle}
 [ -f /usr/lib/openfoam/openfoam2606/etc/bashrc ] || { echo "SKIP: no OpenFOAM v2606"; exit 77; }
 [ -x "$ORACLE_ROOT/bin/dumpInterFoam" ] || { echo "SKIP: no $ORACLE_ROOT/bin/dumpInterFoam (tools/mgpu_oracle/setup.sh)"; exit 77; }
 grep -q stageDump "$ORACLE_ROOT/dumpInterFoam/interFoam.C" 2>/dev/null \

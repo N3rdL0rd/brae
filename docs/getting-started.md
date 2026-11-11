@@ -35,7 +35,7 @@ export PATH="$PWD/build:$PATH"
 | Blackwell (GB10, RTX 50-series, B200, B300) | 121 / 120 / 100 / 103 | the development targets; the full test suite runs on a GB10 |
 | Hopper (H100, GH200) | 90 | supported; measured in [performance](performance.md) |
 | Ada, Ampere (RTX 40/30, L40, A100) | 89 / 86 / 80 | built by CI for sm_80 and sm_90; same source |
-| Volta (V100) | 70 | builds with CUDA 12.x (compiled for `70` and for `"70;90;120"` with CUDA 12.9); an interFoam case has run on a V100 (2.48M cells, 0.49 s/step in a container, measured before the CUDA 12 graph solvers described below were enabled). Not part of CI |
+| Volta (V100) | 70 | builds with CUDA 12.x (compiled for `70` and for `"70;90;120"` with CUDA 12.9); a 2.48M-cell interFoam case runs on 1-8 V100s ([Multi-GPU](multi-gpu.md#performance)). Not part of CI |
 
 Nothing in brae needs sm_80 or newer: the thread-block-cluster reductions (sm_90+) compile to no-ops below Hopper and are
 never launched there.
@@ -58,7 +58,6 @@ Toolchain notes:
   `LD_LIBRARY_PATH=$CUDA_HOME/lib64`.
 - **NVSHMEM** was removed: the multi-GPU code uses ProcComm (MPI-host or NCCL); no NVSHMEM installation or CMake option remains
   (a DGX-1 has no NVSwitch, and its unlinked GPU pairs cannot use it). See [Multi-GPU](multi-gpu.md).
-- A ready-made V100 benchmark (old build against new build on the tank case) is in `tools/bench_v100/`.
 
 ## 3. Run a case
 

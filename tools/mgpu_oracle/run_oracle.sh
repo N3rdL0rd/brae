@@ -14,7 +14,7 @@
 #        par_rec/         reconstructPar of par/ (global fields), for the self-test
 #        report.md        decomposition table + serial-vs-parallel error floors (compare_fields.py)
 #        log.*            every log
-#   env: TIGHT=1 (all linear solvers to 1e-12 / relTol 0, dir suffix _tight), ORACLE_ROOT (default /mnt/storage/brae-scratch/oracle; setup.sh builds it), OUT_ROOT (/tmp/mgpu_oracle),
+#   env: TIGHT=1 (all linear solvers to 1e-12 / relTol 0, dir suffix _tight), ORACLE_ROOT (default /tmp/brae-oracle; setup.sh builds it), OUT_ROOT (/tmp/mgpu_oracle),
 #        KEEP_DUMPS=1 keeps the per-step .dump fields (default: kept; set 0 to drop them after comparing)
 set -eo pipefail
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
@@ -22,7 +22,7 @@ CASE=${1:?usage: run_oracle.sh <case> <np> [method] [steps]}
 NP=${2:?np}
 METHOD=${3:-scotch}
 STEPS=${4:-20}
-ORACLE_ROOT=${ORACLE_ROOT:-/mnt/storage/brae-scratch/oracle}
+ORACLE_ROOT=${ORACLE_ROOT:-/tmp/brae-oracle}
 OUT_ROOT=${OUT_ROOT:-/tmp/mgpu_oracle}
 SUF=""; [ "$METHOD" = scotch ] || SUF="_$METHOD"
 [ "${TIGHT:-0}" = 1 ] && SUF="${SUF}_tight"

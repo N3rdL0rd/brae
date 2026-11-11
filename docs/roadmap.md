@@ -37,11 +37,10 @@ Ordered by value against cost, not by ambition.
 
 - **Multi-GPU `interFoam`.** One case across up to 8 GPUs of one node, with OpenFOAM's own `-parallel` semantics
   (`decomposePar` output, processor patches, per-rank preconditioners, global reductions), validated against OpenFOAM
-  `-parallel`. The reader, processor-patch geometry (bit-identical to OpenFOAM), the communication layer (loopback,
-  MPI and NCCL backends), the distributed solvers, the per-rank writer, the function-object reductions, and the
-  operators, MULES and the pressure/momentum assembly across a processor face are in. A coarse G4-like case agrees
-  with OpenFOAM `-parallel` at np 2 and 4 with the ranks sharing one GPU; the full-size case, np 8 and a run on
-  distinct physical GPUs are not validated. Status, measurements, options and tools: [Multi-GPU](multi-gpu.md).
+  `-parallel` at np 1, 2 and 4 on a small case and against brae's own np 1 at np 8 on a 2.48M-cell case, where 8 V100s
+  take a step in 62 ms against 312 ms on one. Open: scaling beyond that (idle GPU time at collectives and host
+  read-backs), cyclic AMI and turbulence models across processor faces. Options, measurements and tools:
+  [Multi-GPU](multi-gpu.md).
 
 ## Not scheduled
 

@@ -10,7 +10,7 @@ work gates field by field against this.
   (`platforms/linux64GccDPInt32Opt`, `WM_MPLIB=SYSTEMOPENMPI`, `/usr/lib64/openmpi`): `interFoam`, `decomposePar`,
   `reconstructPar`, `blockMesh`, `setFields`, `topoSet`, `checkMesh` all run. **No headers, no `wmake`.**
 * `/tmp/OpenFOAM-v2606.tgz`: the matching v2606 source tree (api 2606, patch 0). `setup.sh` unpacks it to
-  `$ORACLE_ROOT` (default `/mnt/storage/brae-scratch/oracle`), points its `platforms/` at the installed binaries,
+  `$ORACLE_ROOT` (default `/tmp/brae-oracle`), points its `platforms/` at the installed binaries,
   builds `wmake`'s own tools, makes the `lnInclude` directories and builds `tools/dumpInterFoam` with `wmake` against
   the installed libraries (about 2 minutes). The installed `bashrc` is not used (it needs the missing `wmake`); the
   generated `$ORACLE_ROOT/of_env.sh` sources the source tree's and overrides `FOAM_USER_APPBIN` (the stock bashrc
@@ -42,7 +42,7 @@ tools/mgpu_oracle/setup.sh                          # once
 tools/mgpu_oracle/run_oracle.sh tankGraded 4        # scotch, 20 steps
 tools/mgpu_oracle/run_oracle.sh tank 8 simple       # simple (2 2 2): a DGX-1 cube
 TIGHT=1 tools/mgpu_oracle/run_oracle.sh open 8      # every linear solver to 1e-12, relTol 0
-OUT_ROOT=/mnt/storage/brae-scratch/x tools/mgpu_oracle/run_matrix.sh
+OUT_ROOT=/tmp/brae-oracle-runs tools/mgpu_oracle/run_matrix.sh
 tools/mgpu_oracle/selftest.sh
 ```
 

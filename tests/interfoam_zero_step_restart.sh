@@ -5,7 +5,7 @@
 # empty device buffer when the hook had never run, and the run died with a segfault.)
 # Also checks the neighbours: a restart that takes one step, and one that takes the rest of the run.
 #   tests/interfoam_zero_step_restart.sh <case dir with startFrom latestTime, adjustTimeStep yes> [brae_interFoam]
-# e.g. ~/code/sketches/g4_tank_refill_interfoam/case (first run to 0.008 takes ~30 s on an RTX 5090 laptop)
+# a short interFoam case run to a mid-run write time first
 set -uo pipefail
 CASE=$(cd "${1:?case dir}" && pwd)
 BRAE=${2:-$(cd "$(dirname "$0")/.." && pwd)/build/brae_interFoam}

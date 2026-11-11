@@ -2,12 +2,12 @@
 # One-time setup for the oracle: unpack the OpenFOAM v2606 SOURCE next to the installed v2606 binaries
 # (/usr/lib/openfoam/openfoam2606 ships binaries+libs only: no headers, no wmake) and build tools/dumpInterFoam
 # against the installed libraries.  Idempotent.  Everything lands under $ORACLE_ROOT (not in $HOME).
-#   ORACLE_ROOT   default /mnt/storage/brae-scratch/oracle     (OpenFOAM source tree + built dump tool)
+#   ORACLE_ROOT   default /tmp/brae-oracle     (OpenFOAM source tree + built dump tool)
 #   OF_TGZ        default /tmp/OpenFOAM-v2606.tgz              (ESI OpenFOAM-v2606 source release)
 #   OF_INSTALL    default /usr/lib/openfoam/openfoam2606
 set -eo pipefail
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
-ORACLE_ROOT=${ORACLE_ROOT:-/mnt/storage/brae-scratch/oracle}
+ORACLE_ROOT=${ORACLE_ROOT:-/tmp/brae-oracle}
 OF_TGZ=${OF_TGZ:-/tmp/OpenFOAM-v2606.tgz}
 OF_INSTALL=${OF_INSTALL:-/usr/lib/openfoam/openfoam2606}
 PLAT=linux64GccDPInt32Opt

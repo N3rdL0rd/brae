@@ -17,7 +17,7 @@ if [ -n "${BRAE_MGPU_TEARDOWN_CASE:-}" ]; then
     CASE=$BRAE_MGPU_TEARDOWN_CASE
 else
     [ -f /usr/lib/openfoam/openfoam2606/etc/bashrc ] || { echo "SKIP: no OpenFOAM v2606"; exit 77; }
-    [ -x "${ORACLE_ROOT:-/mnt/storage/brae-scratch/oracle}/bin/dumpInterFoam" ] || {
+    [ -x "${ORACLE_ROOT:-/tmp/brae-oracle}/bin/dumpInterFoam" ] || {
         echo "SKIP: no stage-dump oracle (set ORACLE_ROOT or BRAE_MGPU_TEARDOWN_CASE)"; exit 77; }
     OUT_ROOT=$OUT/setup KEEP=1 "$HERE/tools/mgpu_oracle/stage_gate.sh" "$BRAE" tank 8 scotch > "$OUT/setup.log" 2>&1 || {
         cat "$OUT/setup.log"; exit 1; }

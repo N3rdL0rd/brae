@@ -8,8 +8,8 @@
 #       nps      default "2 4 8"
 #       methods  default "scotch simple hier"        (system/decomposeParDict.<method><np>)
 #   env  ORACLE_ROOT  directory with of_env.sh and bin/dumpInterFoam built from tools/dumpInterFoam WITH procGeometryDump.H
-#                     (setup.sh builds it; default /mnt/storage/brae-scratch/oracle)
-#        OUT_ROOT     default /mnt/storage/brae-scratch/oracle_geometry (scratch; the run directories are removed after
+#                     (setup.sh builds it; default /tmp/brae-oracle)
+#        OUT_ROOT     default /tmp/brae-oracle_geometry (scratch; the run directories are removed after
 #                     a passing combination unless KEEP=1)
 #   one process per rank (mpirun --oversubscribe) on the one GPU; the brae side is
 #   BRAE_MGPU_GEOMETRY_ONLY=1 brae_interFoam -parallel, which couples the patches over ProcComm and stops.
@@ -19,8 +19,8 @@ BRAE=$(readlink -f "${1:?usage: proc_geometry_gate.sh <brae_interFoam> [cases] [
 CASES=${2:-"tank tankGraded open"}
 NPS=${3:-"2 4 8"}
 METHODS=${4:-"scotch simple hier"}
-ORACLE_ROOT=${ORACLE_ROOT:-/mnt/storage/brae-scratch/oracle}
-OUT_ROOT=${OUT_ROOT:-/mnt/storage/brae-scratch/oracle_geometry}
+ORACLE_ROOT=${ORACLE_ROOT:-/tmp/brae-oracle}
+OUT_ROOT=${OUT_ROOT:-/tmp/brae-oracle_geometry}
 [ -x "$BRAE" ] || { echo "no brae binary at $BRAE" >&2; exit 1; }
 [ -x "$ORACLE_ROOT/bin/dumpInterFoam" ] || { echo "SKIP: no $ORACLE_ROOT/bin/dumpInterFoam (tools/mgpu_oracle/setup.sh builds the OpenFOAM oracle)"; exit 77; }
 source "$ORACLE_ROOT/of_env.sh"

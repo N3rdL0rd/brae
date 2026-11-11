@@ -1,6 +1,6 @@
 # G4 tank mesh (2,483,933 cells) decomposePar statistics
 
-decomposePar -constant on ~/code/sketches/g4_tank_refill_interfoam/case/constant (mesh only), stats by decomp_stats.py. scotch is not deterministic from run to run (np=8: 28444 cut faces here, 27223 in another run).
+decomposePar -constant on the G4 tank-refill case (mesh only), stats by decomp_stats.py. scotch is not deterministic from run to run (np=8: 28444 cut faces here, 27223 in another run).
 
 ### scotch_2
 

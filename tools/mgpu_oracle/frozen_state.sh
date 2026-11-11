@@ -7,7 +7,7 @@
 #       case    tank | tankGraded | open       (tools/mgpu_oracle/cases/)
 #       np      1 | 2 | 4 | 8                  (np 1: no decomposition, the serial state itself)
 #       method  scotch | simple | hier         (system/decomposeParDict.<method><np>)
-#   -> $OUT_ROOT/<case>_np<N>[_<method>]/      OUT_ROOT default /mnt/storage/brae-scratch/frozen
+#   -> $OUT_ROOT/<case>_np<N>[_<method>]/      OUT_ROOT default /tmp/brae-frozen
 #        serial/        mesh + the serial run (dumpInterFoam, BRAE_STOP_ITER=steps); its last time is the state
 #        dec/           the decomposed case: system/, processorN/{constant, <time>}
 #        dec/postProcessing   OpenFOAM's function objects evaluated on that state (postProcess -parallel;
@@ -17,18 +17,17 @@
 #                       own output while it made ITS state dec_par/ (processor patch values = coupled ones)
 #        dec/<time>     reconstructPar of the state: equal to serial/<time> (the identity the writer gate builds on)
 #        TIME           the state's time name
-#   env: ORACLE_ROOT (the oracle's of_env.sh and bin/dumpInterFoam; default /mnt/storage/brae-scratch/oracleharness/of,
-#        else /mnt/storage/brae-scratch/oracle), FORMAT=ascii|binary (the decomposed fields; default the case's)
+#   env: ORACLE_ROOT (the oracle's of_env.sh and bin/dumpInterFoam; default /tmp/brae-oracle), FORMAT=ascii|binary (the decomposed fields; default the case's)
 set -eo pipefail
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 CASE=${1:?usage: frozen_state.sh <case> <np> [method] [steps]}
 NP=${2:?np}
 METHOD=${3:-scotch}
 STEPS=${4:-5}
-for r in "${ORACLE_ROOT:-}" /mnt/storage/brae-scratch/oracleharness/of /mnt/storage/brae-scratch/oracle; do
+for r in "${ORACLE_ROOT:-}" /tmp/brae-oracle; do
     [ -n "$r" ] && [ -f "$r/of_env.sh" ] && { ORACLE_ROOT=$r; break; }
 done
-OUT_ROOT=${OUT_ROOT:-/mnt/storage/brae-scratch/frozen}
+OUT_ROOT=${OUT_ROOT:-/tmp/brae-frozen}
 SUF=""; [ "$NP" = 1 ] || { SUF="_np$NP"; [ "$METHOD" = scotch ] || SUF="${SUF}_$METHOD"; }
 OUT=$OUT_ROOT/${CASE}${SUF:-_np1}
 [ -d "$HERE/cases/$CASE" ] || { echo "no case $CASE" >&2; exit 1; }
