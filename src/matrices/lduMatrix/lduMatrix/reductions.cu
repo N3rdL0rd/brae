@@ -340,16 +340,9 @@ scalar deviceMaxRatio(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>&
 
 void deviceCourantReductions(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar out[3])
 {
-    ProcComm* pc = globalComm();
-    if (!pc)
-    {
-        out[0] = deviceMaxRatio(x, y);
-        out[1] = deviceSumMag(x);
-        out[2] = deviceSumMag(y);
-        return;
-    }
     // Per loopback rank thread, like the other reduction scratch.
     thread_local auto& d3 = *new DeviceBuffer<scalar>(3);
+    ProcComm* pc = globalComm();
     const int n = static_cast<int>(x.size());
     cudaCheck(cudaMemsetAsync(d3.data(), 0, 3*sizeof(scalar), cudaStreamPerThread), "courant zero");
     // a rank without cells contributes the identities (0 for all three: the ratios are >= 0), and still joins
@@ -358,12 +351,17 @@ void deviceCourantReductions(const DeviceBuffer<scalar>& x, const DeviceBuffer<s
         maxRatioKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), d3.data(), n);
         cudaCheck(cudaGetLastError(), "courant maxratio");
     }
-    ++procHookCountsRef().reductions;
-    pc->allReduce(d3.data(), 1, ReduceOp::Max, cudaStreamPerThread, procChannel());
+    if (pc)
+    {
+        ++procHookCountsRef().reductions;
+        pc->allReduce(d3.data(), 1, ReduceOp::Max, cudaStreamPerThread, procChannel());
+    }
+    // The same kernels deviceSumMag runs, one read at the end for all three instead of one each (no communicator:
+    // the three results are what deviceMaxRatio, deviceSumMag(x) and deviceSumMag(y) return, to the bit)
     if (n > 0) deviceSumMagInto(x, d3.data() + 1);
-    else pc->allReduce(d3.data() + 1, 1, ReduceOp::Sum, cudaStreamPerThread, procChannel());
+    else if (pc) pc->allReduce(d3.data() + 1, 1, ReduceOp::Sum, cudaStreamPerThread, procChannel());
     if (y.size() > 0) deviceSumMagInto(y, d3.data() + 2);
-    else pc->allReduce(d3.data() + 2, 1, ReduceOp::Sum, cudaStreamPerThread, procChannel());
+    else if (pc) pc->allReduce(d3.data() + 2, 1, ReduceOp::Sum, cudaStreamPerThread, procChannel());
     cudaCheck(cudaMemcpy(out, d3.data(), 3*sizeof(scalar), cudaMemcpyDeviceToHost), "courant results");
 }
 
