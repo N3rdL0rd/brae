@@ -220,27 +220,6 @@ void prghEvaluateKernel(
     if (b >= nB) return;
     val[b] = pr[cell[b]] + grad[b] / dc[b];
 }
-__global__ void prghProcCoeffsKernel(
-    int n,
-    int bndStart,
-    const label* __restrict__ own,
-    CyclicNbr nbr,
-    const scalar* __restrict__ dc,
-    const scalar* __restrict__ weight,
-    const scalar* __restrict__ magSf,
-    const scalar* __restrict__ rAU,
-    scalar* __restrict__ iC,
-    scalar* __restrict__ bC)
-{
-    const int j = blockIdx.x*blockDim.x + threadIdx.x;
-    if (j >= n) return;
-    const scalar gamma = weight[j]*rAU[own[j]] + (scalar(1) - weight[j])*cyclicNbrValue(nbr, rAU, j);
-    const scalar coeff = gamma * dc[j] * magSf[j];
-    iC[bndStart + j] = coeff;
-    bC[bndStart + j] = scalar(0);
-}
-
-
 
 // A scalar's value in each of `n` listed cells, in the list's order: the cells under a set of patch faces.
 __global__
@@ -4585,6 +4564,13 @@ RunReport runInterFoamDevice(
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
             if (fvp[pi].type == "empty" || isCyclicFamilyType(fvp[pi].type)) return false;
+            // a processor patch is in the device mesh's boundary array too, with the host's zero-gradient
+            // placeholder's entries (below); it does not decide which path the physical patches take
+            if (isProcessorType(fvp[pi].type))
+            {
+                nFaces += static_cast<std::size_t>(fvp[pi].size);
+                continue;
+            }
             const auto* pp = f.p_rgh.boundary[pi].get();
             const auto* up = f.U.boundary[pi].get();
             if (!pp || !up) return false;
@@ -4632,27 +4618,18 @@ RunReport runInterFoamDevice(
                 dm.Sfz.data(), scalar(0), dPGrad.data(), iC.data(), bC.data());
             cudaCheck(cudaGetLastError(), "prghFluxCoeffsKernel");
             cycJump.resize(0);
-            if (procCtx)
+            if (procCtx && procCtx->nFaces() > 0)
             {
-                // Processor faces are coupled faces, not fixedFluxPressure walls. Their gradient is the
-                // processor snGrad and their matrix coefficient is the interface's, not the wall's zero.
-                DeviceBuffer<scalar> gx, gy, gz;
-                deviceGradOf(dm, *prghForHooks, dPVal, f.gradPrgh.leastSquares, f.gradPrgh.cellLimitK,
-                             gx, gy, gz, nullptr);
-                procExchange(*procCtx, {const_cast<DeviceBuffer<scalar>*>(prghForHooks), &gx, &gy, &gz},
-                             "p_rgh and grad(p_rgh)");
-                DeviceBuffer<scalar> snProc;
-                deviceCyclicSnGrad(procCtx->cyc(), *prghForHooks, gx, gy, gz,
-                                   f.snGradScheme.corrected, f.snGradScheme.limitCoeff,
-                                   f.snGradScheme.nonOrthCoeffs, snProc);
-                procScatter(*procCtx, snProc, dPGrad);
-                const int nProc = procCtx->nFaces();
-                prghProcCoeffsKernel<<<(nProc + 255)/256, 256, 0, cudaStreamPerThread>>>(
-                    nProc, procCtx->bndStart(), procCtx->cyc().ownCell.data(), procCtx->cyc().nbr(),
-                    procCtx->cyc().deltaCoeffs.data(), procCtx->cyc().weights.data(),
-                    procCtx->cyc().magSf.data(), rAUCell.data(),
-                    iC.data(), bC.data());
-                cudaCheck(cudaGetLastError(), "processor p_rgh coefficients");
+                // THE PROCESSOR FACES TAKE WHAT THE HOST PATH GIVES THEM: its patch field there is the zero-gradient
+                // placeholder, so no matrix coefficient (the coupling is the interface's, deviceCyclicAssembleLaplacian
+                // and the matrix's procIfCoeff) and no gradient, which leaves the evaluate at the cell's value. The
+                // corrected laplacian's grad(p_rgh) takes the interpolated face value there itself
+                // (device_inter_pressure_step.cu). The kernel above formed a wall's entries for these faces.
+                const std::size_t at = static_cast<std::size_t>(procCtx->bndStart());
+                const std::size_t n = static_cast<std::size_t>(procCtx->nFaces())*sizeof(scalar);
+                cudaCheck(cudaMemsetAsync(iC.data() + at, 0, n, cudaStreamPerThread), "processor faces' iC");
+                cudaCheck(cudaMemsetAsync(bC.data() + at, 0, n, cudaStreamPerThread), "processor faces' bC");
+                cudaCheck(cudaMemsetAsync(dPGrad.data() + at, 0, n, cudaStreamPerThread), "processor faces' gradient");
             }
             return;
         }
@@ -6017,7 +5994,11 @@ RunReport runInterFoamDevice(
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
             const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
-            f.p_rgh.boundary[pi]->updateSnGrad(std::vector<scalar>(grad.begin() + at, grad.begin() + at + n));
+            // a processor patch's placeholder has no gradient to take; the writer fills its values from the device
+            if (!isProcessorType(fvp[pi].type))
+            {
+                f.p_rgh.boundary[pi]->updateSnGrad(std::vector<scalar>(grad.begin() + at, grad.begin() + at + n));
+            }
             at += n;
         }
         f.p_rgh.evaluateBoundary();
