@@ -392,6 +392,13 @@ static void deviceSymGaussSeidelProcGraph(
                         || c.addressingId != A.addressingId || !sameProc;
     if (recapture)
     {
+        static const bool log = std::getenv("BRAE_GRAPH_RECAPTURE_LOG") != nullptr;
+        if (log)
+            std::fprintf(stderr, "[recapture] GS proc graph: %s (cache %p)\n",
+                         !c.exec ? "first" : c.key != psi.data() ? "psi" : (c.tol != tol || c.relTol != relTol || c.maxIter != maxIter
+                         || c.minIter != minIter || c.sweepsPer != sweepsPer || c.symmetric != symmetric) ? "controls"
+                         : c.scratchEpoch != epoch ? "scratchEpoch" : (c.owner != (const void*)A.owner || c.nC != nC || c.nF != nF) ? "owner/size"
+                         : c.addressingId != A.addressingId ? "addressingId" : "proc", static_cast<void*>(&c));
         if (c.exec)
         {
             cudaGraphExecDestroy(c.exec);

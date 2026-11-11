@@ -734,11 +734,14 @@ static DeviceSolverPerf deviceAMGPCGProcGraph(
     const bool sameProc = c.keyProcComm == (const void*)A.proc.comm && c.keyProcPlan == (const void*)A.proc.plan
                        && c.keyProcFaceCell == (const void*)A.proc.faceCell && c.keyProcNbrIdx == (const void*)A.proc.nbrIdx
                        && c.keyProcRank == (const void*)A.proc.rank && c.keyProcFaces == A.proc.nFaces;
-    if (!c.exec || c.key != psi.data() || c.keyEpoch != epoch
-        || c.keyOwner != (const void*)A.owner || c.keyNC != nC || c.keyNF != nF
-        || c.keyAddressingId != A.addressingId || !samePair || c.keyPairEpoch != amg.pair.epoch
-        || !sameProc || c.keyPA != (const void*)c.pA.data() || c.keyHistCap != static_cast<int>(histCap))
+    const char* recaptureWhy = !c.exec ? "first" : c.key != psi.data() ? "psi" : c.keyEpoch != epoch ? "scratchEpoch"
+        : c.keyOwner != (const void*)A.owner ? "owner" : (c.keyNC != nC || c.keyNF != nF) ? "size"
+        : c.keyAddressingId != A.addressingId ? "addressingId" : !samePair ? "pair" : c.keyPairEpoch != amg.pair.epoch ? "pairEpoch"
+        : !sameProc ? "proc" : c.keyPA != (const void*)c.pA.data() ? "pA" : c.keyHistCap != static_cast<int>(histCap) ? "histCap" : nullptr;
+    if (recaptureWhy)
     {
+        static const bool log = std::getenv("BRAE_GRAPH_RECAPTURE_LOG") != nullptr;
+        if (log) std::fprintf(stderr, "[recapture] PCG proc graph: %s (cache %p)\n", recaptureWhy, static_cast<void*>(&c));
         interPhase::Nested timedCapture("AMG-PCG: graph capture");
         {
             // PRE-SIZE what the capture touches (V-cycle scratch, the reduction partials): rank-local only, no halo,
