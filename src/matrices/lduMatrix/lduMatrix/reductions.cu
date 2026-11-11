@@ -338,6 +338,35 @@ scalar deviceMaxRatio(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>&
     return *rs.pinned;
 }
 
+void deviceCourantReductions(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar out[3])
+{
+    ProcComm* pc = globalComm();
+    if (!pc)
+    {
+        out[0] = deviceMaxRatio(x, y);
+        out[1] = deviceSumMag(x);
+        out[2] = deviceSumMag(y);
+        return;
+    }
+    // Per loopback rank thread, like the other reduction scratch.
+    thread_local auto& d3 = *new DeviceBuffer<scalar>(3);
+    const int n = static_cast<int>(x.size());
+    cudaCheck(cudaMemsetAsync(d3.data(), 0, 3*sizeof(scalar), cudaStreamPerThread), "courant zero");
+    // a rank without cells contributes the identities (0 for all three: the ratios are >= 0), and still joins
+    if (n > 0 && static_cast<int>(y.size()) >= n)
+    {
+        maxRatioKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), d3.data(), n);
+        cudaCheck(cudaGetLastError(), "courant maxratio");
+    }
+    ++procHookCountsRef().reductions;
+    pc->allReduce(d3.data(), 1, ReduceOp::Max, cudaStreamPerThread, procChannel());
+    if (n > 0) deviceSumMagInto(x, d3.data() + 1);
+    else pc->allReduce(d3.data() + 1, 1, ReduceOp::Sum, cudaStreamPerThread, procChannel());
+    if (y.size() > 0) deviceSumMagInto(y, d3.data() + 2);
+    else pc->allReduce(d3.data() + 2, 1, ReduceOp::Sum, cudaStreamPerThread, procChannel());
+    cudaCheck(cudaMemcpy(out, d3.data(), 3*sizeof(scalar), cudaMemcpyDeviceToHost), "courant results");
+}
+
 
 scalar deviceSumMag(const DeviceBuffer<scalar>& x)
 {

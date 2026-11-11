@@ -62,6 +62,10 @@ scalar deviceSumMag(const DeviceBuffer<scalar>& x);                             
 // max over i of x[i]/y[i], skipping y[i] <= 0. The Courant number is a MAXIMUM, which cannot be built
 // from the sum/dot reductions above; this keeps it a single device pass returning one scalar.
 scalar deviceMaxRatio(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y);
+// The Courant number's three reductions at once: {max_i x[i]/y[i] (y > 0), sum|x|, sum|y|}. With no communicator these
+// are deviceMaxRatio, deviceSumMag(x) and deviceSumMag(y) as they always were. Under -parallel the three global
+// reductions are device-resident and the host reads the three results together: one synchronisation, not three.
+void   deviceCourantReductions(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar out[3]);
 void   deviceHadamard(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b);  // out = a.*b
 void   deviceDivide(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b);     // out = a./b (0 where b==0)
 // fused multi-term BLAS-1 (fewer launches + less memory traffic, bit-identical to the separate-kernel sequences):
