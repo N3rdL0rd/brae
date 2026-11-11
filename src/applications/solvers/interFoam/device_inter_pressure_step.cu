@@ -658,7 +658,9 @@ scalar deviceInterPressureStep(
                                 static_cast<double>(relTol), static_cast<double>(knobs.dicInnerRelTol));
                 }
             }
-            const bool graph = knobs.graph && !(in.cyc && in.cyc->n > 0) && !A.proc.active() && pressureCondGraphsAvailable();
+            // under -parallel too: the decomposed solve's loop is host-driven there, but its V-cycle is block-local --
+            // no halo, no collective -- and deviceAMGPCG captures it as a graph on the single-precision path
+            const bool graph = knobs.graph && !(in.cyc && in.cyc->n > 0) && pressureCondGraphsAvailable();
             // EXPERIMENT (AmgPcgKnobs::finalTolFactor): the Final solve's tolerance scaled
             scalar tolUsed = tol;
             if (finalPass && knobs.finalTolFactor != scalar(1))

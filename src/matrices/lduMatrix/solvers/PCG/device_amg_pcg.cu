@@ -947,6 +947,12 @@ DeviceSolverPerf deviceAMGPCG(
             if(std::getenv("BRAE_AMG_CYCLES")) std::fprintf(stderr,"[AMG] FP32 V-cycle ENGAGED (levels=%d)\n", amg.nLevels());
         }
     }
+    // A DECOMPOSED MESH'S V-CYCLE IS CAPTURED ON THE SINGLE-PRECISION PATH ONLY. Its matrices (LduF) carry no processor
+    // interface, so the cycle is the block-local preconditioner with no halo exchange and no collective in it -- a
+    // graph like the single mesh's. The FP64 cycle takes the DeviceLduView, whose processor product would put a halo
+    // exchange inside the capture. MEASURED on the G4 case at np 8 (V100): about 100 kernels a cycle, ~30 cycles a step,
+    // each launched from the host where np 1 replays one graph.
+    if (A.proc.active() && !fp32) captureVcycle = false;
     amgSplit::lap(amgSplit::matrixCast);
     AMGGraphCache& gc = *amg.gcache;
     auto applyPrecond = [&]()
