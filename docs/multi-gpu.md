@@ -223,6 +223,25 @@ over the field's largest value:
 
 The two-step checks also pass at np 2 on the MPI-host backend (1560 ms a step against NCCL's 1600, both including the
 first step's setup). NCCL logs `ipcHandleMultiSegmentRegistration ... Cuda failure 1 'invalid argument'` warnings at
-np > 1 on these nodes; the runs complete and agree, so they are a lead for the performance work, not a correctness
-issue. The scaling is below the estimate in "What is in" (4.7-5.9x at 8 GPUs); the AMG-PCG iteration growth and the
-per-iteration collectives are where to look first.
+np > 1 on these nodes; the runs complete and agree, and turning NCCL's buffer registration off
+(`NCCL_LOCAL_REGISTER=0 NCCL_GRAPH_REGISTER=0`) changes neither the warnings' effect nor the step time.
+
+**Without the phase timer**, which costs about a fifth of the step at np 1, the step time is taken inside one run from
+rank 0's clock between steps 10 and 70 (`tools/rosie` results `bench3`; the same case, 70 steps):
+
+| np | ms per step | speedup | parallel efficiency |
+|---|---|---|---|
+| 1 | 311.9 | 1.00 | 100% |
+| 2 | 204.8 | 1.52 | 76% |
+| 4 | 112.4 | 2.78 | 69% |
+| 8 | 67.0 | 4.66 | 58% |
+
+(np 2, 4 and 8 with p_rgh's patches on the GPU across processor faces; before that change np 8 took 78.0 ms. The
+parity above is unchanged by it, digit for digit.) What `nsys` shows at np 8 (`--trace=cuda --cuda-graph-trace=graph`):
+the compute kernels scale almost perfectly (48 ms a step on every rank against 197 ms at np 1; 27 ms where the
+distributed AMG-PCG runs as its WHILE graph), and the rest is the host. About 4,250 kernels are launched one by one a
+step against 590 at np 1, because the pressure solve's V-cycle is not captured as a graph under `-parallel`, plus about
+15 blocking device-to-host scalar reads a step (Courant numbers, norm factors, the pressure step's own reads). NCCL time
+differs from rank to rank (17-26 ms) where the compute does not: ranks wait for each other at those points.
+`BRAE_PCG_CHECK_EVERY=1`, which takes the fused WHILE-graph loop (about 1,140 launches a step), measures the same 67 ms:
+launch counts alone are not the limit, the synchronisation points and the waits behind them are.
