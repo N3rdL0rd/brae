@@ -347,7 +347,7 @@ bool simpleColourSwapControl()
             std::vector<scalar> ub[3];
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCoupledType(fvp[pi].type)) continue;
                 const std::vector<vector>& v = U.boundary[pi]->value();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
@@ -366,7 +366,7 @@ bool simpleColourSwapControl()
             std::vector<scalar> pb;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCoupledType(fvp[pi].type)) continue;
                 const std::vector<scalar>& v = p.boundary[pi]->value();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
@@ -388,7 +388,7 @@ bool simpleColourSwapControl()
             std::vector<scalar> ub[3];
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCoupledType(fvp[pi].type)) continue;
                 const std::vector<vector>& v = U.boundary[pi]->value();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
@@ -1759,7 +1759,7 @@ bool simpleColourSwapControl()
         }
         deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], ddrNuCell, ctl_.maxwell ? ddrNuBnd : nuEffBnd,
                          ddrX, ddrY, ddrZ,
-                         hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr, nullptr,
+                         hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr,
                          // null without a freestream patch: this driver evaluates U's boundary before the
                          // assembly, so re-deriving it here is the same number. See the header (item 30).
                          freestreamStored() ? gradUBndP : nullptr, ctl_.gradULimitK);

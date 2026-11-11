@@ -2342,7 +2342,7 @@ int runSimpleFoamV2(const std::string& caseDir)
         std::vector<scalar> ub[3], pb;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCoupledType(fvp[pi].type)) continue;
             const std::vector<vector>& v = f.U.boundary[pi]->value();
             const std::vector<scalar>& w = f.p.boundary[pi]->value();
             for (label i = 0; i < fvp[pi].size; ++i)
