@@ -267,6 +267,7 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/smoothers/symGaussSeidel/device_sym_gauss_seidel.cu
     src/matrices/lduMatrix/smoothers/GaussSeidel/device_colour_gauss_seidel.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_vcycle.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_fused.cu
     src/matrices/lduMatrix/solvers/PCG/device_amg_pcg.cu
     src/matrices/lduMatrix/solvers/GAMG/device_gamg_solver.cu
     src/cuda/device_cluster.cu
@@ -5533,6 +5534,18 @@ add_executable(test_amg_one_off_diagonal tests/test_amg_one_off_diagonal.cu)
 target_include_directories(test_amg_one_off_diagonal PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_amg_one_off_diagonal PRIVATE brae_core)
 add_test(NAME amg_one_off_diagonal COMMAND test_amg_one_off_diagonal ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+
+# The fused coarse-level FP32 V-cycle (device_amg_fused.cu): bit-identical to the unfused cycle, direct and captured, at
+# several thresholds, with the premise (the kernel ran), a stale-coefficient replay check and a negative control. Run
+# under the default inverse coarsest solve, the LU (also fused) and the warp substitutions (not fused: must still match).
+add_executable(test_amg_fused_coarse tests/test_amg_fused_coarse.cu)
+target_include_directories(test_amg_fused_coarse PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_amg_fused_coarse PRIVATE brae_core)
+add_test(NAME amg_fused_coarse COMMAND test_amg_fused_coarse ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurbBig)
+add_test(NAME amg_fused_coarse_lu COMMAND test_amg_fused_coarse ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(amg_fused_coarse_lu PROPERTIES ENVIRONMENT "BRAE_AMG_COARSE_SOLVE=lu")
+add_test(NAME amg_fused_coarse_tri COMMAND test_amg_fused_coarse ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(amg_fused_coarse_tri PROPERTIES ENVIRONMENT "BRAE_AMG_COARSE_SOLVE=tri")
 
 # The AMG's single-precision CSR values gathered through each grid's addressing: the stored source list's
 # bits (BRAE_AMG_CSR_SRC=1 keeps the list), a smaller footprint, and a control that changes the cycle.
