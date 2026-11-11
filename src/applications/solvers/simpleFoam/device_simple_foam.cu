@@ -3919,9 +3919,12 @@ bool simpleColourSwapControl()
                                hasAMI_    ? &ami_.ownCell : nullptr, hasAMI_    ? &ami_.phi : nullptr,
                                sumPhi);
         // OF CourantNo.H: CoNum = 0.5*max(sumPhi/V)*deltaT, meanCoNum = 0.5*(sum(sumPhi)/sum(V))*deltaT.
-        const scalar sumV = deviceSumMag(dm.V);
-        c.CoNum     = scalar(0.5)*deviceMaxRatio(sumPhi, dm.V)*deltaT;
-        c.meanCoNum = (sumV > 0) ? scalar(0.5)*(deviceSumMag(sumPhi)/sumV)*deltaT : scalar(0);
+        // the three reductions with one read-back
+        scalar red[3];
+        deviceCourantReductions(sumPhi, dm.V, red);
+        const scalar sumV = red[2];
+        c.CoNum     = scalar(0.5)*red[0]*deltaT;
+        c.meanCoNum = (sumV > 0) ? scalar(0.5)*(red[1]/sumV)*deltaT : scalar(0);
         return c;
     }
 
