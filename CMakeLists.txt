@@ -5654,7 +5654,8 @@ set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_TURBULENCE
 # (skips, exit 77, without it).
 add_test(NAME mgpu_np1_byte_identical
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_np1_byte_identical.sh $<TARGET_FILE:brae_interFoam>)
-set_tests_properties(mgpu_np1_byte_identical PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# (it runs the tank case serially and as np = 1, 2 and 4: about 15-20 minutes)
+set_tests_properties(mgpu_np1_byte_identical PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400)
 # The explicit stages across processor faces against OpenFOAM v2606 -parallel at np 1/2/4/8 (BRAE_MGPU_STAGE_DUMP).
 add_test(NAME mgpu_stage_gate
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_stage_gate.sh $<TARGET_FILE:brae_interFoam>)

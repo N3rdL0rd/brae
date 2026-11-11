@@ -5,6 +5,7 @@
 // The CPU baseline stays the oracle; each GPU kernel is validated against it.
 #include "cf_types.cuh"
 #include <chrono>
+#include <mutex>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -110,6 +111,9 @@ public:
     void* take(std::size_t bytes)
     {
         if (bytes == 0) return nullptr;
+        // the loopback communicator runs one thread a rank in ONE process, all sharing this pool (a device thread of a
+        // multi-process run takes one lock it never contends)
+        std::lock_guard<std::mutex> lock(mu_);
         const std::size_t cls = classOf(bytes);
         if (cls < bytes)
         {
@@ -149,6 +153,7 @@ public:
     void give(void* p, std::size_t bytes)
     {
         if (!p) return;
+        std::lock_guard<std::mutex> lock(mu_);
         if (stats_)
         {
             liveBytes_ -= classOf(bytes);
@@ -202,6 +207,7 @@ public:
     // wants the list kept for good (every block is then retained, as before); never under the exact-size keys.
     void endOfStep()
     {
+        std::lock_guard<std::mutex> lock(mu_);
         ++step_;
         if (!enabled_ || exact_ || step_ <= keep_) return;
         const auto t0 = std::chrono::steady_clock::now();
@@ -546,6 +552,7 @@ private:
     std::set<std::size_t> poisonIds_;
     unsigned long poisonFrom_ = 2;
     unsigned long poisonEntries_ = 0;
+    std::mutex mu_;
     bool enabled_;
     bool exact_;
     bool short_;
