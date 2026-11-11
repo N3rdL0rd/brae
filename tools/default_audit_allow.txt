@@ -519,8 +519,3 @@ SF r ref
 SF r own
 SF s c
 SF s ref
-# Val is a tagged expression value: a scalar field (s) or a vector one (v/vf), uniform or not, and each site sets the part it makes
-Val v f
-Val v isVector
-Val v uniform
-Val v vf
