@@ -3,9 +3,12 @@
 // vcycleAtF launches ~7 kernels a grid (smoothFromZero, product, residual, restrict, prolong, product, smooth)
 // plus the coarsest solve's three, each on a grid of a few thousand cells or fewer where the work is 1-2 us and a
 // dependent launch costs 3-4. On a decomposed mesh with ~300k cells a rank the pressure solve is latency-bound and
-// that tail is most of the block-local cycle. From the first grid of at most BRAE_AMG_FUSE_BELOW cells (4096) this
+// that tail is most of the block-local cycle. From the first grid of at most BRAE_AMG_FUSE_BELOW cells (1024) this
 // kernel runs the REST of the cycle -- down, the coarsest solve, back up -- as ONE block of up to 1024 threads
-// with __syncthreads where the launches were.
+// with __syncthreads where the launches were. 1024 is MEASURED on an RTX 5090 (tests/test_amg_fused_coarse.cu's
+// sweep, captured cycle per call, us unfused / 1024 / 4096 / 16384: pitzDaily 65.6 / 49.2 / 50.0 / 79.8, TurbBig
+// 112 / 69.7 / 72.0 / 104, sbMatched 111 / 98.4 / 119 / 209, duct3d 100 / 88.0 / 91.8 / 129): one block's throughput
+// loses to the separate launches on grids of a few thousand cells.
 //
 // BIT-IDENTICAL TO THE UNFUSED CYCLE, by construction: every per-cell expression is amg_cell_ops.cuh's (and
 // amg_coarse_dev.cuh's, device_amg_coarse.cu's inverse rows), the same functions the separate kernels call, over
@@ -34,13 +37,19 @@ namespace brae {
 
 namespace {
 
-// One grid's product for cell i, into dst: the rows where the grid has them, else the faces. The arrays are
-// written by this kernel (x, ax, r, b), so they are read through plain pointers, never the read-only path.
+// One grid's product over the cells of this thread, each handed to store(cell, value): the rows where the grid has
+// them, else the faces. The arrays are written by this kernel (x, ax, r, b), so they are read through plain
+// pointers, never the read-only path.
+template <class Store>
 __device__ __forceinline__
-float fusedSpmv(const FusedLevel& L, int i, const float* psi)
+void fusedProduct(const FusedLevel& L, int tid, int nt, const float* psi, Store store)
 {
-    if (L.row != nullptr) return cellSpmvCsrF(i, L.diag, L.row, L.col, L.val, psi);
-    return cellSpmvFaceF(i, L.diag, L.upper, L.lower, L.nei, L.owner, L.ownerStart, L.losort, L.losortStart, psi);
+    for (int i = tid; i < L.n; i += nt)
+    {
+        store(i, L.row != nullptr
+                     ? cellSpmvCsrF(i, L.diag, L.row, L.col, L.val, psi)
+                     : cellSpmvFaceF(i, L.diag, L.upper, L.lower, L.nei, L.owner, L.ownerStart, L.losort, L.losortStart, psi));
+    }
 }
 
 // one smoothing sweep: A x into ax, then x += omega (b - ax)/diag; a barrier between (the sweep is Jacobi: every
@@ -48,7 +57,7 @@ float fusedSpmv(const FusedLevel& L, int i, const float* psi)
 __device__ __forceinline__
 void fusedSweep(const FusedLevel& L, int tid, int nt)
 {
-    for (int i = tid; i < L.n; i += nt) L.ax[i] = fusedSpmv(L, i, L.x);
+    fusedProduct(L, tid, nt, L.x, [&](int i, float ax) { L.ax[i] = ax; });
     __syncthreads();
     for (int i = tid; i < L.n; i += nt) L.x[i] = cellSmooth<float>(L.x[i], L.b[i], L.ax[i], L.diag[i]);
     __syncthreads();
@@ -60,11 +69,14 @@ void amgFusedVcycleKernel(const __grid_constant__ FusedArgs a)
     const int tid = threadIdx.x;
     const int nt = blockDim.x;
 
-    // DOWN: pre-smooth, residual, restrict
+    // DOWN: pre-smooth, residual, restrict. The restriction also starts the next grid's cycle -- its first sweep from
+    // zero (or the zeroing), or the FP64 cast on the coarsest -- in the thread that made each coarse value: one
+    // barrier fewer a grid, the same expressions on the same values
     for (int l = 0; l < a.nLev; ++l)
     {
         const FusedLevel& L = a.lev[l];
-        if (a.nPre == 0)
+        const FusedLevel& C = a.lev[l + 1];
+        if (l == 0 && a.nPre == 0)
         {
             for (int i = tid; i < L.n; i += nt) L.x[i] = 0.0f;                 // zeroT
             __syncthreads();
@@ -73,21 +85,29 @@ void amgFusedVcycleKernel(const __grid_constant__ FusedArgs a)
         {
             if (s == 0)                                                       // x = 0: smoothFromZeroT
             {
-                for (int i = tid; i < L.n; i += nt) L.x[i] = cellSmoothFromZero<float>(L.b[i], L.diag[i]);
-                __syncthreads();
+                if (l == 0)
+                {
+                    for (int i = tid; i < L.n; i += nt) L.x[i] = cellSmoothFromZero<float>(L.b[i], L.diag[i]);
+                    __syncthreads();
+                }
                 continue;
             }
             fusedSweep(L, tid, nt);
         }
-        for (int i = tid; i < L.n; i += nt)                                   // r = b - A x
+        fusedProduct(L, tid, nt, L.x, [&](int i, float ax)                    // r = b - A x
         {
-            const float ax = fusedSpmv(L, i, L.x);
             L.ax[i] = ax;
             L.r[i] = cellResidual<float>(L.b[i], ax);
-        }
+        });
         __syncthreads();
-        const FusedLevel& C = a.lev[l + 1];
-        for (int ci = tid; ci < L.nc; ci += nt) C.b[ci] = cellRestrict<float>(L.galStart, L.galList, L.r, ci);
+        const bool coarsestNext = l + 1 == a.nLev;
+        for (int ci = tid; ci < L.nc; ci += nt)
+        {
+            const float rb = cellRestrict<float>(L.galStart, L.galList, L.r, ci);
+            C.b[ci] = rb;
+            if (coarsestNext) a.coarse.rcD[ci] = (scalar)rb;                  // cast_<float, scalar>
+            else C.x[ci] = a.nPre > 0 ? cellSmoothFromZero<float>(rb, C.diag[ci]) : 0.0f;
+        }
         __syncthreads();
     }
 
@@ -96,8 +116,11 @@ void amgFusedVcycleKernel(const __grid_constant__ FusedArgs a)
         const FusedLevel& L = a.lev[a.nLev];
         const FusedCoarse& K = a.coarse;
         const int n = K.n;
-        for (int i = tid; i < n; i += nt) K.rcD[i] = (scalar)L.b[i];          // cast_<float, scalar>
-        __syncthreads();
+        if (a.nLev == 0)
+        {
+            for (int i = tid; i < n; i += nt) K.rcD[i] = (scalar)L.b[i];      // cast_<float, scalar>
+            __syncthreads();
+        }
         if (K.inverse)
         {
             if (*K.unsafe != 0)                                               // the LU's substitutions, one warp
@@ -189,7 +212,7 @@ bool controlsHoldTheCycle()
 int fuseBelow()
 {
     const char* e = std::getenv("BRAE_AMG_FUSE_BELOW");
-    if (e == nullptr || *e == '\0') return 4096;
+    if (e == nullptr || *e == '\0') return 1024;
     return std::atoi(e);
 }
 

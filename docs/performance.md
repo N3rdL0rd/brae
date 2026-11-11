@@ -27,6 +27,7 @@ Other tuning knobs (advanced; sensible defaults):
 | `BRAE_AMG_GS=1` | multicolor Gauss-Seidel smoother (vs the default Jacobi), fewer cycles on some anisotropic meshes |
 | `BRAE_AMG_TSGS=1` | two-stage Gauss-Seidel (parallel polynomial) smoother, coloring-free |
 | `BRAE_AMG_SA=1` | smoothed-aggregation multigrid (vs default pairwise), stronger on cyclic / graded meshes |
+| `BRAE_AMG_FUSE_BELOW=<cells>` | the single-precision V-cycle runs every grid of that many cells or fewer (default 1024, the best of a sweep on an RTX 5090; `0` switches it off), and the coarsest solve, as ONE one-block kernel instead of ~7 dependent launches a grid. Bit-identical to the unfused cycle (`tests/test_amg_fused_coarse.cu`); applies to the weighted-Jacobi cycle with no coupled pair, on the default inverse or the LU coarsest solve. Set it before the run: a captured graph keeps the setting it was captured with |
 | `BRAE_GS_DEVICE=1` | device-resident k/ε Gauss-Seidel scalar solve |
 
 ## interFoam on one GPU: what stays on the device

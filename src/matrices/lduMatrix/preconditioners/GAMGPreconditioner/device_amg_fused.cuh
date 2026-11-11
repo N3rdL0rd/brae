@@ -81,7 +81,7 @@ void amgFusedVcycleLaunch(const FusedArgs& args, int threads);
 
 // Runs grid g's V-cycle -- and every coarser one -- in the fused kernel when this hierarchy and cycle allow it and
 // g is the first grid of the fused range; false (nothing launched) otherwise, and the caller recurses as usual.
-// BRAE_AMG_FUSE_BELOW=<cells> (default 4096; 0 switches the fusion off) sets the range: every grid of that many
+// BRAE_AMG_FUSE_BELOW=<cells> (default 1024; 0 switches the fusion off) sets the range: every grid of that many
 // cells or fewer.
 bool amgFusedVcycleAt(
     int g,

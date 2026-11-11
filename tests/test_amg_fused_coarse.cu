@@ -2,7 +2,7 @@
 //
 // On each mesh a real hierarchy is built and cast to single precision, and the V-cycle is applied with
 // BRAE_AMG_FUSE_BELOW=0 (the kernels the cycle has always launched) and with fusion on at several thresholds --
-// the default 4096, one that fuses only a few grids, one that fuses every grid including the finest -- for
+// the default 1024, 4096, one that fuses only a few grids, one that fuses every grid including the finest -- for
 // three right-hand sides, directly launched and as captured graphs. Every output is memcmp'd with the unfused
 // direct launch's. Then:
 //   * premise: the fused arms really launched the kernel (amgFusedStats) and the unfused arms did not;
@@ -24,6 +24,7 @@
 #include "device_ldu.cuh"
 #include "device_amg.cuh"
 #include "device_amg_fused.cuh"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -186,7 +187,7 @@ void runCase(
         check(unfusedGraph, "unfused: captured graph replay = direct launch, 3 right-hand sides");
         const std::size_t nodesOff = graphNodes(amg);
 
-        const int thresholds[] = {4096, 700, 100000, 64};
+        const int thresholds[] = {1024, 4096, 700, 100000, 64};
         for (int below : thresholds)
         {
             setBelow(below);
@@ -203,7 +204,16 @@ void runCase(
             bool graph = true;
             for (int k = 0; k < 3; ++k) graph = graph && sameBits(cycle(amg, A, rhs[k], true), ref[k]);
             check(graph, "BELOW=" + std::to_string(below) + ": captured graph replay = unfused, bit for bit");
-            if (below == 4096) std::printf("  graph nodes: %zu unfused, %zu fused\n", nodesOff, graphNodes(amg));
+            if (below == 1024) std::printf("  graph nodes: %zu unfused, %zu fused\n", nodesOff, graphNodes(amg));
+        }
+        // the default (BRAE_AMG_FUSE_BELOW unset)
+        unsetenv("BRAE_AMG_FUSE_BELOW");
+        {
+            const long long l0 = amgFusedStats().launches;
+            bool direct = true;
+            for (int k = 0; k < 3; ++k) direct = direct && sameBits(cycle(amg, A, rhs[k], false), ref[k]);
+            check((amgFusedStats().launches > l0) == expectFused, "default threshold: the fused kernel " + std::string(expectFused ? "ran" : "stayed out"));
+            check(direct, "default threshold: direct launch = unfused, bit for bit");
         }
 
         // the replay reads live coefficients, fused or not; and the control: the comparison sees one coarse coefficient
@@ -212,7 +222,7 @@ void runCase(
         std::vector<float> d1 = d0;
         d1[0] *= 1.000001f;
         std::vector<std::vector<scalar>> perturbed;
-        for (int below : {0, 4096})
+        for (int below : {0, 1024})
         {
             setBelow(below);
             dropGraph(amg);
@@ -227,16 +237,26 @@ void runCase(
         check(!sameBits(perturbed[1], ref[0]),
               "NEGATIVE CONTROL: the fused cycle with one coarsest diagonal off by 1e-6 is NOT the unperturbed unfused cycle");
 
-        // timing
+        // timing: the captured cycle's time per call, unfused and fused at a sweep of thresholds (best of three runs)
         const int reps = 200;
-        setBelow(0);
-        dropGraph(amg);
-        const double tOff = timeCaptured(amg, A, rhs[0], reps);
-        setBelow(4096);
-        dropGraph(amg);
-        const double tOn = timeCaptured(amg, A, rhs[0], reps);
-        std::printf("  captured V-cycle call: %.1f us unfused, %.1f us fused (%.2fx)\n", tOff, tOn, tOff/tOn);
-        setenv("BRAE_AMG_FUSE_BELOW", "4096", 1);
+        std::printf("  captured V-cycle call, us (grids fused):");
+        double tOff = 0.0;
+        double tDef = 0.0;
+        for (int below : {0, 256, 1024, 4096, 16384, 65536})
+        {
+            setBelow(below);
+            double best = 1e30;
+            for (int rep = 0; rep < 3; ++rep)
+            {
+                dropGraph(amg);
+                best = std::min(best, timeCaptured(amg, A, rhs[0], reps));
+            }
+            if (below == 0) tOff = best;
+            if (below == 1024) tDef = best;
+            std::printf("  %d: %.1f (%d)", below, best, below == 0 ? 0 : amgFusedStats().grids);
+        }
+        std::printf("\n  fused (default 1024) %.2fx the unfused cycle\n", tOff/tDef);
+        unsetenv("BRAE_AMG_FUSE_BELOW");
     }
 }
 
