@@ -11,6 +11,7 @@
 #include "device_amg_internal.cuh" // LduF/lduF/cast_/amulF, gsSweep + smoother decls (ensureSpectrum/cheb/tsGS)
 #include "device_amg_coarse.cuh"   // deviceCoarsePCG / deviceCoarseJacobiSingleBlock
 #include "amg_kernels.cuh"         // zeroT/smoothT/residualT/restrictT/prolongT<T>
+#include "device_amg_fused.cuh"    // amgFusedVcycleAt: the coarse levels of the FP32 cycle in one block
 #include "device_ldu.cuh"          // DeviceLduView / deviceAmul
 #include "device_blas.cuh"         // deviceCopy / deviceDot / deviceReciprocalV
 #include <cuda_runtime.h>
@@ -1560,6 +1561,9 @@ void vcycleAtF(
     }
     const int n = Ag.nCells;
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
+    // FROM THE FIRST GRID OF AT MOST BRAE_AMG_FUSE_BELOW CELLS the rest of the cycle is ONE kernel (device_amg_fused.cu):
+    // the same arithmetic bit for bit, where this recursion launches ~7 dependent kernels a grid
+    if (amgFusedVcycleAt(g, amg, Ag, bg, xg)) return;
     // A COUPLED PAIR (AMGPair): this cycle's matrices are the internal faces' on EVERY grid, the finest included,
     // so every product is followed by pairAdd.
     // x starts at zero. A level that pre-smooths writes its first sweep straight from b (smoothFromZeroT) and
