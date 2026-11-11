@@ -347,7 +347,7 @@ bool simpleColourSwapControl()
             std::vector<scalar> ub[3];
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const std::vector<vector>& v = U.boundary[pi]->value();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
@@ -366,7 +366,7 @@ bool simpleColourSwapControl()
             std::vector<scalar> pb;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const std::vector<scalar>& v = p.boundary[pi]->value();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
@@ -388,7 +388,7 @@ bool simpleColourSwapControl()
             std::vector<scalar> ub[3];
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const std::vector<vector>& v = U.boundary[pi]->value();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {

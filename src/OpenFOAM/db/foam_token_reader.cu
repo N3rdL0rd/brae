@@ -807,20 +807,22 @@ TokenStream::TokenStream(const std::string& path, bool expandVars)
 
     // tokenizeFoamBinary already skipped the header for the direct path; only the text path needs it here.
     std::size_t i = 0;
-    if (!directBinary) while (i < all.size() && all[i] != "FoamFile") ++i;
-    if (!directBinary && i < all.size())
+    if (!directBinary)
     {
-        while (i < all.size() && all[i] != "{") ++i;
-        int depth = 0;
-        for (; i < all.size(); ++i)
+        std::size_t h = 0;
+        while (h < all.size() && all[h] != "FoamFile") ++h;
+        // no header: the payload starts at the top
+        if (h < all.size())
         {
-            if (all[i] == "{") ++depth;
-            else if (all[i] == "}") { if (--depth == 0) { ++i; break; } }
+            i = h;
+            while (i < all.size() && all[i] != "{") ++i;
+            int depth = 0;
+            for (; i < all.size(); ++i)
+            {
+                if (all[i] == "{") ++depth;
+                else if (all[i] == "}") { if (--depth == 0) { ++i; break; } }
+            }
         }
-    }
-    else if (directBinary)
-    {
-        i = 0;
     }
     toks_.assign(all.begin() + i, all.end());
 }
