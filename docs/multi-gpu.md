@@ -145,9 +145,15 @@ largest value:
 | 4 | 1.7e-10 | 2.3e-10 | 7.8e-10 | 1.1e-12 |
 | 8 | 3.4e-9 | 4.2e-10 | 1.7e-8 | 3.1e-10 |
 
-Where the time goes at np 8 (Nsight Systems): the compute kernels scale almost perfectly (about 34 ms of kernel time a
-step per GPU against 197 ms at np 1), the GPU is idle for roughly the other half of the step, and ranks wait for each
-other at collectives (NCCL time differs by rank, 17-26 ms, where compute does not). The distributed AMG-PCG's iteration
-count grows with the number of blocks (np 1: 17 iterations a step on average, np 8: 25). Kernel-launch counts, NCCL
-buffer registration, the PCG convergence-check cadence and NCCL protocol settings were tried and change the step by less
-than the noise.
+Where the time goes at np 8 (Nsight Systems and the per-phase timer): the compute kernels scale almost perfectly (about
+34 ms of kernel time a step per GPU against 197 ms at np 1), the pressure solve is about 55% of the step and the alpha
+transport about 27%, and the GPU is idle for roughly a quarter to a third of the step waiting at collectives and
+host read-backs. The distributed AMG-PCG's iteration count grows with the number of blocks (np 1: 17 iterations a solve
+on average, np 8: 25), which by itself puts the pressure solve at about 4.8x of np 1 instead of 8x.
+
+Tried at np 8 with no gain beyond the run-to-run noise (about ±1.5 ms): the PCG convergence-check cadence, running the
+solver as one CUDA graph per rank, NCCL buffer registration, channel count, thread count and protocol, CUDA connection
+count, smoothed-aggregation or merged-level AMG hierarchies (`BRAE_AMG_SA`, `BRAE_AMG_MERGE`; a larger coarsest level,
+`BRAE_AMG_TARGET`, is slower), and pinning each rank's threads to cores of its GPU's socket. About 60 ms a step (5x)
+is the floor for this case without changing the algorithm: a stronger decomposed preconditioner, or capturing a whole
+time step as one graph.
