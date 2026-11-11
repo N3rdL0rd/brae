@@ -129,12 +129,12 @@ forward-compatibility libraries (driver 535), ranks placed by the topology tool.
 (`interFoam`, laminar, MULESCorr, 3 PISO correctors, scotch decompositions), fixed deltaT, 70 steps. Step time is
 rank 0's clock between steps 10 and 70, which excludes startup and output; run-to-run noise is about ±1.5 ms at np 8.
 
-| np | ms per step | speedup | parallel efficiency |
+| np | ms/step | speedup | parallel efficiency |
 |---|---|---|---|
-| 1 | 311.9 | 1.00 | 100% |
-| 2 | 196.7 | 1.59 | 79% |
-| 4 | 106.1 | 2.94 | 73% |
-| 8 | 62.3 | 5.01 | 63% |
+| 1 | 287.6 | 1.00 | 100% |
+| 2 | 181.8 | 1.58 | 79% |
+| 4 | 98.2 | 2.93 | 73% |
+| 8 | 56.7 | 5.07 | 63% |
 
 Converged-solve parity, five fixed steps (tolerance 1e-12, relTol 0), largest difference from np 1 over the field's
 largest value:
@@ -145,15 +145,21 @@ largest value:
 | 4 | 1.7e-10 | 2.3e-10 | 7.8e-10 | 1.1e-12 |
 | 8 | 3.4e-9 | 4.2e-10 | 1.7e-8 | 3.1e-10 |
 
-Where the time goes at np 8 (Nsight Systems and the per-phase timer): the compute kernels scale almost perfectly (about
-34 ms of kernel time a step per GPU against 197 ms at np 1), the pressure solve is about 55% of the step and the alpha
-transport about 27%, and the GPU is idle for roughly a quarter to a third of the step waiting at collectives and
-host read-backs. The distributed AMG-PCG's iteration count grows with the number of blocks (np 1: 17 iterations a solve
-on average, np 8: 25), which by itself puts the pressure solve at about 4.8x of np 1 instead of 8x.
+Where the time goes at np 8 (Nsight Systems with node-level graph tracing, and the per-phase timer): the AMG V-cycle's
+products are the largest kernel group (about 28% of GPU-busy time), then the Gauss gradient and the FP64 matrix-vector
+product of the outer PCG; the GPU is busy for most of the step, so at 310,000 cells per GPU the step is bandwidth-bound on
+the V100 rather than latency-bound. The distributed AMG-PCG's iteration count grows with the number of blocks (np 1: 17
+iterations a solve on average, np 8: 25), which by itself puts the pressure solve at about 4.8x of np 1 instead of 8x.
 
-Tried at np 8 with no gain beyond the run-to-run noise (about ±1.5 ms): the PCG convergence-check cadence, running the
+What each change gave at np 8 (same case, in-run step time, one A/B switch each): the Gauss gradient reading one 32-byte
+record a face instead of nine scattered values (`BRAE_CONTROL_GRAD_UNPACKED=1` restores the old kernel): 2.6 ms; the
+processor-interface products as one launch (`BRAE_CONTROL_PROC_PER_PLACE_LAUNCH=1`): 0.7 ms; the coarse levels of the FP32
+V-cycle as one kernel (`BRAE_AMG_FUSE_BELOW=0` switches it off): 0.9 ms. All three are bit-identical to what they replace;
+60.2 ms before, 56.7 after.
+
+Tried at np 8 with no gain beyond the run-to-run noise (about ±1 ms): the PCG convergence-check cadence, running the
 solver as one CUDA graph per rank, NCCL buffer registration, channel count, thread count and protocol, CUDA connection
 count, smoothed-aggregation or merged-level AMG hierarchies (`BRAE_AMG_SA`, `BRAE_AMG_MERGE`; a larger coarsest level,
-`BRAE_AMG_TARGET`, is slower), and pinning each rank's threads to cores of its GPU's socket. About 60 ms a step (5x)
-is the floor for this case without changing the algorithm: a stronger decomposed preconditioner, or capturing a whole
-time step as one graph.
+`BRAE_AMG_TARGET`, is slower), pinning each rank's threads to cores of its GPU's socket, and other fusion thresholds for the
+coarse V-cycle (256 and 4096 cells are no better than 1024). About 55-57 ms a step (5x) is the floor for this case without
+changing the algorithm: a stronger decomposed preconditioner, or less memory traffic per V-cycle (more FP32, fewer passes).
