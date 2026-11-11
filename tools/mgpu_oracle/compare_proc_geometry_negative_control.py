@@ -57,6 +57,9 @@ def mutate(path, mode):
 
 
 def main():
+    if len(sys.argv) < 2 or not sys.argv[1]:
+        print("SKIP: no decomposed case given (configure with -DBRAE_PROC_GEOMETRY_CASE=<case with both dump sets>)")
+        return 77
     case = sys.argv[1]
     dumps = sorted(glob.glob(os.path.join(case, "processor*", "brae_procGeometry.dump")))
     if not dumps:

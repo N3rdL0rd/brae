@@ -54,12 +54,14 @@ every bit; the log says which (`contact angle: b2 = cos(acos(a12) - theta) on th
 architecture, an unusual libm) it says so and keeps the host loop. Measured against glibc 2.43 on 1e9 samples: 0
 mismatches for the FMA port; glibc 2.34-2.43 and the older generation were checked with the matching variant.
 
-**Measured** (G4 tank, 2.48M cells, laptop RTX 5090, `BRAE_INTER_PHASE_TIME=1`, 233 steps): **530 ms/step before,
-225–241 ms after**, outputs byte-identical. With `nsys` graph tracing the GPU is active 97.5% of a steady-state window
-(88.5% before the contact-angle change). A one-step Nsight Compute profile of the
-3,400 kernels gives 68% of peak DRAM throughput, 70% of kernel time in kernels at 60% or more, and at most 1.15× left if
-every kernel reached 90% of its own roofline. These are one laptop and one case; the V100 and H100 gain depends on the
-host and has not been measured.
+**Measured** (G4 tank, 2.48M cells, laptop RTX 5090, one GPU; the run to t = 0.008, 89 steps, against the same run to
+t = 0.002, 28 steps, so start-up cancels): **0.72 s/step before, 0.23 s/step after (3.1x)**; the whole 89-step run takes
+72.3 s before and 29.1 s after (two runs each, within 0.2 s of each other), and every field of the `End` line is the same
+to the digit. Earlier, with the per-phase timer on and the contact-angle change last: 530 ms/step before, 225–241 ms
+after, outputs byte-identical over 233 steps. With `nsys` graph tracing the GPU is active 97.5% of a steady-state window
+(88.5% before the contact-angle change). A one-step Nsight Compute profile of the 3,400 kernels gives 68% of peak DRAM
+throughput, 70% of kernel time in kernels at 60% or more, and at most 1.15× left if every kernel reached 90% of its own
+roofline. These are one laptop and one case; the gain on other GPUs depends on the host and was not measured there.
 
 The one numerical difference: `adjustPhi`'s `totalFlux` is summed on the device (a different order from the host's loop,
 so it differs in its last bits). It feeds only the 1e-15 and 1e-8 relative thresholds and the error text.
