@@ -262,7 +262,7 @@ struct SF
 
 struct VF { SF x, y, z; };
 
-struct Val
+struct ExprVal
 {
     bool vec = false;
     SF   s;
@@ -548,7 +548,7 @@ public:
 
     SF parseScalar()
     {
-        Val v = expr();
+        ExprVal v = expr();
         if (peek().k != Tok::End)
         {
             fail("unexpected `" + peek().t + "`");
@@ -581,8 +581,8 @@ private:
         ++p_;
     }
 
-    Val scalarVal(const SF& s) const { Val v; v.s = s; return v; }
-    const SF& needScalar(const Val& v) const
+    ExprVal scalarVal(const SF& s) const { ExprVal v; v.s = s; return v; }
+    const SF& needScalar(const ExprVal& v) const
     {
         if (v.vec)
         {
@@ -591,34 +591,34 @@ private:
         return v.s;
     }
 
-    Val expr()
+    ExprVal expr()
     {
-        Val l = term();
+        ExprVal l = term();
         while (isOp("+") || isOp("-"))
         {
             const char op = t_[p_++].t[0];
-            Val r = term();
+            ExprVal r = term();
             l = scalarVal(sfBinary(needScalar(l), needScalar(r), op, sc_.n));
         }
         return l;
     }
-    Val term()
+    ExprVal term()
     {
-        Val l = unary();
+        ExprVal l = unary();
         while (isOp("*") || isOp("/"))
         {
             const char op = t_[p_++].t[0];
-            Val r = unary();
+            ExprVal r = unary();
             l = scalarVal(sfBinary(needScalar(l), needScalar(r), op, sc_.n));
         }
         return l;
     }
-    Val unary()
+    ExprVal unary()
     {
         if (isOp("-"))
         {
             ++p_;
-            Val v = unary();
+            ExprVal v = unary();
             return scalarVal(sfMap(needScalar(v), [](scalar x) { return -x; }, sc_.n));
         }
         if (isOp("+"))
@@ -633,7 +633,7 @@ private:
     {
         return s == "x" ? 0 : s == "y" ? 1 : s == "z" ? 2 : -1;
     }
-    Val component(const Val& v, int c) const
+    ExprVal component(const ExprVal& v, int c) const
     {
         if (!v.vec)
         {
@@ -641,7 +641,7 @@ private:
         }
         return scalarVal(c == 0 ? v.v.x : c == 1 ? v.v.y : v.v.z);
     }
-    Val postfix(Val v)
+    ExprVal postfix(ExprVal v)
     {
         while (isOp(".") && peek(1).k == Tok::Id && componentIndex(peek(1).t) >= 0 && isOp("(", 2) && isOp(")", 3))
         {
@@ -652,7 +652,7 @@ private:
         return v;
     }
 
-    Val callFunction(const std::string& name, const std::vector<Val>& args)
+    ExprVal callFunction(const std::string& name, const std::vector<ExprVal>& args)
     {
         const std::size_t n = sc_.n;
         auto sq = [](scalar x) { return x*x; };
@@ -662,7 +662,7 @@ private:
             {
                 fail("pos() takes no argument");
             }
-            Val v;
+            ExprVal v;
             v.vec = true;
             v.v = sc_.pos();
             return v;
@@ -671,7 +671,7 @@ private:
         {
             fail("function `" + name + "` is not supported here (mag, magSqr, sqr, sqrt and pos() are)");
         }
-        const Val& a = args[0];
+        const ExprVal& a = args[0];
         if (name == "magSqr" || name == "mag")
         {
             SF s;
@@ -696,7 +696,7 @@ private:
         fail("function `" + name + "` is not supported here (mag, magSqr, sqr, sqrt and pos() are)");
     }
 
-    Val primary()
+    ExprVal primary()
     {
         const Tok tk = peek();
         if (tk.k == Tok::Num)
@@ -707,7 +707,7 @@ private:
         if (isOp("("))
         {
             ++p_;
-            Val v = expr();
+            ExprVal v = expr();
             expectOp(")");
             return postfix(v);
         }
@@ -726,7 +726,7 @@ private:
         if (parts.size() == 1 && isOp("("))
         {
             ++p_;
-            std::vector<Val> args;
+            std::vector<ExprVal> args;
             if (!isOp(")"))
             {
                 args.push_back(expr());
@@ -752,7 +752,7 @@ private:
         VF vf;
         if (sc_.vectorField(name, vf))
         {
-            Val v;
+            ExprVal v;
             v.vec = true;
             v.v = vf;
             return postfix(v);
